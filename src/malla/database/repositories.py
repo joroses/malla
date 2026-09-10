@@ -3338,10 +3338,17 @@ class TracerouteRepository:
 
     @staticmethod
     def get_traceroute_packets_for_graph(
-        limit: int = 5000,
+        limit: int = -1,
         filters: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Get minimal traceroute packet fields for network graph extraction."""
+        from .traceroute_read_repository import get_traceroute_packets
+
+        # Graph calculations cover the complete selected range. ``limit`` is
+        # retained in the public signature for compatibility with callers.
+        return get_traceroute_packets(limit=-1, filters=filters)["packets"]
+
+        # Legacy raw-packet reader retained temporarily for reference.
         if filters is None:
             filters = {}
 
@@ -3403,6 +3410,20 @@ class TracerouteRepository:
         group_packets: bool = False,
     ) -> dict[str, Any]:
         """Get traceroute packets with filtering and optional grouping."""
+        from .traceroute_read_repository import get_traceroute_packets
+
+        return get_traceroute_packets(
+            limit=limit,
+            offset=offset,
+            filters=filters,
+            order_by=order_by,
+            order_dir=order_dir,
+            search=search,
+            group_packets=group_packets,
+        )
+
+        # Legacy implementation retained temporarily while remaining PR2
+        # readers are migrated to the shared materialized-query layer.
         if filters is None:
             filters = {}
 

@@ -1,0 +1,141 @@
+"""Behavioral tests for PR2's saved-traceroute list reader."""
+
+import sqlite3
+from contextlib import closing
+from unittest.mock import patch
+
+import pytest
+from meshtastic import mesh_pb2
+
+from malla.database.traceroute_read_repository import get_traceroute_packets
+from malla.database.traceroute_schema import ensure_traceroute_schema
+from malla.database.traceroutes import write_traceroute
+
+pytestmark = pytest.mark.unit
+
+
+@pytest.fixture
+def database(tmp_path):
+    path = tmp_path / "reader.db"
+    with closing(sqlite3.connect(path)) as conn:
+        conn.row_factory = sqlite3.Row
+        conn.execute("""
+            CREATE TABLE packet_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp REAL NOT NULL,
+                portnum INTEGER,
+                portnum_name TEXT,
+                mesh_packet_id INTEGER,
+                from_node_id INTEGER,
+                to_node_id INTEGER,
+                gateway_id TEXT,
+                channel_id TEXT,
+                hop_start INTEGER,
+                hop_limit INTEGER,
+                rssi REAL,
+                snr REAL,
+                payload_length INTEGER,
+                raw_payload BLOB,
+                processed_successfully INTEGER DEFAULT 1
+            )
+        """)
+        ensure_traceroute_schema(conn.cursor())
+        conn.commit()
+    return path
+
+
+def _connection(path):
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def _insert(conn, *, packet_id, timestamp, mesh_id, gateway, route=(900,)):
+    raw = mesh_pb2.RouteDiscovery(
+        route=route, snr_towards=[-40] * (len(route) + 1)
+    ).SerializeToString()
+    cursor = conn.execute(
+        """
+        INSERT INTO packet_history (
+            id, timestamp, portnum, portnum_name, mesh_packet_id,
+            from_node_id, to_node_id, gateway_id, channel_id,
+            hop_start, hop_limit, rssi, snr, payload_length, raw_payload
+        ) VALUES (?, ?, 70, 'TRACEROUTE_APP', ?, 100, 200, ?, 'LongFast',
+                  5, 3, -80, -10, ?, ?)
+        """,
+        (packet_id, timestamp, mesh_id, gateway, len(raw), raw),
+    )
+    packet = dict(
+        conn.execute("SELECT * FROM packet_history WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    )
+    write_traceroute(conn.cursor(), packet)
+
+
+def test_empty_database_returns_empty_packets(database):
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        result = get_traceroute_packets()
+
+    assert result["total_count"] == 0
+    assert result["packets"] == []
+
+
+def test_grouping_filters_full_history_before_exact_pagination(database):
+    with closing(_connection(database)) as conn:
+        # More receptions than the old grouped-reader scan cap, with an older
+        # matching route that must remain reachable on a later page.
+        for packet_id in range(1, 101):
+            _insert(
+                conn,
+                packet_id=packet_id,
+                timestamp=packet_id,
+                mesh_id=packet_id,
+                gateway="!00000001",
+                route=(900 if packet_id == 1 else 901,),
+            )
+        # A second reception of one mesh packet must change its reception count,
+        # not the number of grouped rows.
+        _insert(
+            conn,
+            packet_id=101,
+            timestamp=101,
+            mesh_id=1,
+            gateway="!00000002",
+            route=(900,),
+        )
+        conn.commit()
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        page = get_traceroute_packets(
+            limit=10,
+            offset=90,
+            filters={"start_time": 0.0, "end_time": 200.0},
+            group_packets=True,
+        )
+        route_match = get_traceroute_packets(
+            limit=10,
+            filters={"start_time": 0.0, "end_time": 200.0, "route_node": 900},
+            group_packets=True,
+        )
+        gateway_sorted = get_traceroute_packets(
+            limit=-1,
+            filters={"start_time": 0.0, "end_time": 200.0},
+            order_by="gateway_id",
+            order_dir="asc",
+            group_packets=True,
+        )
+
+    assert page["total_count"] == 100
+    assert len(page["packets"]) == 10
+    assert route_match["total_count"] == 1
+    assert route_match["packets"][0]["mesh_packet_id"] == 1
+    assert route_match["packets"][0]["reception_count"] == 2
+    assert route_match["packets"][0]["gateway_count"] == 2
+    assert gateway_sorted["packets"][0]["gateway_count"] == 1
+    assert gateway_sorted["packets"][-1]["gateway_count"] == 2
