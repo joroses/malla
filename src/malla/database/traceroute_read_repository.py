@@ -350,3 +350,264 @@ def route_data_from_row(packet: dict[str, Any]) -> dict[str, list[Any]] | None:
         return {key: json.loads(packet[f"{key}_json"]) for key in keys}
     except (KeyError, TypeError, json.JSONDecodeError):
         return None
+
+
+def get_traceroute_hops_for_graph(
+    filters: dict[str, Any] | None = None,
+    min_snr: float = -200.0,
+) -> list[dict[str, Any]]:
+    """Return RF hops from traceroute_hops matching filters for network graph building."""
+    filters = dict(filters or {})
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        conditions = [
+            "r.parser_version = ?",
+            "r.parse_status = 'parsed'",
+            "h.from_node_id != 4294967295",
+            "h.to_node_id != 4294967295",
+            f"(h.snr = {TRACEROUTE_UNKNOWN_SNR} OR (h.snr >= {SNR_PLAUSIBLE_MIN} AND h.snr <= {SNR_PLAUSIBLE_MAX}))",
+            "h.snr != 0",
+        ]
+        params: list[Any] = [PARSER_VERSION]
+
+        if filters.get("start_time") is not None:
+            conditions.append("h.timestamp >= ?")
+            params.append(filters["start_time"])
+        if filters.get("end_time") is not None:
+            conditions.append("h.timestamp <= ?")
+            params.append(filters["end_time"])
+        if min_snr != -200.0:
+            conditions.append("h.snr >= ?")
+            params.append(min_snr)
+
+        join_packet = False
+        if filters.get("gateway_id"):
+            join_packet = True
+            conditions.append("p.gateway_id = ?")
+            params.append(filters["gateway_id"])
+        if filters.get("primary_channel"):
+            join_packet = True
+            conditions.append("p.channel_id = ?")
+            params.append(filters["primary_channel"])
+
+        join_clause = "JOIN packet_history p ON p.id = h.packet_id" if join_packet else ""
+        where_clause = " AND ".join(conditions)
+
+        query = f"""
+            SELECT
+                h.packet_id,
+                h.direction,
+                h.hop_index,
+                h.timestamp,
+                h.from_node_id,
+                h.to_node_id,
+                h.snr
+            FROM traceroute_hops h
+            JOIN traceroute_routes r ON r.packet_id = h.packet_id
+            {join_clause}
+            WHERE {where_clause}
+            ORDER BY h.timestamp DESC, h.packet_id, h.direction, h.hop_index
+        """
+        rows = cursor.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_traceroute_hops_for_longest_links(
+    start_time: float,
+    end_time: float,
+) -> list[dict[str, Any]]:
+    """Return all RF hops from traceroute_hops in the specified time window."""
+    return get_traceroute_hops_for_graph(
+        filters={"start_time": start_time, "end_time": end_time}
+    )
+
+
+def get_route_patterns_data(
+    start_time: float,
+    end_time: float,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Aggregate route patterns directly in SQL from traceroute_routes."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        total_analyzed = cursor.execute(
+            """
+            SELECT COUNT(*)
+            FROM traceroute_routes
+            WHERE parser_version = ? AND parse_status = 'parsed'
+              AND timestamp >= ? AND timestamp <= ?
+            """,
+            (PARSER_VERSION, start_time, end_time),
+        ).fetchone()[0]
+
+        query = """
+            WITH ranked_patterns AS (
+                SELECT
+                    p.id AS packet_id,
+                    r.timestamp,
+                    r.from_node_id,
+                    r.to_node_id,
+                    r.route_nodes_json,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY r.from_node_id, r.to_node_id, r.route_nodes_json
+                        ORDER BY r.timestamp DESC, p.id DESC
+                    ) AS rank,
+                    COUNT(*) OVER (
+                        PARTITION BY r.from_node_id, r.to_node_id, r.route_nodes_json
+                    ) AS pattern_count
+                FROM traceroute_routes r
+                JOIN packet_history p ON p.id = r.packet_id
+                WHERE r.parser_version = ? AND r.parse_status = 'parsed'
+                  AND r.route_nodes_json != '[]'
+                  AND r.timestamp >= ? AND r.timestamp <= ?
+            )
+            SELECT
+                packet_id,
+                timestamp,
+                from_node_id,
+                to_node_id,
+                route_nodes_json,
+                pattern_count,
+                rank
+            FROM ranked_patterns
+            WHERE rank <= 3
+            ORDER BY pattern_count DESC, from_node_id, to_node_id
+        """
+        rows = cursor.execute(query, (PARSER_VERSION, start_time, end_time)).fetchall()
+
+        route_patterns: dict[tuple[tuple[int, int], tuple[int, ...]], dict[str, Any]] = {}
+
+        for row in rows:
+            try:
+                route_nodes = tuple(json.loads(row["route_nodes_json"]))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not route_nodes:
+                continue
+
+            endpoints = tuple(sorted([row["from_node_id"], row["to_node_id"]]))
+            pattern_key = (endpoints, route_nodes)
+
+            if pattern_key not in route_patterns:
+                route_patterns[pattern_key] = {
+                    "count": 0,
+                    "endpoints": endpoints,
+                    # Legacy placeholder / dead code: always 0, never computed or updated;
+                    # retained for API response schema backwards-compatibility.
+                    "avg_success_rate": 0,
+                    "examples": [],
+                }
+
+            if row["rank"] == 1:
+                route_patterns[pattern_key]["count"] += row["pattern_count"]
+
+            if len(route_patterns[pattern_key]["examples"]) < 3:
+                route_patterns[pattern_key]["examples"].append(
+                    {
+                        "packet_id": row["packet_id"],
+                        "timestamp": row["timestamp"],
+                        "from_node": row["from_node_id"],
+                        "to_node": row["to_node_id"],
+                    }
+                )
+
+        sorted_patterns = sorted(
+            route_patterns.items(), key=lambda x: x[1]["count"], reverse=True
+        )[:limit]
+
+        return {
+            "sorted_patterns": sorted_patterns,
+            "total_patterns": len(route_patterns),
+            "analyzed_traceroutes": total_analyzed,
+        }
+    finally:
+        conn.close()
+
+
+def get_node_traceroute_statistics(
+    node_id: int,
+    start_time: float | None = None,
+    end_time: float | None = None,
+) -> dict[str, Any]:
+    """Compute traceroute source, destination, and intermediate participation in SQL."""
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+        time_conditions = []
+        time_params: list[Any] = []
+        if start_time is not None:
+            time_conditions.append("timestamp >= ?")
+            time_params.append(start_time)
+        if end_time is not None:
+            time_conditions.append("timestamp <= ?")
+            time_params.append(end_time)
+
+        time_sql = f" AND {' AND '.join(time_conditions)}" if time_conditions else ""
+
+        # Query 1: As source and as destination
+        endpoint_query = f"""
+            SELECT
+                COUNT(CASE WHEN from_node_id = ? THEN 1 END) AS source_total,
+                COUNT(CASE WHEN from_node_id = ? AND parse_status IN ('parsed', 'valid_empty') THEN 1 END) AS source_successful,
+                COUNT(CASE WHEN to_node_id = ? THEN 1 END) AS dest_total,
+                COUNT(CASE WHEN to_node_id = ? AND parse_status IN ('parsed', 'valid_empty') THEN 1 END) AS dest_successful
+            FROM traceroute_routes
+            WHERE parser_version = ?
+              AND (from_node_id = ? OR to_node_id = ?)
+              {time_sql}
+        """
+        endpoint_params = [
+            node_id,
+            node_id,
+            node_id,
+            node_id,
+            PARSER_VERSION,
+            node_id,
+            node_id,
+            *time_params,
+        ]
+        row = cursor.execute(endpoint_query, endpoint_params).fetchone()
+        source_total = int(row["source_total"] or 0)
+        source_successful = int(row["source_successful"] or 0)
+        dest_total = int(row["dest_total"] or 0)
+        dest_successful = int(row["dest_successful"] or 0)
+
+        # Query 2: Intermediate participation
+        intermediate_query = f"""
+            SELECT COUNT(*)
+            FROM traceroute_routes
+            WHERE parser_version = ?
+              AND parse_status IN ('parsed', 'valid_empty')
+              {time_sql}
+              AND EXISTS (
+                  SELECT 1 FROM json_each(route_nodes_json) WHERE value = ?
+              )
+        """
+        intermediate_params = [
+            PARSER_VERSION,
+            *time_params,
+            node_id,
+        ]
+        participation_count = cursor.execute(intermediate_query, intermediate_params).fetchone()[0]
+
+        return {
+            "node_id": node_id,
+            "as_source": {
+                "total": source_total,
+                "successful": source_successful,
+                "success_rate": (source_successful / source_total * 100) if source_total > 0 else 0,
+            },
+            "as_destination": {
+                "total": dest_total,
+                "successful": dest_successful,
+                "success_rate": (dest_successful / dest_total * 100) if dest_total > 0 else 0,
+            },
+            "as_intermediate_hop": {"participation_count": participation_count},
+            "total_involvement": source_total + dest_total + participation_count,
+        }
+    finally:
+        conn.close()
