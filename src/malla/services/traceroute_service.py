@@ -18,26 +18,19 @@ from ..database.repositories import (
     LocationRepository,
     TracerouteRepository,
 )
+from ..database.traceroute_read_repository import route_data_from_row
 from ..models.traceroute import (
     RouteData,
     TraceroutePacket,  # Use the correct TraceroutePacket class
 )
 from ..utils.node_utils import get_bulk_node_names
 from ..utils.signal_quality import is_plausible_traceroute_snr
-from ..utils.traceroute_utils import parse_traceroute_payload
 
 logger = logging.getLogger(__name__)
 
 _NETWORK_GRAPH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 _NETWORK_GRAPH_CACHE_TTL_SECONDS = 60
 _NETWORK_GRAPH_CACHE_MAX_ENTRIES = 32
-
-# Default cap on traceroute packets analyzed per network graph build. The graph
-# advertises a multi-day window (e.g. 168h for the map), so this must be large
-# enough that the newest N packets still span that window; on busy brokers a
-# low cap silently shrinks the analysis to the last few hours and older RF
-# links drop off the map. ~20k packets parse in a couple of seconds.
-DEFAULT_GRAPH_PACKET_LIMIT = 20000
 
 
 def _network_graph_cache_key(
@@ -192,9 +185,10 @@ class TracerouteService:
                 "end_time": end_time.timestamp(),
             }
 
-            # Get raw traceroute data
+            # Saved JSON arrays make full-window analysis practical without
+            # decoding packet payloads during the request.
             result = TracerouteRepository.get_traceroute_packets(
-                limit=1000,  # Large limit for analysis
+                limit=-1,
                 filters=filters,
             )
 
@@ -210,9 +204,8 @@ class TracerouteService:
                 if tr["processed_successfully"]:
                     successful_traceroutes += 1
 
-                    # Parse route data
-                    if tr["raw_payload"]:
-                        route_data = parse_traceroute_payload(tr["raw_payload"])
+                    route_data = route_data_from_row(tr)
+                    if route_data is not None:
 
                         if route_data["route_back"]:
                             traceroutes_with_return += 1
@@ -303,7 +296,7 @@ class TracerouteService:
             # Get recent successful traceroutes
             filters = {"processed_successfully_only": True}
             result = TracerouteRepository.get_traceroute_packets(
-                limit=1000,  # Analyze more data
+                limit=-1,
                 filters=filters,
             )
 
@@ -314,8 +307,8 @@ class TracerouteService:
             directional_patterns: dict[tuple[int, int, tuple[int, ...]], int] = {}
 
             for tr in result["packets"]:
-                if tr["raw_payload"] and tr["processed_successfully"]:
-                    route_data = parse_traceroute_payload(tr["raw_payload"])
+                route_data = route_data_from_row(tr)
+                if route_data is not None and tr["processed_successfully"]:
 
                     # Create pattern key (normalized)
                     route_nodes = tuple(route_data["route_nodes"])
@@ -407,10 +400,10 @@ class TracerouteService:
             dest_filters = {"to_node": node_id}
 
             source_result = TracerouteRepository.get_traceroute_packets(
-                limit=1000, filters=source_filters
+                limit=-1, filters=source_filters
             )
             dest_result = TracerouteRepository.get_traceroute_packets(
-                limit=1000, filters=dest_filters
+                limit=-1, filters=dest_filters
             )
 
             # Analyze as source
@@ -433,12 +426,12 @@ class TracerouteService:
             # This requires checking all traceroutes for this node in route_nodes
             participation_count = 0
             all_traceroutes = TracerouteRepository.get_traceroute_packets(
-                limit=1000, filters={"processed_successfully_only": True}
+                limit=-1, filters={"processed_successfully_only": True}
             )
 
             for tr in all_traceroutes["packets"]:
-                if tr["raw_payload"]:
-                    route_data = parse_traceroute_payload(tr["raw_payload"])
+                route_data = route_data_from_row(tr)
+                if route_data is not None:
                     if node_id in route_data.get("route_nodes", []):
                         participation_count += 1
 
@@ -505,9 +498,7 @@ class TracerouteService:
             }
 
             result = TracerouteRepository.get_traceroute_packets(
-                # Fetch a larger sample of packets to cover busy networks
-                # 25k packets ≈ several hours of traffic on busy meshes but still manageable
-                limit=25000,
+                limit=-1,
                 filters=filters,
             )
             fetch_duration = time.time() - fetch_start
@@ -523,10 +514,10 @@ class TracerouteService:
             unique_node_ids: set[int] = set()
             parsed_route_cache: dict[int, RouteData] = {}
             for packet in result["packets"]:
-                if not packet.get("raw_payload"):
-                    continue
                 try:
-                    route_data = parse_traceroute_payload(packet["raw_payload"])
+                    route_data = route_data_from_row(packet)
+                    if route_data is None:
+                        continue
                     parsed_route_cache[packet["id"]] = route_data
                     nodes_for_packet = {packet["from_node_id"], packet["to_node_id"]}
                     nodes_for_packet.update(route_data.get("route_nodes", []))
@@ -659,10 +650,7 @@ class TracerouteService:
                     packet_start = time.time()
                     try:
                         # Early filtering: skip packets that won't contribute any valid hops
-                        if (
-                            not packet["raw_payload"]
-                            or not packet["processed_successfully"]
-                        ):
+                        if not packet["processed_successfully"]:
                             early_filtered += 1
                             continue
 
@@ -1021,7 +1009,7 @@ class TracerouteService:
         min_snr: float = -200.0,
         include_indirect: bool = False,
         filters: dict | None = None,
-        limit_packets: int = DEFAULT_GRAPH_PACKET_LIMIT,
+        limit_packets: int = -1,
     ) -> dict[str, Any]:
         """
         Extract RF links from traceroute data to build a network connectivity graph.
@@ -1031,7 +1019,7 @@ class TracerouteService:
             min_snr: Minimum SNR threshold for including links
             include_indirect: Whether to include indirect (multi-hop) connections
             filters: Optional filters dict with start_time, end_time, gateway_id, etc.
-            limit_packets: Maximum number of packets to analyze
+            limit_packets: Maximum number of packets to analyze (-1 for unlimited)
 
         Returns:
             Dictionary with nodes and links data for graph visualization
@@ -1100,9 +1088,6 @@ class TracerouteService:
 
             # Process each traceroute packet
             for tr_data in packets:
-                if not tr_data["raw_payload"]:
-                    continue
-
                 try:
                     # Create TraceroutePacket object for analysis
                     tr_packet = TraceroutePacket(
