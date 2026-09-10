@@ -2209,4 +2209,24 @@ class TestTracerouteFilters:
         """)
         assert has_methods, "URL manager should have required methods"
 
-        assert has_methods, "URL manager should have required methods"
+    def test_traceroute_pagination_visibility(
+        self, page: Page, test_server_url: str
+    ):
+        """Test that pagination controls remain visible in viewport."""
+        page.set_viewport_size({"width": 1280, "height": 800})
+        page.goto(f"{test_server_url}/traceroute")
+
+        # Wait for table to load
+        page.wait_for_selector("#tracerouteTable .modern-pagination", timeout=10000)
+
+        # Verify pagination is fully inside the viewport
+        pagination_locator = page.locator("#tracerouteTable .modern-pagination")
+        expect(pagination_locator).to_be_visible()
+        pag_box = pagination_locator.bounding_box()
+        assert pag_box is not None
+        assert pag_box["y"] + pag_box["height"] <= 800.5, (
+            f"Pagination bottom ({pag_box['y'] + pag_box['height']}) must not exceed viewport height (800)"
+        )
+
+        # Verify pagination navigation buttons exist and are visible
+        expect(page.locator(".pagination-btn").first).to_be_visible()
