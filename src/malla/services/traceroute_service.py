@@ -88,6 +88,47 @@ def _prune_network_graph_cache(now: float) -> None:
             _NETWORK_GRAPH_CACHE.pop(key, None)
 
 
+def _rf_hop_qualifies(hop: dict[str, Any], min_snr: float | None = None) -> bool:
+    """True when a hop is an evidenced RF link (usable SNR, real endpoints)."""
+    snr = hop.get("snr")
+    if not is_plausible_traceroute_snr(snr) or snr == 0:
+        return False
+    if min_snr is not None and min_snr != -200 and snr < min_snr:
+        return False
+    return 4294967295 not in (hop["from_node_id"], hop["to_node_id"])
+
+
+def _contiguous_path_segments(
+    hops: list[dict[str, Any]],
+    qualifies: Any = _rf_hop_qualifies,
+) -> list[list[dict[str, Any]]]:
+    """Split hops in path order into maximal contiguous runs of qualifying hops.
+
+    A run continues only while each hop starts where the previous one ended.
+    Removing a hop from the middle of a route (zero/invalid SNR, weak link)
+    must not splice the survivors into a shorter path: for A->B->C->D with
+    B->C filtered, A->B and C->D stay two disconnected segments instead of
+    aggregating into a bogus A->D path.
+    """
+    segments: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    for hop in hops:
+        if not qualifies(hop):
+            if len(current) > 1:
+                segments.append(current)
+            current = []
+            continue
+        if current and hop["from_node_id"] != current[-1]["to_node_id"]:
+            if len(current) > 1:
+                segments.append(current)
+            current = [hop]
+        else:
+            current.append(hop)
+    if len(current) > 1:
+        segments.append(current)
+    return segments
+
+
 class TracerouteService:
     """Service for traceroute analysis and management."""
 
@@ -491,48 +532,42 @@ class TracerouteService:
                 hops_by_path[path_key].append(hop)
 
             for (packet_id, _direction), path_hops in hops_by_path.items():
-                hop_distances: list[float | None] = []
                 for hop in path_hops:
                     from_id = hop["from_node_id"]
                     to_id = hop["to_node_id"]
-                    if from_id == 4294967295 or to_id == 4294967295:
-                        hop_distances.append(None)
-                        continue
-
                     ts = hop["timestamp"]
-                    loc_from = get_node_loc(from_id, ts)
-                    loc_to = get_node_loc(to_id, ts)
 
-                    if (
-                        loc_from
-                        and loc_to
-                        and loc_from.get("latitude") is not None
-                        and loc_from.get("longitude") is not None
-                        and loc_to.get("latitude") is not None
-                        and loc_to.get("longitude") is not None
-                    ):
-                        dist = calculate_distance(
-                            loc_from["latitude"],
-                            loc_from["longitude"],
-                            loc_to["latitude"],
-                            loc_to["longitude"],
-                        )
-                        hop_distances.append(dist)
-                    else:
-                        hop_distances.append(None)
+                    dist: float | None = None
+                    if from_id != 4294967295 and to_id != 4294967295:
+                        loc_from = get_node_loc(from_id, ts)
+                        loc_to = get_node_loc(to_id, ts)
+                        if (
+                            loc_from
+                            and loc_to
+                            and loc_from.get("latitude") is not None
+                            and loc_from.get("longitude") is not None
+                            and loc_to.get("latitude") is not None
+                            and loc_to.get("longitude") is not None
+                        ):
+                            dist = calculate_distance(
+                                loc_from["latitude"],
+                                loc_from["longitude"],
+                                loc_to["latitude"],
+                                loc_to["longitude"],
+                            )
+                    hop["_distance_km"] = dist
 
                     # Direct link processing
-                    dist_km = hop_distances[-1]
                     snr = hop["snr"]
                     if (
-                        dist_km is not None
-                        and dist_km >= min_distance_km
+                        dist is not None
+                        and dist >= min_distance_km
                         and is_plausible_traceroute_snr(snr)
                         and snr != 0
                         and snr >= min_snr
                     ):
-                        key = tuple(sorted([from_id, to_id]))
-                        node1_id, node2_id = key
+                        node1_id, node2_id = sorted((from_id, to_id))
+                        key: tuple[int, int] = (node1_id, node2_id)
                         from_name = node_names.get(node1_id, f"!{node1_id:08x}")
                         to_name = node_names.get(node2_id, f"!{node2_id:08x}")
 
@@ -550,9 +585,9 @@ class TracerouteService:
                             }
                         stats_dict = link_stats[key]
                         stats_dict["traceroute_count"] += 1
-                        stats_dict["total_distance"] += dist_km
+                        stats_dict["total_distance"] += dist
                         stats_dict["total_snr"] += snr
-                        stats_dict["max_distance"] = max(stats_dict["max_distance"], dist_km)
+                        stats_dict["max_distance"] = max(stats_dict["max_distance"], dist)
                         if stats_dict["best_snr"] is None or snr > stats_dict["best_snr"]:
                             stats_dict["best_snr"] = snr
                         if ts > stats_dict["last_seen"]:
@@ -562,48 +597,55 @@ class TracerouteService:
                             if len(stats_dict["recent_packets"]) > 5:
                                 stats_dict["recent_packets"].pop(0)
 
-                # Indirect path processing
-                if len(path_hops) > 1 and all(d is not None for d in hop_distances):
-                    path_distance_km = sum(d for d in hop_distances if d is not None)
-                    if path_distance_km >= min_distance_km:
-                        valid_snrs = [h["snr"] for h in path_hops if is_plausible_traceroute_snr(h["snr"])]
-                        avg_path_snr = (sum(valid_snrs) / len(valid_snrs)) if valid_snrs else None
-                        if avg_path_snr is not None and avg_path_snr >= min_snr:
-                            from_id_path = path_hops[0]["from_node_id"]
-                            to_id_path = path_hops[-1]["to_node_id"]
-                            p_key = (from_id_path, to_id_path)
-                            if p_key not in path_stats:
-                                from_name = node_names.get(from_id_path, f"!{from_id_path:08x}")
-                                to_name = node_names.get(to_id_path, f"!{to_id_path:08x}")
-                                route_preview = [
-                                    node_names.get(h["from_node_id"], f"!{h['from_node_id']:08x}")
-                                    for h in path_hops
-                                ] + [node_names.get(to_id_path, f"!{to_id_path:08x}")]
-                                path_stats[p_key] = {
-                                    "from_node_name": from_name,
-                                    "to_node_name": to_name,
-                                    "total_distance": 0.0,
-                                    "total_snr": 0.0,
-                                    "traceroute_count": 0,
-                                    "hop_count_total": 0,
-                                    "recent_packets": [],
-                                    "route_preview": route_preview,
-                                    "max_distance": 0.0,
-                                    "last_seen": path_hops[0]["timestamp"],
-                                }
-                            pstats = path_stats[p_key]
-                            pstats["traceroute_count"] += 1
-                            pstats["total_distance"] += path_distance_km
-                            pstats["hop_count_total"] += len(path_hops)
-                            pstats["total_snr"] += avg_path_snr
-                            pstats["max_distance"] = max(pstats["max_distance"], path_distance_km)
-                            ts = path_hops[0]["timestamp"]
-                            if ts > pstats["last_seen"]:
-                                pstats["last_seen"] = ts
-                            if packet_id not in pstats["recent_packets"]:
-                                pstats["recent_packets"].append(packet_id)
-                                if len(pstats["recent_packets"]) > 5:
-                                    pstats["recent_packets"].pop(0)
+                # Indirect path processing: only contiguous runs of qualifying
+                # hops are real multi-hop paths. When a middle hop fails the
+                # filters, the remaining hops are disconnected segments whose
+                # endpoints and distance sums must not be joined.
+                for segment in _contiguous_path_segments(path_hops):
+                    segment_distances = [h["_distance_km"] for h in segment]
+                    if any(d is None for d in segment_distances):
+                        continue
+                    path_distance_km = sum(segment_distances)
+                    if path_distance_km < min_distance_km:
+                        continue
+                    avg_path_snr = sum(h["snr"] for h in segment) / len(segment)
+                    if avg_path_snr < min_snr:
+                        continue
+                    from_id_path = segment[0]["from_node_id"]
+                    to_id_path = segment[-1]["to_node_id"]
+                    p_key = (from_id_path, to_id_path)
+                    if p_key not in path_stats:
+                        from_name = node_names.get(from_id_path, f"!{from_id_path:08x}")
+                        to_name = node_names.get(to_id_path, f"!{to_id_path:08x}")
+                        route_preview = [
+                            node_names.get(h["from_node_id"], f"!{h['from_node_id']:08x}")
+                            for h in segment
+                        ] + [node_names.get(to_id_path, f"!{to_id_path:08x}")]
+                        path_stats[p_key] = {
+                            "from_node_name": from_name,
+                            "to_node_name": to_name,
+                            "total_distance": 0.0,
+                            "total_snr": 0.0,
+                            "traceroute_count": 0,
+                            "hop_count_total": 0,
+                            "recent_packets": [],
+                            "route_preview": route_preview,
+                            "max_distance": 0.0,
+                            "last_seen": segment[0]["timestamp"],
+                        }
+                    pstats = path_stats[p_key]
+                    pstats["traceroute_count"] += 1
+                    pstats["total_distance"] += path_distance_km
+                    pstats["hop_count_total"] += len(segment)
+                    pstats["total_snr"] += avg_path_snr
+                    pstats["max_distance"] = max(pstats["max_distance"], path_distance_km)
+                    ts = segment[0]["timestamp"]
+                    if ts > pstats["last_seen"]:
+                        pstats["last_seen"] = ts
+                    if packet_id not in pstats["recent_packets"]:
+                        pstats["recent_packets"].append(packet_id)
+                        if len(pstats["recent_packets"]) > 5:
+                            pstats["recent_packets"].pop(0)
 
             process_duration = time.time() - process_start
             logger.info(f"TIMING: Hop processing took {process_duration:.3f}s")
@@ -767,11 +809,11 @@ class TracerouteService:
             # Always filter for successfully processed packets
             filters["processed_successfully_only"] = True
 
-            # Get traceroute hops directly from materialized traceroute_hops
-            hops = get_traceroute_hops_for_graph(
-                filters=filters,
-                min_snr=min_snr,
-            )
+            # Get traceroute hops directly from materialized traceroute_hops.
+            # The query returns complete hop sequences so path structure is
+            # preserved; SNR filtering happens per hop below and continuity is
+            # validated before any path-level aggregation.
+            hops = get_traceroute_hops_for_graph(filters=filters)
 
             # Track nodes and links
             nodes = {}  # node_id -> node_data
@@ -853,36 +895,38 @@ class TracerouteService:
                     nodes[from_id]["total_snr"] += snr
                     nodes[from_id]["snr_count"] += 1
 
-                # Process indirect connections if requested
-                if include_indirect and len(rf_hops) > 1:
-                    first_from = rf_hops[0]["from_node_id"]
-                    last_to = rf_hops[-1]["to_node_id"]
-                    if 4294967295 not in (first_from, last_to):
+                # Process indirect connections if requested. Only contiguous
+                # runs of qualifying hops count as a path: a route whose middle
+                # hop failed the SNR filters is two disconnected segments, not
+                # a shortcut between its endpoints.
+                if include_indirect:
+                    for segment in _contiguous_path_segments(
+                        rf_hops, lambda hop: _rf_hop_qualifies(hop, min_snr)
+                    ):
+                        first_from = segment[0]["from_node_id"]
+                        last_to = segment[-1]["to_node_id"]
+                        if 4294967295 in (first_from, last_to):
+                            continue
                         indirect_key = tuple(sorted([first_from, last_to]))
-                        if indirect_key not in direct_links:
-                            path_snrs = [
-                                h["snr"]
-                                for h in rf_hops
-                                if is_plausible_traceroute_snr(h["snr"])
-                            ]
-                            if indirect_key not in indirect_connections:
-                                indirect_connections[indirect_key] = {
-                                    "source": indirect_key[0],
-                                    "target": indirect_key[1],
-                                    "hop_count": len(rf_hops),
-                                    "path_count": 1,
-                                    "avg_snr": (sum(path_snrs) / len(path_snrs))
-                                    if path_snrs
-                                    else None,
-                                    "last_seen": ts,
-                                    "last_packet_id": packet_id,
-                                }
-                            else:
-                                conn = indirect_connections[indirect_key]
-                                conn["path_count"] += 1
-                                if ts > conn["last_seen"]:
-                                    conn["last_seen"] = ts
-                                    conn["last_packet_id"] = packet_id
+                        if indirect_key in direct_links:
+                            continue
+                        path_snrs = [h["snr"] for h in segment]
+                        if indirect_key not in indirect_connections:
+                            indirect_connections[indirect_key] = {
+                                "source": indirect_key[0],
+                                "target": indirect_key[1],
+                                "hop_count": len(segment),
+                                "path_count": 1,
+                                "avg_snr": sum(path_snrs) / len(path_snrs),
+                                "last_seen": ts,
+                                "last_packet_id": packet_id,
+                            }
+                        else:
+                            conn = indirect_connections[indirect_key]
+                            conn["path_count"] += 1
+                            if ts > conn["last_seen"]:
+                                conn["last_seen"] = ts
+                                conn["last_packet_id"] = packet_id
 
             node_ids = list(nodes.keys())
             node_names = get_bulk_node_names(node_ids) if node_ids else {}

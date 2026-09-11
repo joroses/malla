@@ -58,9 +58,11 @@ def _connection(path):
     return conn
 
 
-def _insert(conn, *, packet_id, timestamp, mesh_id, gateway, route=(900,)):
+def _insert(conn, *, packet_id, timestamp, mesh_id, gateway, route=(900,), snr_towards=None):
+    if snr_towards is None:
+        snr_towards = [-40] * (len(route) + 1)
     raw = mesh_pb2.RouteDiscovery(
-        route=route, snr_towards=[-40] * (len(route) + 1)
+        route=route, snr_towards=snr_towards
     ).SerializeToString()
     cursor = conn.execute(
         """
@@ -164,6 +166,38 @@ def test_get_traceroute_hops_for_graph_and_longest_links(database):
     assert [h["from_node_id"] for h in hops] == [100, 901, 902]
     assert [h["to_node_id"] for h in hops] == [901, 902, 200]
     assert len(longest_hops) == 3
+
+
+def test_hop_query_preserves_zero_snr_hops_in_path_order(database):
+    """A zero-SNR middle hop stays in the sequence so paths keep their structure.
+
+    For A->B->C->D the stored hops are A->B, B->C, C->D. Dropping B->C (SNR 0)
+    in SQL would leave two disconnected segments that downstream consumers
+    would splice into a bogus two-hop A->D path.
+    """
+    with closing(_connection(database)) as conn:
+        _insert(
+            conn,
+            packet_id=1,
+            timestamp=10.0,
+            mesh_id=101,
+            gateway="!00000001",
+            route=(901, 902),
+            snr_towards=[-160, 0, -160],
+        )
+        conn.commit()
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        hops = get_traceroute_hops_for_graph(filters={"start_time": 0.0, "end_time": 20.0})
+        longest_hops = get_traceroute_hops_for_longest_links(start_time=0.0, end_time=20.0)
+
+    for query_hops in (hops, longest_hops):
+        assert [h["from_node_id"] for h in query_hops] == [100, 901, 902]
+        assert [h["to_node_id"] for h in query_hops] == [901, 902, 200]
+        assert [h["snr"] for h in query_hops] == [-40.0, 0.0, -40.0]
 
 
 def test_get_route_patterns_data(database):

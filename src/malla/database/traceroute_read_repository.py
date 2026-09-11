@@ -354,9 +354,15 @@ def route_data_from_row(packet: dict[str, Any]) -> dict[str, list[Any]] | None:
 
 def get_traceroute_hops_for_graph(
     filters: dict[str, Any] | None = None,
-    min_snr: float = -200.0,
 ) -> list[dict[str, Any]]:
-    """Return RF hops from traceroute_hops matching filters for network graph building."""
+    """Return the complete hop sequences of parsed traceroutes for graph building.
+
+    Hops are returned in path order with their SNR untouched so callers can
+    preserve path structure: dropping individual rows here (invalid SNR, weak
+    links) would splice the remaining hops of one route into a shorter,
+    connected-looking path. Quality filtering and continuity validation are the
+    caller's responsibility.
+    """
     filters = dict(filters or {})
     conn = get_db_connection()
     try:
@@ -366,8 +372,6 @@ def get_traceroute_hops_for_graph(
             "r.parse_status = 'parsed'",
             "h.from_node_id != 4294967295",
             "h.to_node_id != 4294967295",
-            f"(h.snr = {TRACEROUTE_UNKNOWN_SNR} OR (h.snr >= {SNR_PLAUSIBLE_MIN} AND h.snr <= {SNR_PLAUSIBLE_MAX}))",
-            "h.snr != 0",
         ]
         params: list[Any] = [PARSER_VERSION]
 
@@ -377,9 +381,6 @@ def get_traceroute_hops_for_graph(
         if filters.get("end_time") is not None:
             conditions.append("h.timestamp <= ?")
             params.append(filters["end_time"])
-        if min_snr != -200.0:
-            conditions.append("h.snr >= ?")
-            params.append(min_snr)
 
         join_packet = False
         if filters.get("gateway_id"):

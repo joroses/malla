@@ -95,6 +95,131 @@ class TestTracerouteServiceLongestLinks:
         assert len(result["direct_links"]) == 0
         assert len(result["indirect_links"]) == 0
 
+    @staticmethod
+    def _hop(packet_id, hop_index, from_node, to_node, snr, timestamp):
+        return {
+            "packet_id": packet_id,
+            "direction": "forward",
+            "hop_index": hop_index,
+            "timestamp": timestamp,
+            "from_node_id": from_node,
+            "to_node_id": to_node,
+            "snr": snr,
+        }
+
+    @staticmethod
+    def _linear_locations(node_positions, timestamp):
+        return {
+            node_id: [
+                {
+                    "from_node_id": node_id,
+                    "latitude": lat,
+                    "longitude": lon,
+                    "altitude": 100,
+                    "timestamp": timestamp,
+                }
+            ]
+            for node_id, (lat, lon) in node_positions.items()
+        }
+
+    @patch("src.malla.services.traceroute_service.get_bulk_node_names")
+    @patch("src.malla.services.traceroute_service.LocationRepository.get_nodes_location_history")
+    @patch("src.malla.services.traceroute_service.get_traceroute_hops_for_longest_links")
+    def test_longest_links_broken_path_not_aggregated(
+        self, mock_get_hops, mock_get_locs, mock_get_names
+    ):
+        """A zero-SNR middle hop splits A->B->C->D; segments must not join as A->D."""
+        now_ts = datetime.now().timestamp()
+        mock_get_hops.return_value = [
+            self._hop(1, 0, 100, 200, -5.0, now_ts),
+            self._hop(1, 1, 200, 300, 0.0, now_ts),
+            self._hop(1, 2, 300, 400, -5.0, now_ts),
+        ]
+        mock_get_locs.return_value = self._linear_locations(
+            {
+                100: (40.000, -3.0),
+                200: (40.045, -3.0),
+                300: (40.090, -3.0),
+                400: (40.135, -3.0),
+            },
+            now_ts,
+        )
+        mock_get_names.return_value = {nid: f"Node{nid}" for nid in (100, 200, 300, 400)}
+
+        result = TracerouteService.get_longest_links_analysis(
+            min_distance_km=1.0, min_snr=-30.0, max_results=10
+        )
+
+        direct = {(link["from_node_id"], link["to_node_id"]) for link in result["direct_links"]}
+        assert direct == {(100, 200), (300, 400)}
+        assert result["indirect_links"] == []
+        assert result["summary"]["longest_path"] is None
+        assert result["summary"]["longest_direct"] is not None
+
+    @patch("src.malla.services.traceroute_service.get_bulk_node_names")
+    @patch("src.malla.services.traceroute_service.LocationRepository.get_nodes_location_history")
+    @patch("src.malla.services.traceroute_service.get_traceroute_hops_for_longest_links")
+    def test_longest_links_contiguous_path_aggregated(
+        self, mock_get_hops, mock_get_locs, mock_get_names
+    ):
+        """A fully evidenced A->B->C path still aggregates with correct hops/preview."""
+        now_ts = datetime.now().timestamp()
+        mock_get_hops.return_value = [
+            self._hop(1, 0, 100, 200, -5.0, now_ts),
+            self._hop(1, 1, 200, 300, -5.0, now_ts),
+        ]
+        mock_get_locs.return_value = self._linear_locations(
+            {100: (40.000, -3.0), 200: (40.045, -3.0), 300: (40.090, -3.0)},
+            now_ts,
+        )
+        mock_get_names.return_value = {nid: f"Node{nid}" for nid in (100, 200, 300)}
+
+        result = TracerouteService.get_longest_links_analysis(
+            min_distance_km=1.0, min_snr=-10.0, max_results=10
+        )
+
+        assert len(result["indirect_links"]) == 1
+        path = result["indirect_links"][0]
+        assert (path["from_node_id"], path["to_node_id"]) == (100, 300)
+        assert path["hop_count"] == 2
+        assert path["route_preview"] == ["Node100", "Node200", "Node300"]
+        assert path["total_distance_km"] > 9.0
+        assert path["avg_snr"] == -5.0
+
+    @patch("src.malla.services.traceroute_service.LocationRepository.get_node_locations")
+    @patch("src.malla.services.traceroute_service.get_bulk_node_names")
+    @patch("src.malla.services.traceroute_service.get_traceroute_hops_for_graph")
+    def test_network_graph_broken_path_no_indirect(
+        self, mock_get_hops, mock_get_names, mock_get_locs
+    ):
+        """Graph indirect connections require continuity: no fake A->D shortcut."""
+        from src.malla.services.traceroute_service import _NETWORK_GRAPH_CACHE
+
+        _NETWORK_GRAPH_CACHE.clear()
+        now_ts = datetime.now().timestamp()
+        mock_get_hops.return_value = [
+            self._hop(1, 0, 100, 200, -5.0, now_ts),
+            self._hop(1, 1, 200, 300, 0.0, now_ts),
+            self._hop(1, 2, 300, 400, -5.0, now_ts),
+        ]
+        mock_get_names.return_value = {nid: f"Node{nid}" for nid in (100, 200, 300, 400)}
+        mock_get_locs.return_value = []
+
+        try:
+            result = TracerouteService.get_network_graph_data(
+                hours=24,
+                min_snr=-200.0,
+                include_indirect=True,
+                filters={"start_time": now_ts - 60, "end_time": now_ts + 60},
+            )
+        finally:
+            _NETWORK_GRAPH_CACHE.clear()
+
+        direct = {(link["source"], link["target"]) for link in result["links"]}
+        assert direct == {(100, 200), (300, 400)}
+        assert result["indirect_connections"] == []
+        assert result["stats"]["links_filtered_due_to_snr_0"] == 1
+
     @patch("src.malla.services.traceroute_service.get_bulk_node_names")
     @patch("src.malla.services.traceroute_service.get_node_traceroute_statistics")
     def test_node_traceroute_stats(self, mock_get_stats, mock_get_names):
