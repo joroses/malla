@@ -15,6 +15,7 @@ from meshtastic.protobuf import mqtt_pb2
 from ..config import get_config
 from ..utils.decryption import try_decrypt_mesh_packet
 from ..utils.formatting import format_time_ago
+from ..utils.geo_utils import is_valid_position
 from ..utils.node_utils import convert_node_id, get_bulk_node_short_names
 from ..utils.signal_quality import (
     is_plausible_rssi,
@@ -3394,6 +3395,13 @@ class TracerouteRepository:
 class LocationRepository:
     """Repository for location operations."""
 
+    # How many of each node's most recent position packets to consider when
+    # resolving its latest valid location. Firmware bugs intermittently emit
+    # garbage (~0/~0) coordinates; the newest valid packet wins so nodes fall
+    # back to their previous good fix instead of vanishing or jumping to null
+    # island.
+    POSITION_LOOKUP_DEPTH = 5
+
     @staticmethod
     def get_node_locations(
         filters: dict[str, Any] | None = None,
@@ -3455,41 +3463,47 @@ class LocationRepository:
             if extra_conditions:
                 extra_where = "AND " + " AND ".join(extra_conditions)
 
-            # Optimized query using window function instead of correlated subquery
+            # Optimized query using window function instead of correlated subquery.
+            # Ranks each node's recent position packets so the decode loop can
+            # skip invalid ones (null-island garbage) and fall back to the
+            # previous valid fix.
             query = f"""
-                WITH max_timestamps AS (
+                WITH ranked AS (
                     SELECT
-                        from_node_id,
-                        MAX(timestamp) as max_timestamp
-                    FROM packet_history
-                    WHERE portnum = 3  -- POSITION_APP
-                    AND raw_payload IS NOT NULL
-                    AND from_node_id IS NOT NULL
+                        ph.from_node_id,
+                        ph.timestamp,
+                        ph.raw_payload,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY ph.from_node_id
+                            ORDER BY ph.timestamp DESC
+                        ) AS rank
+                    FROM packet_history ph
+                    WHERE ph.portnum = 3  -- POSITION_APP
+                    AND ph.raw_payload IS NOT NULL
+                    AND ph.from_node_id IS NOT NULL
                     {node_ids_clause}
                     {extra_where}
-                    GROUP BY from_node_id
                 )
                 SELECT
-                    ph.from_node_id as node_id,
-                    ph.timestamp,
-                    ph.raw_payload,
+                    r.from_node_id as node_id,
+                    r.timestamp,
+                    r.raw_payload,
                     ni.long_name,
                     ni.short_name,
                     ni.hw_model,
                     ni.role,
                     ni.primary_channel,
-                    printf('!%08x', ph.from_node_id) as hex_id
-                FROM packet_history ph
-                INNER JOIN max_timestamps mt ON ph.from_node_id = mt.from_node_id
-                    AND ph.timestamp = mt.max_timestamp
-                LEFT JOIN node_info ni ON ph.from_node_id = ni.node_id
-                WHERE ph.portnum = 3
-                AND ph.raw_payload IS NOT NULL
-                ORDER BY ph.timestamp DESC
+                    printf('!%08x', r.from_node_id) as hex_id
+                FROM ranked r
+                LEFT JOIN node_info ni ON r.from_node_id = ni.node_id
+                WHERE r.rank <= ?
+                ORDER BY r.timestamp DESC
             """
 
             query_start = time.time()
-            cursor.execute(query, [*node_ids_params, *extra_params])
+            cursor.execute(
+                query, [*node_ids_params, *extra_params, LocationRepository.POSITION_LOOKUP_DEPTH]
+            )
             raw_rows = cursor.fetchall()
             timing_breakdown["sql_query"] = time.time() - query_start
 
@@ -3498,9 +3512,14 @@ class LocationRepository:
             locations = []
             decode_count = 0
             skip_count = 0
+            seen_nodes: set[int] = set()
 
             for row in raw_rows:
                 try:
+                    # A newer row for this node was already accepted
+                    if row["node_id"] in seen_nodes:
+                        continue
+
                     if not row["raw_payload"]:
                         skip_count += 1
                         continue
@@ -3578,12 +3597,7 @@ class LocationRepository:
 
                             precision_meters = math.exp(log_result)
 
-                    if (
-                        latitude is None
-                        or longitude is None
-                        or latitude == 0
-                        or longitude == 0
-                    ):
+                    if not is_valid_position(latitude, longitude):
                         skip_count += 1
                         continue
 
@@ -3592,6 +3606,8 @@ class LocationRepository:
                         or row["short_name"]
                         or f"Node {row['node_id']:08x}"
                     )
+
+                    seen_nodes.add(row["node_id"])
 
                     locations.append(
                         {
@@ -3704,8 +3720,8 @@ class LocationRepository:
                     )
                     altitude = position.altitude if position.altitude else None
 
-                    # Skip invalid coordinates
-                    if not latitude or not longitude:
+                    # Skip invalid coordinates (unset, null-island garbage, out of range)
+                    if not is_valid_position(latitude, longitude):
                         continue
 
                     locations.append(
@@ -3785,7 +3801,7 @@ class LocationRepository:
                             position.longitude_i / 1e7 if position.longitude_i else None
                         )
                         altitude = position.altitude if position.altitude else None
-                        if not latitude or not longitude:
+                        if not is_valid_position(latitude, longitude):
                             continue
 
                         results[row["from_node_id"]].append(
@@ -3833,7 +3849,9 @@ class LocationRepository:
             else:
                 node_id = int(node_id)
 
-            # Fetch the most recent POSITION_APP packet for this node
+            # Fetch the node's most recent POSITION_APP packets so a garbage
+            # newest fix (null-island coordinates) can fall back to the last
+            # valid one
             cursor.execute(
                 """
                 SELECT timestamp, raw_payload
@@ -3842,43 +3860,45 @@ class LocationRepository:
                   AND portnum = 3            -- POSITION_APP
                   AND raw_payload IS NOT NULL
                 ORDER BY timestamp DESC
-                LIMIT 1
+                LIMIT ?
                 """,
-                (node_id,),
+                (node_id, LocationRepository.POSITION_LOOKUP_DEPTH),
             )
-            row = cursor.fetchone()
+            rows = cursor.fetchall()
 
-            if not row:
+            if not rows:
                 conn.close()
                 return None
 
-            # Decode protobuf – this is the same logic used elsewhere but for a single row
-            try:
-                position = mesh_pb2.Position()
-                position.ParseFromString(row["raw_payload"])
+            # Decode protobuf – this is the same logic used elsewhere but for
+            # a handful of rows, returning the newest valid position
+            for row in rows:
+                try:
+                    position = mesh_pb2.Position()
+                    position.ParseFromString(row["raw_payload"])
 
-                latitude = position.latitude_i / 1e7 if position.latitude_i else None
-                longitude = position.longitude_i / 1e7 if position.longitude_i else None
-                altitude = position.altitude if position.altitude else None
+                    latitude = position.latitude_i / 1e7 if position.latitude_i else None
+                    longitude = position.longitude_i / 1e7 if position.longitude_i else None
+                    altitude = position.altitude if position.altitude else None
 
-                if not latitude or not longitude or latitude == 0 or longitude == 0:
+                    if not is_valid_position(latitude, longitude):
+                        continue
+
+                    result = {
+                        "latitude": latitude,
+                        "longitude": longitude,
+                        "altitude": altitude,
+                        "timestamp": row["timestamp"],
+                    }
                     conn.close()
-                    return None
-
-                result = {
-                    "latitude": latitude,
-                    "longitude": longitude,
-                    "altitude": altitude,
-                    "timestamp": row["timestamp"],
-                }
-                conn.close()
-                return result
-            except Exception as e:
-                logger.warning(
-                    f"Failed to decode position payload for node {node_id}: {e}"
-                )
-                conn.close()
-                return None
+                    return result
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to decode position payload for node {node_id}: {e}"
+                    )
+                    continue
+            conn.close()
+            return None
         except Exception as e:
             logger.error(f"Error getting latest location for node {node_id}: {e}")
             raise
@@ -3892,7 +3912,54 @@ class LocationRepository:
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            # First try to get the most recent location before or at the target timestamp
+            def _first_valid_location(
+                rows: list[Any], *, later: bool
+            ) -> dict[str, Any] | None:
+                for location_row in rows:
+                    try:
+                        position = mesh_pb2.Position()
+                        position.ParseFromString(location_row["raw_payload"])
+
+                        latitude = (
+                            position.latitude_i / 1e7 if position.latitude_i else None
+                        )
+                        longitude = (
+                            position.longitude_i / 1e7
+                            if position.longitude_i
+                            else None
+                        )
+                        altitude = position.altitude if position.altitude else None
+
+                        if not is_valid_position(latitude, longitude):
+                            continue
+
+                        if later:
+                            age_seconds = location_row["timestamp"] - target_timestamp
+                        else:
+                            age_seconds = target_timestamp - location_row["timestamp"]
+                        age_hours = age_seconds / 3600
+                        unit = "later" if later else "ago"
+
+                        if age_hours <= 24:
+                            age_warning = f"from {age_hours:.1f}h {unit}"
+                        elif age_hours <= 168:  # 1 week
+                            age_warning = f"from {age_hours / 24:.1f}d {unit}"
+                        else:
+                            age_warning = f"from {age_hours / 168:.1f}w {unit}"
+
+                        return {
+                            "latitude": latitude,
+                            "longitude": longitude,
+                            "altitude": altitude,
+                            "timestamp": location_row["timestamp"],
+                            "age_warning": age_warning,
+                        }
+                    except Exception as e:
+                        logger.warning(f"Failed to decode position from raw payload: {e}")
+                return None
+
+            # Try to get the most recent valid location before or at the target
+            # timestamp, falling back past invalid (null-island) fixes
             query_before = """
                 SELECT timestamp, raw_payload
                 FROM packet_history
@@ -3901,49 +3968,19 @@ class LocationRepository:
                 AND timestamp <= ?
                 AND raw_payload IS NOT NULL
                 ORDER BY timestamp DESC
-                LIMIT 1
+                LIMIT ?
             """
 
-            cursor.execute(query_before, (node_id, target_timestamp))
-            location_before = cursor.fetchone()
-
+            cursor.execute(
+                query_before,
+                (node_id, target_timestamp, LocationRepository.POSITION_LOOKUP_DEPTH),
+            )
+            location_before = _first_valid_location(cursor.fetchall(), later=False)
             if location_before:
-                try:
-                    # Decode position from raw protobuf payload
-                    position = mesh_pb2.Position()
-                    position.ParseFromString(location_before["raw_payload"])
+                conn.close()
+                return location_before
 
-                    # Extract coordinates (stored as integers, need to divide by 1e7)
-                    latitude = (
-                        position.latitude_i / 1e7 if position.latitude_i else None
-                    )
-                    longitude = (
-                        position.longitude_i / 1e7 if position.longitude_i else None
-                    )
-                    altitude = position.altitude if position.altitude else None
-
-                    if latitude and longitude:
-                        age_seconds = target_timestamp - location_before["timestamp"]
-                        age_hours = age_seconds / 3600
-
-                        if age_hours <= 24:
-                            age_warning = f"from {age_hours:.1f}h ago"
-                        elif age_hours <= 168:  # 1 week
-                            age_warning = f"from {age_hours / 24:.1f}d ago"
-                        else:
-                            age_warning = f"from {age_hours / 168:.1f}w ago"
-
-                        return {
-                            "latitude": latitude,
-                            "longitude": longitude,
-                            "altitude": altitude,
-                            "timestamp": location_before["timestamp"],
-                            "age_warning": age_warning,
-                        }
-                except Exception as e:
-                    logger.warning(f"Failed to decode position from raw payload: {e}")
-
-            # If no location before target, try to get the earliest location after
+            # If no valid location before target, try the earliest location after
             query_after = """
                 SELECT timestamp, raw_payload
                 FROM packet_history
@@ -3952,47 +3989,17 @@ class LocationRepository:
                 AND timestamp > ?
                 AND raw_payload IS NOT NULL
                 ORDER BY timestamp ASC
-                LIMIT 1
+                LIMIT ?
             """
 
-            cursor.execute(query_after, (node_id, target_timestamp))
-            location_after = cursor.fetchone()
-
+            cursor.execute(
+                query_after,
+                (node_id, target_timestamp, LocationRepository.POSITION_LOOKUP_DEPTH),
+            )
+            location_after = _first_valid_location(cursor.fetchall(), later=True)
             if location_after:
-                try:
-                    # Decode position from raw protobuf payload
-                    position = mesh_pb2.Position()
-                    position.ParseFromString(location_after["raw_payload"])
-
-                    # Extract coordinates (stored as integers, need to divide by 1e7)
-                    latitude = (
-                        position.latitude_i / 1e7 if position.latitude_i else None
-                    )
-                    longitude = (
-                        position.longitude_i / 1e7 if position.longitude_i else None
-                    )
-                    altitude = position.altitude if position.altitude else None
-
-                    if latitude and longitude:
-                        age_seconds = location_after["timestamp"] - target_timestamp
-                        age_hours = age_seconds / 3600
-
-                        if age_hours <= 24:
-                            age_warning = f"from {age_hours:.1f}h later"
-                        elif age_hours <= 168:  # 1 week
-                            age_warning = f"from {age_hours / 24:.1f}d later"
-                        else:
-                            age_warning = f"from {age_hours / 168:.1f}w later"
-
-                        return {
-                            "latitude": latitude,
-                            "longitude": longitude,
-                            "altitude": altitude,
-                            "timestamp": location_after["timestamp"],
-                            "age_warning": age_warning,
-                        }
-                except Exception as e:
-                    logger.warning(f"Failed to decode position from raw payload: {e}")
+                conn.close()
+                return location_after
 
             conn.close()
             return None

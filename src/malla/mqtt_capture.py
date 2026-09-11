@@ -61,6 +61,7 @@ from malla.config import get_config  # Import here to avoid circular import issu
 from .database.connection import seed_query_planner_stats_async
 from .database.schema import ensure_startup_schema
 from .database.traceroutes import write_traceroute
+from .utils.geo_utils import is_valid_position
 
 # Load the singleton configuration once at module import time.  This ensures the
 # capture tool honours the same YAML + optional environment override mechanism
@@ -1266,9 +1267,19 @@ def on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> Non
             via_mqtt_str = (
                 " (via MQTT)" if getattr(mesh_packet, "via_mqtt", False) else ""
             )
-            logging.info(
-                f"📍 Position from {from_node_display}{via_mqtt_str}: {lat:.5f}, {lon:.5f} (alt: {alt}m)"
-            )
+            if not is_valid_position(
+                lat if position_data.latitude_i else None,
+                lon if position_data.longitude_i else None,
+            ):
+                logging.warning(
+                    f"⚠️ Invalid position from {from_node_display}{via_mqtt_str}: "
+                    f"{lat:.5f}, {lon:.5f} (near null island or out of range) - "
+                    f"will be ignored by UI queries"
+                )
+            else:
+                logging.info(
+                    f"📍 Position from {from_node_display}{via_mqtt_str}: {lat:.5f}, {lon:.5f} (alt: {alt}m)"
+                )
             processed_successfully = True
 
         elif mesh_packet.decoded.portnum == portnums_pb2.PortNum.NODEINFO_APP:
