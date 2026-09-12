@@ -30,7 +30,7 @@ from ..models.traceroute import (
 )
 from ..utils.geo_utils import calculate_distance
 from ..utils.node_utils import get_bulk_node_names
-from ..utils.signal_quality import is_plausible_traceroute_snr
+from ..utils.signal_quality import TRACEROUTE_UNKNOWN_SNR, is_plausible_traceroute_snr
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +253,6 @@ class TracerouteService:
 
                     route_data = route_data_from_row(tr)
                     if route_data is not None:
-
                         if route_data["route_back"]:
                             traceroutes_with_return += 1
 
@@ -587,8 +586,13 @@ class TracerouteService:
                         stats_dict["traceroute_count"] += 1
                         stats_dict["total_distance"] += dist
                         stats_dict["total_snr"] += snr
-                        stats_dict["max_distance"] = max(stats_dict["max_distance"], dist)
-                        if stats_dict["best_snr"] is None or snr > stats_dict["best_snr"]:
+                        stats_dict["max_distance"] = max(
+                            stats_dict["max_distance"], dist
+                        )
+                        if (
+                            stats_dict["best_snr"] is None
+                            or snr > stats_dict["best_snr"]
+                        ):
                             stats_dict["best_snr"] = snr
                         if ts > stats_dict["last_seen"]:
                             stats_dict["last_seen"] = ts
@@ -618,7 +622,9 @@ class TracerouteService:
                         from_name = node_names.get(from_id_path, f"!{from_id_path:08x}")
                         to_name = node_names.get(to_id_path, f"!{to_id_path:08x}")
                         route_preview = [
-                            node_names.get(h["from_node_id"], f"!{h['from_node_id']:08x}")
+                            node_names.get(
+                                h["from_node_id"], f"!{h['from_node_id']:08x}"
+                            )
                             for h in segment
                         ] + [node_names.get(to_id_path, f"!{to_id_path:08x}")]
                         path_stats[p_key] = {
@@ -638,7 +644,9 @@ class TracerouteService:
                     pstats["total_distance"] += path_distance_km
                     pstats["hop_count_total"] += len(segment)
                     pstats["total_snr"] += avg_path_snr
-                    pstats["max_distance"] = max(pstats["max_distance"], path_distance_km)
+                    pstats["max_distance"] = max(
+                        pstats["max_distance"], path_distance_km
+                    )
                     ts = segment[0]["timestamp"]
                     if ts > pstats["last_seen"]:
                         pstats["last_seen"] = ts
@@ -663,7 +671,9 @@ class TracerouteService:
 
                 avg_distance = stats["total_distance"] / stats["traceroute_count"]
                 avg_snr = stats["total_snr"] / stats["traceroute_count"]
-                packet_id = stats["recent_packets"][0] if stats["recent_packets"] else None
+                packet_id = (
+                    stats["recent_packets"][0] if stats["recent_packets"] else None
+                )
                 packet_url = f"/packet/{packet_id}" if packet_id is not None else None
 
                 analyzed_links.append(
@@ -687,7 +697,11 @@ class TracerouteService:
                     continue
 
                 avg_distance = stats["total_distance"] / stats["traceroute_count"]
-                avg_snr = (stats["total_snr"] / stats["traceroute_count"]) if stats["total_snr"] else None
+                avg_snr = (
+                    (stats["total_snr"] / stats["traceroute_count"])
+                    if stats["total_snr"]
+                    else None
+                )
                 pkt_id = stats["recent_packets"][0] if stats["recent_packets"] else None
                 pkt_url = f"/packet/{pkt_id}" if pkt_id is not None else None
 
@@ -698,7 +712,9 @@ class TracerouteService:
                         "from_node_name": stats["from_node_name"],
                         "to_node_name": stats["to_node_name"],
                         "total_distance_km": round(avg_distance, 2),
-                        "hop_count": int(round(stats["hop_count_total"] / stats["traceroute_count"])),
+                        "hop_count": int(
+                            round(stats["hop_count_total"] / stats["traceroute_count"])
+                        ),
                         "avg_snr": round(avg_snr, 1) if avg_snr is not None else None,
                         "traceroute_count": stats["traceroute_count"],
                         "route_preview": stats["route_preview"],
@@ -718,8 +734,14 @@ class TracerouteService:
             build_duration = time.time() - build_start
             logger.info(f"TIMING: Result building took {build_duration:.3f}s")
 
-            longest_direct = f"{analyzed_links[0]['distance_km']:.2f} km" if analyzed_links else None
-            longest_path = f"{analyzed_paths[0]['total_distance_km']:.2f} km" if analyzed_paths else None
+            longest_direct = (
+                f"{analyzed_links[0]['distance_km']:.2f} km" if analyzed_links else None
+            )
+            longest_path = (
+                f"{analyzed_paths[0]['total_distance_km']:.2f} km"
+                if analyzed_paths
+                else None
+            )
 
             result_dict = {
                 "summary": {
@@ -823,7 +845,9 @@ class TracerouteService:
             # Statistics
             stats = {
                 "packets_analyzed": len({h["packet_id"] for h in hops}),
-                "packets_with_rf_hops": len({(h["packet_id"], h.get("direction", "forward")) for h in hops}),
+                "packets_with_rf_hops": len(
+                    {(h["packet_id"], h.get("direction", "forward")) for h in hops}
+                ),
                 "total_rf_hops": len(hops),
                 "links_found": 0,
                 "links_filtered_by_snr": 0,
@@ -872,23 +896,47 @@ class TracerouteService:
                             nodes[node_id]["last_seen"] = ts
 
                     link_key = tuple(sorted([from_id, to_id]))
-                    if link_key not in direct_links:
-                        direct_links[link_key] = {
+                    # Direction is derived from the hop's own endpoints, not
+                    # from the traceroute path it belongs to: a return path
+                    # may still contain canonically forward hops.
+                    is_forward_hop = from_id == link_key[0]
+                    # The -32.0 sentinel is a real hop with unrecorded SNR:
+                    # it counts as an observation but contributes no SNR to
+                    # the directional averages.
+                    directional_snr = None if snr == TRACEROUTE_UNKNOWN_SNR else snr
+                    link = direct_links.get(link_key)
+                    if link is None:
+                        link = {
                             "source": link_key[0],
                             "target": link_key[1],
-                            "snr_values": [snr],
-                            "packet_count": 1,
+                            "snr_values": [],
+                            "forward_snr_sum": 0.0,
+                            "forward_snr_count": 0,
+                            "forward_observations": 0,
+                            "return_snr_sum": 0.0,
+                            "return_snr_count": 0,
+                            "return_observations": 0,
+                            "packet_count": 0,
                             "last_seen": ts,
                             "last_packet_id": packet_id,
                         }
+                        direct_links[link_key] = link
                         stats["links_found"] += 1
+                    link["snr_values"].append(snr)
+                    if is_forward_hop:
+                        link["forward_observations"] += 1
+                        if directional_snr is not None:
+                            link["forward_snr_sum"] += directional_snr
+                            link["forward_snr_count"] += 1
                     else:
-                        link = direct_links[link_key]
-                        link["snr_values"].append(snr)
-                        link["packet_count"] += 1
-                        if ts > link["last_seen"]:
-                            link["last_seen"] = ts
-                            link["last_packet_id"] = packet_id
+                        link["return_observations"] += 1
+                        if directional_snr is not None:
+                            link["return_snr_sum"] += directional_snr
+                            link["return_snr_count"] += 1
+                    link["packet_count"] += 1
+                    if ts > link["last_seen"]:
+                        link["last_seen"] = ts
+                        link["last_packet_id"] = packet_id
 
                     nodes[from_id]["connections"].add(to_id)
                     nodes[to_id]["connections"].add(from_id)
@@ -954,6 +1002,21 @@ class TracerouteService:
             processed_links = []
             for link_data in direct_links.values():
                 avg_snr = sum(link_data["snr_values"]) / len(link_data["snr_values"])
+                # forward/return relative to the canonical link key
+                # (lower node id → higher); counts are hop observations per
+                # direction, averages use only hops with recorded SNR.
+                forward_count = link_data["forward_observations"]
+                return_count = link_data["return_observations"]
+                forward_avg_snr = (
+                    link_data["forward_snr_sum"] / link_data["forward_snr_count"]
+                    if link_data["forward_snr_count"]
+                    else None
+                )
+                return_avg_snr = (
+                    link_data["return_snr_sum"] / link_data["return_snr_count"]
+                    if link_data["return_snr_count"]
+                    else None
+                )
 
                 # Calculate link strength based on SNR and packet count
                 # Higher SNR and more packets = stronger link
@@ -968,6 +1031,14 @@ class TracerouteService:
                         "target": link_data["target"],
                         "type": "direct",
                         "avg_snr": round(avg_snr, 1),
+                        "forward_avg_snr": round(forward_avg_snr, 1)
+                        if forward_avg_snr is not None
+                        else None,
+                        "return_avg_snr": round(return_avg_snr, 1)
+                        if return_avg_snr is not None
+                        else None,
+                        "forward_count": forward_count,
+                        "return_count": return_count,
                         "packet_count": link_data["packet_count"],
                         "strength": round(strength, 1),
                         "last_seen": link_data["last_seen"],

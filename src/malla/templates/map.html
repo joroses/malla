@@ -1671,6 +1671,32 @@ function createLinkPopupContent(link) {
         losButton.addEventListener('click', () => showLineOfSight(link.from_node_id, link.to_node_id));
     }
 
+    // Null-safe value check: a real 0.0 dB measurement must still display.
+    const hasValue = v => v !== null && v !== undefined && !Number.isNaN(v);
+
+    // Per-direction breakdown: forward = from_node → to_node, return = to_node → from_node.
+    const directionalRows = [];
+    if (hasValue(link.forward_avg_snr) || (link.forward_count ?? 0) > 0) {
+        directionalRows.push(el('div', { className: 'small' },
+            el('strong', null, `${fromName} → ${toName}:`),
+            textNode(` ${hasValue(link.forward_avg_snr) ? `${link.forward_avg_snr.toFixed(1)} dB` : 'N/A'} (${link.forward_count ?? 0} measurements)`)));
+    }
+    if (hasValue(link.return_avg_snr) || (link.return_count ?? 0) > 0) {
+        directionalRows.push(el('div', { className: 'small' },
+            el('strong', null, `${toName} → ${fromName}:`),
+            textNode(` ${hasValue(link.return_avg_snr) ? `${link.return_avg_snr.toFixed(1)} dB` : 'N/A'} (${link.return_count ?? 0} measurements)`)));
+    }
+    if (hasValue(link.forward_avg_rssi)) {
+        directionalRows.push(el('div', { className: 'small' },
+            el('strong', null, `${fromName} → ${toName} RSSI:`),
+            textNode(` ${link.forward_avg_rssi.toFixed(1)} dBm`)));
+    }
+    if (hasValue(link.return_avg_rssi)) {
+        directionalRows.push(el('div', { className: 'small' },
+            el('strong', null, `${toName} → ${fromName} RSSI:`),
+            textNode(` ${link.return_avg_rssi.toFixed(1)} dBm`)));
+    }
+
     return el('div', { className: 'traceroute-link-info' },
         el('div', { className: 'fw-bold mb-2' }, link.link_type === 'packet' ? 'Direct Packet Link' : 'Traceroute RF Hop'),
         el('div', null, el('strong', null, 'From:'), textNode(` ${fromName}`)),
@@ -1678,8 +1704,9 @@ function createLinkPopupContent(link) {
         el('div', null, el('strong', null, 'Success Rate:'), textNode(' '), el('span', { className: qualityClass }, `${link.success_rate.toFixed(1)}%`)),
         el('div', null, el('strong', null, 'Attempts:'), textNode(` ${link.total_hops_seen}`)),
         el('div', null, el('strong', null, 'Last Seen:'), textNode(` ${formattedTime}`)),
-        link.avg_snr ? el('div', null, el('strong', null, 'Avg SNR:'), textNode(` ${link.avg_snr.toFixed(1)} dB`)) : null,
-        link.avg_rssi ? el('div', null, el('strong', null, 'Avg RSSI:'), textNode(` ${link.avg_rssi.toFixed(0)} dBm`)) : null,
+        hasValue(link.avg_snr) ? el('div', null, el('strong', null, 'Avg SNR:'), textNode(` ${link.avg_snr.toFixed(1)} dB`)) : null,
+        hasValue(link.avg_rssi) ? el('div', null, el('strong', null, 'Avg RSSI:'), textNode(` ${link.avg_rssi.toFixed(0)} dBm`)) : null,
+        directionalRows.length ? el('div', { className: 'mt-1' }, ...directionalRows) : null,
         el('div', { className: 'mt-2 d-flex gap-1' }, historyButton, losButton)
     );
 }
