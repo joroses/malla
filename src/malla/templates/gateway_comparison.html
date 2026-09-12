@@ -401,9 +401,12 @@ document.getElementById('gateway2').addEventListener('change', function() {
 </script>
 
 {% if comparison_data and not comparison_data.get('error') and comparison_data.chart_data %}
+<script id="comparison-chart-data" type="application/json">
+{{ comparison_data.chart_data | tojson | safe }}
+</script>
 <script>
 // Chart data from server
-const chartData = {{ comparison_data.chart_data | tojson | safe }};
+const chartData = JSON.parse(document.getElementById('comparison-chart-data').textContent);
 
 // RSSI Scatter Plot
 const rssiScatterTrace = {

@@ -1443,19 +1443,8 @@ function toggleTracerouteLinks() {
         return;
     }
 
-    const btn = document.getElementById('linkToggleBtn'); // may be null on this page
-
     if (showTracerouteLinks) {
         drawTracerouteLinks();
-        if (btn) {
-            setChildren(btn, icon('bi bi-link-45deg'), textNode(' Hide Traceroute Links'));
-            btn.className = 'btn btn-sm btn-outline-info';
-        }
-    } else {
-        if (btn) {
-            setChildren(btn, icon('bi bi-link-45deg-off'), textNode(' Show Traceroute Links'));
-            btn.className = 'btn btn-sm btn-outline-secondary';
-        }
     }
 }
 
@@ -1471,19 +1460,8 @@ function togglePacketLinks() {
         return;
     }
 
-    const btn = document.getElementById('packetLinkToggleBtn'); // may be null
-
     if (showPacketLinks) {
         drawPacketLinks();
-        if (btn) {
-            setChildren(btn, icon('bi bi-envelope-open'), textNode(' Hide Packet Links'));
-            btn.className = 'btn btn-sm btn-outline-info';
-        }
-    } else {
-        if (btn) {
-            setChildren(btn, icon('bi bi-envelope-open'), textNode(' Show Packet Links'));
-            btn.className = 'btn btn-sm btn-outline-secondary';
-        }
     }
 }
 
