@@ -23,6 +23,14 @@
     <!-- Global 2025 theme overrides -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/malla.css') }}">
 
+    <!-- Link-quality palette, injected once from the backend single source
+         (src/malla/utils/signal_quality.py). Legend swatches, badges and
+         unknown-color fallbacks must read this instead of hardcoding hex
+         values, so frontend colors can never drift from the backend. -->
+    <script>
+        window.MALLA_QUALITY_COLORS = {{ QUALITY_COLORS | tojson }};
+    </script>
+
     <style>
         .navbar-brand {
             font-weight: bold;
