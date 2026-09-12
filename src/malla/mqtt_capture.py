@@ -905,7 +905,6 @@ def log_packet_to_database(
                     "mesh_packet_id": mesh_packet_id,
                     "from_node_id": from_node_id,
                     "to_node_id": to_node_id,
-                    "channel_id": channel_id,
                     "hop_start": hop_start,
                     "hop_limit": hop_limit,
                     "raw_payload": raw_payload,

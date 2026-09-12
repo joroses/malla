@@ -40,16 +40,13 @@ def ensure_traceroute_schema(cursor: sqlite3.Cursor) -> None:
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS traceroute_hops (
             packet_id INTEGER NOT NULL REFERENCES traceroute_routes(packet_id) ON DELETE CASCADE,
-            mesh_packet_id INTEGER NOT NULL,
             direction TEXT NOT NULL CHECK (direction IN ('forward', 'return')),
             hop_index INTEGER NOT NULL CHECK (hop_index >= 0),
             timestamp REAL NOT NULL,
             from_node_id INTEGER NOT NULL,
             to_node_id INTEGER NOT NULL,
             snr REAL,
-            channel_id TEXT,
-            reception_count INTEGER NOT NULL DEFAULT 1,
-            PRIMARY KEY (mesh_packet_id, direction, hop_index, from_node_id, to_node_id)
+            PRIMARY KEY (packet_id, direction, hop_index)
         )
     """)
 
@@ -67,7 +64,6 @@ def ensure_traceroute_schema(cursor: sqlite3.Cursor) -> None:
         ("hops_time_link", "traceroute_hops", "timestamp, from_node_id, to_node_id"),
         ("hops_source_time", "traceroute_hops", "from_node_id, timestamp"),
         ("hops_target_time", "traceroute_hops", "to_node_id, timestamp"),
-        ("hops_packet", "traceroute_hops", "packet_id"),
     ):
         cursor.execute(
             f"CREATE INDEX IF NOT EXISTS idx_traceroute_{name} ON {table} ({columns})"
@@ -84,16 +80,6 @@ def ensure_traceroute_schema(cursor: sqlite3.Cursor) -> None:
         ),
     ):
         old_cleanup = (
-            "UPDATE traceroute_hops SET packet_id = ("
-            "    SELECT r.packet_id FROM traceroute_routes r "
-            "    WHERE r.mesh_packet_id = traceroute_hops.mesh_packet_id "
-            "      AND r.packet_id != OLD.id "
-            "    LIMIT 1"
-            ") WHERE packet_id = OLD.id AND EXISTS ("
-            "    SELECT 1 FROM traceroute_routes r "
-            "    WHERE r.mesh_packet_id = traceroute_hops.mesh_packet_id "
-            "      AND r.packet_id != OLD.id"
-            "); "
             "DELETE FROM traceroute_hops WHERE packet_id = OLD.id; "
             "DELETE FROM traceroute_routes WHERE packet_id = OLD.id;"
             if event == "update"
@@ -104,6 +90,7 @@ def ensure_traceroute_schema(cursor: sqlite3.Cursor) -> None:
             AFTER {operation} ON packet_history
             BEGIN
                 {old_cleanup}
+                DELETE FROM traceroute_hops WHERE packet_id = NEW.id;
                 DELETE FROM traceroute_routes WHERE packet_id = NEW.id;
                 INSERT INTO traceroute_routes
                     (packet_id, timestamp, mesh_packet_id, from_node_id, to_node_id)
@@ -116,16 +103,6 @@ def ensure_traceroute_schema(cursor: sqlite3.Cursor) -> None:
         CREATE TRIGGER IF NOT EXISTS traceroute_packet_delete
         AFTER DELETE ON packet_history
         BEGIN
-            UPDATE traceroute_hops SET packet_id = (
-                SELECT r.packet_id FROM traceroute_routes r
-                WHERE r.mesh_packet_id = traceroute_hops.mesh_packet_id
-                  AND r.packet_id != OLD.id
-                LIMIT 1
-            ) WHERE packet_id = OLD.id AND EXISTS (
-                SELECT 1 FROM traceroute_routes r
-                WHERE r.mesh_packet_id = traceroute_hops.mesh_packet_id
-                  AND r.packet_id != OLD.id
-            );
             DELETE FROM traceroute_hops WHERE packet_id = OLD.id;
             DELETE FROM traceroute_routes WHERE packet_id = OLD.id;
         END
