@@ -201,7 +201,6 @@ class TestAPIStatsEndpoints:
                 "avg_rssi",
                 "avg_snr",
                 "packet_types",
-                "success_rate",
             ],
         )
 

@@ -135,8 +135,8 @@
         {% call legend_section(legend_items) %}
             <div class="legend-item mt-2">
                 <small class="text-muted">Node size = traffic volume<br>
-                Link thickness = signal strength<br>
-                Colors = SNR quality</small>
+                Link thickness = observation volume<br>
+                Link color = link quality (preset-aware)</small>
             </div>
         {% endcall %}
     {% endcall %}
@@ -638,17 +638,19 @@ function renderGraph(data) {
 
         console.log('Created simulation with', data.nodes.length, 'nodes');
 
-        // Create links
+        // Create links. Color comes from the shared quality palette
+        // (preset-aware tier); thickness is pure observation volume.
+        const linkColor = d => d.quality_color || snrColorScale(d.avg_snr);
         const link = g.append('g')
             .attr('class', 'links')
             .selectAll('line')
             .data(data.links)
             .join('line')
             .attr('class', 'link')
-            .attr('stroke', d => snrColorScale(d.avg_snr))
+            .attr('stroke', linkColor)
             .attr('stroke-width', d => Math.max(1, d.strength))
             .attr('stroke-opacity', 0.8)
-            .attr('data-original-stroke', d => snrColorScale(d.avg_snr))
+            .attr('data-original-stroke', linkColor)
             .attr('data-original-width', d => Math.max(1, d.strength))
             .style('cursor', 'pointer')
             .on('mouseover', function(event, d) {
@@ -1396,16 +1398,24 @@ function showSelectedLinkDetails(link) {
         ),
         el('div', { className: 'row' },
             el('div', { className: 'col-6' },
-                el('strong', null, 'Average SNR:'),
+                el('strong', null, 'Quality:'),
                 el('br'),
-                el('span', { className: `h5 ${link.avg_snr > -10 ? 'text-success' : 'text-warning'}` }, `${link.avg_snr} dB`)
+                link.quality
+                    ? el('span', { className: 'h5', style: `color:${link.quality_color || '#6c757d'}` },
+                        `${link.quality.charAt(0).toUpperCase() + link.quality.slice(1)}`)
+                    : el('span', { className: `h5 ${link.avg_snr > -10 ? 'text-success' : 'text-warning'}` }, `${link.avg_snr} dB`)
             ),
             el('div', { className: 'col-6' },
-                el('strong', null, 'Packets:'),
+                el('strong', null, link.estimated_reliability !== null && link.estimated_reliability !== undefined ? 'Est. Reliability:' : 'Packets:'),
                 el('br'),
-                el('span', { className: 'h5 text-info' }, String(link.packet_count || link.path_count || 0))
+                link.estimated_reliability !== null && link.estimated_reliability !== undefined
+                    ? el('span', { className: 'h5 text-info' }, `${link.estimated_reliability.toFixed(1)}%`)
+                    : el('span', { className: 'h5 text-info' }, String(link.observation_count || link.packet_count || link.path_count || 0))
             )
         ),
+        link.worst_snr !== null && link.worst_snr !== undefined ? el('div', { className: 'small text-muted' },
+            textNode(`Worst-direction SNR ${link.worst_snr.toFixed(1)} dB${link.spreading_factor ? ` · SF${link.spreading_factor}${link.channel_id ? ` (${link.channel_id})` : ''}` : ''}${link.is_bidirectional === false ? ' · one direction observed' : ''}`)
+        ) : null,
         link.hop_count ? el('div', { className: 'row mt-2' },
             el('div', { className: 'col-6' }, el('strong', null, 'Hop Count:'), el('br'), el('span', { className: 'h6 text-primary' }, String(link.hop_count)))
         ) : null,

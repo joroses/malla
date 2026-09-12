@@ -14,6 +14,7 @@ import time
 from datetime import datetime, timedelta
 from typing import Any
 
+from ..config import get_config
 from ..database.repositories import (
     LocationRepository,
     TracerouteRepository,
@@ -29,8 +30,15 @@ from ..models.traceroute import (
     TraceroutePacket,  # Use the correct TraceroutePacket class
 )
 from ..utils.geo_utils import calculate_distance
+from ..utils.link_quality import enrich_link_quality, observation_strength
 from ..utils.node_utils import get_bulk_node_names
-from ..utils.signal_quality import TRACEROUTE_UNKNOWN_SNR, is_plausible_traceroute_snr
+from ..utils.signal_quality import (
+    BALANCE_UNKNOWN,
+    QUALITY_UNKNOWN,
+    TRACEROUTE_UNKNOWN_SNR,
+    get_quality_color,
+    is_plausible_traceroute_snr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +54,10 @@ def _network_graph_cache_key(
     limit_packets: int,
     filters: dict[str, Any] | None,
 ) -> str:
+    # Link quality depends on the RF configuration (preset-aware model), so it
+    # belongs to the cache identity: changing MALLA_LORA_PRESET must produce
+    # different tiers without waiting for the TTL to expire.
+    cfg = get_config()
     return repr(
         (
             hours,
@@ -53,6 +65,8 @@ def _network_graph_cache_key(
             include_indirect,
             limit_packets,
             sorted((filters or {}).items()),
+            cfg.lora_preset,
+            cfg.lora_spreading_factor,
         )
     )
 
@@ -279,11 +293,6 @@ class TracerouteService:
                                 )
 
             # Calculate statistics
-            success_rate = (
-                (successful_traceroutes / total_traceroutes * 100)
-                if total_traceroutes > 0
-                else 0
-            )
             return_path_rate = (
                 (traceroutes_with_return / successful_traceroutes * 100)
                 if successful_traceroutes > 0
@@ -313,7 +322,6 @@ class TracerouteService:
                 "time_period_hours": hours,
                 "total_traceroutes": total_traceroutes,
                 "successful_traceroutes": successful_traceroutes,
-                "success_rate": round(success_rate, 1),
                 "traceroutes_with_return": traceroutes_with_return,
                 "return_path_rate": round(return_path_rate, 1),
                 "unique_routes": len(unique_routes),
@@ -902,14 +910,13 @@ class TracerouteService:
                     is_forward_hop = from_id == link_key[0]
                     # The -32.0 sentinel is a real hop with unrecorded SNR:
                     # it counts as an observation but contributes no SNR to
-                    # the directional averages.
+                    # any average (directional or combined).
                     directional_snr = None if snr == TRACEROUTE_UNKNOWN_SNR else snr
                     link = direct_links.get(link_key)
                     if link is None:
                         link = {
                             "source": link_key[0],
                             "target": link_key[1],
-                            "snr_values": [],
                             "forward_snr_sum": 0.0,
                             "forward_snr_count": 0,
                             "forward_observations": 0,
@@ -919,10 +926,12 @@ class TracerouteService:
                             "packet_count": 0,
                             "last_seen": ts,
                             "last_packet_id": packet_id,
+                            # Most recent channel hint (timestamp, then
+                            # packet id as tie-breaker) for preset resolution.
+                            "last_channel": hop.get("channel_id"),
                         }
                         direct_links[link_key] = link
                         stats["links_found"] += 1
-                    link["snr_values"].append(snr)
                     if is_forward_hop:
                         link["forward_observations"] += 1
                         if directional_snr is not None:
@@ -934,14 +943,16 @@ class TracerouteService:
                             link["return_snr_sum"] += directional_snr
                             link["return_snr_count"] += 1
                     link["packet_count"] += 1
-                    if ts > link["last_seen"]:
+                    if (ts, packet_id) > (link["last_seen"], link["last_packet_id"]):
                         link["last_seen"] = ts
                         link["last_packet_id"] = packet_id
+                        link["last_channel"] = hop.get("channel_id")
 
                     nodes[from_id]["connections"].add(to_id)
                     nodes[to_id]["connections"].add(from_id)
-                    nodes[from_id]["total_snr"] += snr
-                    nodes[from_id]["snr_count"] += 1
+                    if directional_snr is not None:
+                        nodes[from_id]["total_snr"] += directional_snr
+                        nodes[from_id]["snr_count"] += 1
 
                 # Process indirect connections if requested. Only contiguous
                 # runs of qualifying hops count as a path: a route whose middle
@@ -958,20 +969,30 @@ class TracerouteService:
                         indirect_key = tuple(sorted([first_from, last_to]))
                         if indirect_key in direct_links:
                             continue
-                        path_snrs = [h["snr"] for h in segment]
+                        path_snrs = [
+                            h["snr"]
+                            for h in segment
+                            if h["snr"] != TRACEROUTE_UNKNOWN_SNR
+                        ]
                         if indirect_key not in indirect_connections:
                             indirect_connections[indirect_key] = {
                                 "source": indirect_key[0],
                                 "target": indirect_key[1],
-                                "hop_count": len(segment),
+                                "hop_total": len(segment),
                                 "path_count": 1,
-                                "avg_snr": sum(path_snrs) / len(path_snrs),
+                                "avg_snr": sum(path_snrs) / len(path_snrs)
+                                if path_snrs
+                                else None,
                                 "last_seen": ts,
                                 "last_packet_id": packet_id,
                             }
                         else:
                             conn = indirect_connections[indirect_key]
                             conn["path_count"] += 1
+                            # Paths between the same endpoints can vary in
+                            # length; accumulate the actual hops so the
+                            # observation volume reflects real observations.
+                            conn["hop_total"] += len(segment)
                             if ts > conn["last_seen"]:
                                 conn["last_seen"] = ts
                                 conn["last_packet_id"] = packet_id
@@ -1001,12 +1022,16 @@ class TracerouteService:
             # Process direct links - calculate average SNR and strength
             processed_links = []
             for link_data in direct_links.values():
-                avg_snr = sum(link_data["snr_values"]) / len(link_data["snr_values"])
                 # forward/return relative to the canonical link key
                 # (lower node id → higher); counts are hop observations per
                 # direction, averages use only hops with recorded SNR.
+                # The combined average reuses the same directional sums, so
+                # the -32.0 "unknown" sentinel is excluded everywhere.
                 forward_count = link_data["forward_observations"]
                 return_count = link_data["return_observations"]
+                snr_sum = link_data["forward_snr_sum"] + link_data["return_snr_sum"]
+                snr_count = link_data["forward_snr_count"] + link_data["return_snr_count"]
+                avg_snr = snr_sum / snr_count if snr_count else None
                 forward_avg_snr = (
                     link_data["forward_snr_sum"] / link_data["forward_snr_count"]
                     if link_data["forward_snr_count"]
@@ -1017,12 +1042,26 @@ class TracerouteService:
                     if link_data["return_snr_count"]
                     else None
                 )
+                forward_avg_snr_rounded = (
+                    round(forward_avg_snr, 1)
+                    if forward_avg_snr is not None
+                    else None
+                )
+                return_avg_snr_rounded = (
+                    round(return_avg_snr, 1) if return_avg_snr is not None else None
+                )
 
-                # Calculate link strength based on SNR and packet count
-                # Higher SNR and more packets = stronger link
-                strength = min(
-                    10,
-                    max(1, (avg_snr + 20) / 5 + math.log10(link_data["packet_count"])),
+                # Every consumer sees the same quality/reliability/balance
+                # metrics; strength is pure observation volume (thickness =
+                # "how much data", color = quality), so a weak-but-observed
+                # link no longer looks thin-and-bad and a strong-signal link
+                # with one observation no longer looks thick-and-good.
+                enriched = enrich_link_quality(
+                    channel_id=link_data.get("last_channel"),
+                    forward_avg_snr=forward_avg_snr_rounded,
+                    return_avg_snr=return_avg_snr_rounded,
+                    forward_observations=forward_count,
+                    return_observations=return_count,
                 )
 
                 processed_links.append(
@@ -1030,43 +1069,61 @@ class TracerouteService:
                         "source": link_data["source"],
                         "target": link_data["target"],
                         "type": "direct",
-                        "avg_snr": round(avg_snr, 1),
-                        "forward_avg_snr": round(forward_avg_snr, 1)
-                        if forward_avg_snr is not None
-                        else None,
-                        "return_avg_snr": round(return_avg_snr, 1)
-                        if return_avg_snr is not None
-                        else None,
+                        "avg_snr": round(avg_snr, 1) if avg_snr is not None else None,
+                        "forward_avg_snr": forward_avg_snr_rounded,
+                        "return_avg_snr": return_avg_snr_rounded,
                         "forward_count": forward_count,
                         "return_count": return_count,
                         "packet_count": link_data["packet_count"],
-                        "strength": round(strength, 1),
                         "last_seen": link_data["last_seen"],
                         "last_packet_id": link_data["last_packet_id"],
+                        **enriched,
                     }
                 )
 
-            # Process indirect connections
+            # Process indirect connections. These are inferred multi-hop
+            # paths, not measured direct links: RF quality metrics stay
+            # unknown/null instead of presenting the path SNR average as a
+            # measured direct-link quality. Strength still reflects
+            # observation volume (path observations) and the links render
+            # visually distinct (is_inferred flag).
             processed_indirect = []
             if include_indirect:
                 for conn_data in indirect_connections.values():
+                    # Observation volume is the sum of actual hops across
+                    # every qualifying path, not hop_count × path_count
+                    # (which assumes all paths share the first path's
+                    # length and overcounts when path lengths vary).
+                    observation_count = conn_data["hop_total"]
                     processed_indirect.append(
                         {
                             "source": conn_data["source"],
                             "target": conn_data["target"],
                             "type": "indirect",
-                            "hop_count": conn_data["hop_count"],
+                            "is_inferred": True,
+                            "hop_count": int(
+                                round(conn_data["hop_total"] / conn_data["path_count"])
+                            ),
                             "path_count": conn_data["path_count"],
                             "avg_snr": round(conn_data["avg_snr"], 1)
                             if conn_data["avg_snr"]
                             else None,
-                            "strength": min(
-                                5,
-                                max(
-                                    0.5,
-                                    conn_data["path_count"] / conn_data["hop_count"],
-                                ),
-                            ),
+                            "channel_id": None,
+                            "spreading_factor": None,
+                            "forward_quality": QUALITY_UNKNOWN,
+                            "return_quality": QUALITY_UNKNOWN,
+                            "quality": QUALITY_UNKNOWN,
+                            "worst_snr": None,
+                            "forward_estimated_reliability": None,
+                            "return_estimated_reliability": None,
+                            "estimated_reliability": None,
+                            "link_balance": BALANCE_UNKNOWN,
+                            "is_bidirectional": None,
+                            "observation_count": observation_count,
+                            "strength": observation_strength(observation_count),
+                            "forward_color": get_quality_color(QUALITY_UNKNOWN),
+                            "return_color": get_quality_color(QUALITY_UNKNOWN),
+                            "quality_color": get_quality_color(QUALITY_UNKNOWN),
                             "last_seen": conn_data["last_seen"],
                             "last_packet_id": conn_data["last_packet_id"],
                         }

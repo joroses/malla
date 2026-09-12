@@ -622,28 +622,55 @@
             el('br')
         );
 
-        if (forwardObserved && returnObserved) {
+        const isBidirectional = data.is_bidirectional !== undefined && data.is_bidirectional !== null
+            ? data.is_bidirectional
+            : (forwardObserved && returnObserved);
+        const hasCoverage = data.observation_count !== undefined && data.observation_count !== null
+            ? data.observation_count > 0
+            : (forwardObserved || returnObserved);
+
+        if (isBidirectional) {
             appendChildren(content, badge('Bidirectional Link', 'bg-success signal-badge'));
-        } else if (forwardObserved || returnObserved) {
+        } else if (hasCoverage) {
             appendChildren(content, badge('Unidirectional Link', 'bg-warning signal-badge'));
         } else {
             appendChildren(content, badge('No Data', 'bg-secondary signal-badge'));
+        }
+
+        // Shared quality metrics (same fields as the network graph and map).
+        if (data.quality) {
+            const qualityClass = data.quality === 'good' ? 'bg-success'
+                : data.quality === 'fair' ? 'bg-warning'
+                : data.quality === 'marginal' ? 'bg-danger'
+                : 'bg-secondary';
+            appendChildren(content,
+                ' ',
+                badge(`${data.quality}${data.spreading_factor ? ` · SF${data.spreading_factor}` : ''}`, `${qualityClass} signal-badge`));
+            if (data.estimated_reliability !== null && data.estimated_reliability !== undefined) {
+                appendChildren(content, ' ', badge(`Est. reliability ${data.estimated_reliability.toFixed(1)}%`, 'bg-info signal-badge'));
+            }
+            if (data.is_bidirectional === false) {
+                appendChildren(content, ' ', badge('Incomplete coverage', 'bg-secondary signal-badge'));
+            }
         }
 
         // Explicitly labelled per-direction measurements relative to URL order
         const fromLabel = formatNodeIdForDisplay(fromNodeId);
         const toLabel = formatNodeIdForDisplay(toNodeId);
         const total = forwardCount + returnCount;
-        const formatDirection = (label, avgSnr, count) => {
+        const formatDirection = (label, avgSnr, count, quality, reliability) => {
             const snrText = avgSnr !== null && avgSnr !== undefined
                 ? `${avgSnr.toFixed(1)} dB` : 'SNR N/A';
             const percentage = total > 0 ? ` (${(count / total * 100).toFixed(1)}%)` : '';
-            return `${label}: ${snrText} — ${count} measurements${percentage}`;
+            const qualityText = quality && quality !== 'unknown'
+                ? ` — ${quality}${reliability !== null && reliability !== undefined ? ` · est. ${reliability.toFixed(1)}%` : ''}`
+                : '';
+            return `${label}: ${snrText}${qualityText} — ${count} measurements${percentage}`;
         };
         const details = el('small', { className: 'text-muted mt-1 d-block' });
-        details.append(formatDirection(`${fromLabel} → ${toLabel}`, data.forward_avg_snr, forwardCount));
+        details.append(formatDirection(`${fromLabel} → ${toLabel}`, data.forward_avg_snr, forwardCount, data.forward_quality, data.forward_estimated_reliability));
         details.appendChild(el('br'));
-        details.append(formatDirection(`${toLabel} → ${fromLabel}`, data.return_avg_snr, returnCount));
+        details.append(formatDirection(`${toLabel} → ${fromLabel}`, data.return_avg_snr, returnCount, data.return_quality, data.return_estimated_reliability));
         appendChildren(content, el('br'), details);
 
         setChildren(directionDiv, content);

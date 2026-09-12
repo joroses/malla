@@ -13,6 +13,7 @@ from malla.database.traceroute_read_repository import (
     get_route_patterns_data,
     get_traceroute_hops_for_graph,
     get_traceroute_hops_for_longest_links,
+    get_traceroute_link,
     get_traceroute_packets,
 )
 from malla.database.traceroute_schema import ensure_traceroute_schema
@@ -269,4 +270,71 @@ def test_get_nodes_location_history(database):
     assert locs[100][0]["altitude"] == 150
     assert 200 in locs
     assert len(locs[200]) == 0
+
+
+def test_get_traceroute_link_excludes_zero_snr_from_channel_and_observations(database):
+    with closing(_connection(database)) as conn:
+        # Older packet (timestamp 10.0): forward hop 100 -> 200, SNR = -7.5 dB, LongFast
+        raw1 = mesh_pb2.RouteDiscovery(
+            route=(), snr_towards=[-30]
+        ).SerializeToString()
+        conn.execute(
+            """
+            INSERT INTO packet_history (
+                id, timestamp, portnum, portnum_name, mesh_packet_id,
+                from_node_id, to_node_id, gateway_id, channel_id,
+                hop_start, hop_limit, rssi, snr, payload_length, raw_payload
+            ) VALUES (1, 10.0, 70, 'TRACEROUTE_APP', 101, 100, 200, '!00000001', 'LongFast',
+                      5, 3, -80, -10, ?, ?)
+            """,
+            (len(raw1), raw1),
+        )
+        packet1 = dict(
+            conn.execute("SELECT * FROM packet_history WHERE id = 1").fetchone()
+        )
+        write_traceroute(conn.cursor(), packet1)
+
+        # Newer packet (timestamp 20.0): reverse hop 200 -> 100, SNR = 0 dB, SFNarrow
+        raw2 = mesh_pb2.RouteDiscovery(
+            route=(), snr_towards=[0]
+        ).SerializeToString()
+        conn.execute(
+            """
+            INSERT INTO packet_history (
+                id, timestamp, portnum, portnum_name, mesh_packet_id,
+                from_node_id, to_node_id, gateway_id, channel_id,
+                hop_start, hop_limit, rssi, snr, payload_length, raw_payload
+            ) VALUES (2, 20.0, 70, 'TRACEROUTE_APP', 102, 200, 100, '!00000002', 'SFNarrow',
+                      5, 3, -80, -10, ?, ?)
+            """,
+            (len(raw2), raw2),
+        )
+        packet2 = dict(
+            conn.execute("SELECT * FROM packet_history WHERE id = 2").fetchone()
+        )
+        write_traceroute(conn.cursor(), packet2)
+        conn.commit()
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        result = get_traceroute_link(
+            100, 200, start_time=0.0, end_time=30.0, limit=10, offset=0
+        )
+
+    # Eligible preset resolution ignores the newer 0 dB hop on SFNarrow
+    assert result["channel_id"] == "LongFast"
+    # Eligible coverage metrics exclude the 0 dB reverse hop
+    assert result["forward_observations"] == 1
+    assert result["reverse_observations"] == 0
+    assert result["forward_avg_snr"] == -7.5
+    assert result["reverse_avg_snr"] is None
+    # Legacy counts and total_attempts are preserved separately
+    assert result["forward_count"] == 1
+    assert result["reverse_count"] == 1
+    assert result["total_attempts"] == 2
+    assert result["total_count"] == 2
+    assert [p["id"] for p in result["packets"]] == [2, 1]
+
 
