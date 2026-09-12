@@ -65,6 +65,21 @@ debug: false
 #   Multiple keys: "1PG7OiApB1nwvP+rz05pAQ==,AQ4GCAwQFBgcICQoLDA0ODw=,another+base64+key=="
 # default_channel_key: "1PG7OiApB1nwvP+rz05pAQ=="
 
+# LoRa modem preset used by the preset-aware signal-quality estimates
+# ("Estimated reliability" on link pages). Standard Meshtastic presets:
+# ShortFast, ShortSlow, MediumFast, MediumSlow, LongFast, LongSlow,
+# VeryLongSlow, ShortTurbo, LongModerate; plus the regional SF7 alias
+# SFNarrow. Names are matched ignoring case, spaces, underscores and
+# hyphens. Env var: MALLA_LORA_PRESET
+# lora_preset: "LongFast"
+
+# Optional explicit spreading-factor override (7-12) for the quality model.
+# When valid it takes precedence over the preset; blank or invalid values
+# are ignored so the preset applies. Accepted formats: 11, "11", "sf11".
+# Resolution order: explicit SF → per-link channel/preset hint → this
+# preset. Env var: MALLA_LORA_SPREADING_FACTOR
+# lora_spreading_factor: 11
+
 # Reverse proxy settings
 # Comma-separated IPs of trusted reverse proxies.
 # When set, Malla trusts the configured client IP header from those exact proxy
