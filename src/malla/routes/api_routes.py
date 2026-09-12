@@ -720,54 +720,97 @@ def api_traceroute_details(packet_id):
 def api_locations():
     """
     API endpoint for node location data with network topology.
-    Returns up to 14 days of data for client-side filtering.
+
+    Link aggregates (traceroute RF hops and direct packet receptions) are
+    computed server-side over the exact time window requested via the
+    ``start_time``/``end_time`` (epoch seconds) or ``hours``/``max_age_hours``
+    request parameters, so observation counts and signal statistics always
+    match the period selected on the map.
+
+    Node positions deliberately keep a wide lookup window (14 days)
+    independent of the link window: an actively routing node whose last
+    position report is older than the selected window must stay visible at
+    its last known good position instead of disappearing.
     """
     import time
 
     start_time_perf = time.time()
     logger.info("API locations endpoint accessed")
     try:
-        # Build filters from request parameters
-        filters = {}
-
-        # Always limit to last 14 days for performance
         from datetime import datetime, timedelta
 
-        end_time = datetime.now()
-        start_time = end_time - timedelta(days=14)
-        filters["start_time"] = start_time.timestamp()
-        filters["end_time"] = end_time.timestamp()
+        now = datetime.now()
+        max_window_seconds = 14 * 24 * 3600
+
+        # Wide position-lookup window (performance cap only). This window is
+        # intentionally NOT narrowed by the client's time selection so nodes
+        # with stale GPS fixes remain visible while active.
+        position_filters: dict[str, Any] = {
+            "start_time": (now - timedelta(seconds=max_window_seconds)).timestamp(),
+            "end_time": now.timestamp(),
+        }
+
+        # ------------------------------------------------------------------
+        # Resolve the link aggregation window from request parameters.
+        # Explicit start/end win; otherwise hours/max_age_hours is applied
+        # relative to now; with no time parameter at all the endpoint keeps
+        # its historical 14-day default.
+        # ------------------------------------------------------------------
+        start_arg = request.args.get("start_time", type=float)
+        end_arg = request.args.get("end_time", type=float)
+        hours_arg = request.args.get("hours", type=float)
+        if hours_arg is None:
+            hours_arg = request.args.get("max_age_hours", type=float)
+
+        link_filters: dict[str, Any] = {}
+        if start_arg is not None or end_arg is not None or hours_arg:
+            if start_arg is None:
+                lookback = hours_arg * 3600 if hours_arg else max_window_seconds
+                start_arg = (end_arg or now.timestamp()) - lookback
+            if end_arg is None:
+                end_arg = now.timestamp()
+            if start_arg >= end_arg:
+                return jsonify({"error": "start_time must be before end_time"}), 400
+            # Cap the aggregation window for performance
+            if end_arg - start_arg > max_window_seconds:
+                start_arg = end_arg - max_window_seconds
+            link_filters["start_time"] = start_arg
+            link_filters["end_time"] = end_arg
+        else:
+            link_filters.update(position_filters)
 
         # Gateway filter (keep this server-side for performance)
         gateway_id_arg = request.args.get("gateway_id")
         if gateway_id_arg is not None:
             try:
-                filters["gateway_id"] = int(gateway_id_arg)
+                gateway_id = int(gateway_id_arg)
             except ValueError:
                 return jsonify({"error": "Invalid gateway_id format"}), 400
+            link_filters["gateway_id"] = gateway_id
+            position_filters["gateway_id"] = gateway_id
 
         # Search filter (keep this server-side for performance)
         if request.args.get("search"):
-            filters["search"] = request.args.get("search")
+            link_filters["search"] = request.args.get("search")
+            position_filters["search"] = request.args.get("search")
 
         # ------------------------------------------------------------------
         # OPTIMIZATION: Call expensive operations ONCE and pass results down
         # ------------------------------------------------------------------
 
         # 1. Get network topology data (used by both get_node_locations and get_traceroute_links)
-        from ..services.traceroute_service import TracerouteService
-
-        hours = 24  # Default to 24 hours for network analysis
-        time_diff = filters["end_time"] - filters["start_time"]
-        hours = max(1, min(168, int(time_diff / 3600)))  # Between 1 and 168 hours
-
         network_filters = {}
-        if filters.get("start_time"):
-            network_filters["start_time"] = filters["start_time"]
-        if filters.get("end_time"):
-            network_filters["end_time"] = filters["end_time"]
-        if filters.get("gateway_id"):
-            network_filters["gateway_id"] = filters["gateway_id"]
+        if link_filters.get("start_time"):
+            network_filters["start_time"] = link_filters["start_time"]
+        if link_filters.get("end_time"):
+            network_filters["end_time"] = link_filters["end_time"]
+        if link_filters.get("gateway_id"):
+            network_filters["gateway_id"] = link_filters["gateway_id"]
+
+        # The explicit start/end filters take precedence inside the service;
+        # hours is kept consistent with the resolved window for cache keys.
+        time_diff = link_filters["end_time"] - link_filters["start_time"]
+        hours = max(1, min(168, int(time_diff / 3600)))  # Between 1 and 168 hours
 
         network_data = TracerouteService.get_network_graph_data(
             hours=hours,
@@ -776,16 +819,18 @@ def api_locations():
         )
 
         # 2. Get packet links (used by get_node_locations and returned in response)
-        packet_links = LocationService.get_packet_links(filters)
+        packet_links = LocationService.get_packet_links(link_filters)
 
-        # 3. Get enhanced location data, passing pre-computed data
+        # 3. Get enhanced location data, passing pre-computed data. Position
+        #    lookups use the wide window; node activity timestamps come from
+        #    the window-scoped network/packet data computed above.
         locations = LocationService.get_node_locations(
-            filters, network_data=network_data, packet_links=packet_links
+            position_filters, network_data=network_data, packet_links=packet_links
         )
 
         # 4. Get traceroute links, passing pre-computed network data
         traceroute_links = LocationService.get_traceroute_links(
-            filters, network_data=network_data
+            link_filters, network_data=network_data
         )
 
         duration = time.time() - start_time_perf
@@ -797,7 +842,7 @@ def api_locations():
                 "traceroute_links": traceroute_links,
                 "packet_links": packet_links,
                 "total_count": len(locations) if isinstance(locations, list) else 0,
-                "filters_applied": filters,
+                "filters_applied": link_filters,
                 "data_period_days": 14,
             }
         )
