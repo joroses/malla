@@ -550,17 +550,19 @@
     function displayResults(data) {
         document.getElementById('results-section').style.display = 'block';
 
-        // Update summary
+        // Update summary (null check: a real 0.0 dB average must display)
         document.getElementById('total-hops').textContent = data.total_attempts;
-        document.getElementById('avg-snr').textContent = data.avg_snr ? `${data.avg_snr.toFixed(1)}` : 'N/A';
+        document.getElementById('avg-snr').textContent =
+            data.avg_snr !== null && data.avg_snr !== undefined
+                ? `${data.avg_snr.toFixed(1)}` : 'N/A';
         document.getElementById('last-seen').textContent = getRelativeTime(data.traceroutes[0]?.timestamp);
 
         // Calculate and display geographic distance
         const geoDistance = calculateGeoDistance(data.from_node_id, data.to_node_id);
         document.getElementById('geo-distance').textContent = geoDistance;
 
-        // Display direction information with proper node formatting
-        displayDirectionInfo(data.direction_counts, data.from_node_id, data.to_node_id);
+        // Display direction information with per-direction measurements
+        displayDirectionInfo(data);
 
         // Update charts
         updateSNRChart(data.traceroutes);
@@ -601,10 +603,16 @@
         }
     }
 
-    function displayDirectionInfo(directionCounts, fromNodeId, toNodeId) {
+    function displayDirectionInfo(data) {
         const directionDiv = document.getElementById('direction-info');
 
-        const directions = Object.keys(directionCounts);
+        const fromNodeId = data.from_node_id;
+        const toNodeId = data.to_node_id;
+        const forwardCount = data.forward_count ?? 0;
+        const returnCount = data.return_count ?? 0;
+        const forwardObserved = forwardCount > 0;
+        const returnObserved = returnCount > 0;
+
         const content = fragment(
             el('strong', 'Link Analysis:'),
             ' ',
@@ -614,27 +622,56 @@
             el('br')
         );
 
-        if (directions.length > 1) {
+        const isBidirectional = data.is_bidirectional !== undefined && data.is_bidirectional !== null
+            ? data.is_bidirectional
+            : (forwardObserved && returnObserved);
+        const hasCoverage = data.observation_count !== undefined && data.observation_count !== null
+            ? data.observation_count > 0
+            : (forwardObserved || returnObserved);
+
+        if (isBidirectional) {
             appendChildren(content, badge('Bidirectional Link', 'bg-success signal-badge'));
-        } else if (directions.length === 1) {
+        } else if (hasCoverage) {
             appendChildren(content, badge('Unidirectional Link', 'bg-warning signal-badge'));
         } else {
             appendChildren(content, badge('No Data', 'bg-secondary signal-badge'));
         }
 
-        if (directions.length > 1) {
-            const details = el('small', { className: 'text-muted mt-1 d-block' });
-            const total = Object.values(directionCounts).reduce((a, b) => a + b, 0);
-            directions.forEach((direction, index) => {
-                const count = directionCounts[direction];
-                const percentage = (count / total * 100).toFixed(1);
-                if (index > 0) {
-                    details.appendChild(el('br'));
-                }
-                details.append(`${direction}: ${count} traceroutes (${percentage}%)`);
-            });
-            appendChildren(content, el('br'), details);
+        // Shared quality metrics (same fields as the network graph and map).
+        if (data.quality) {
+            const qualityClass = data.quality === 'good' ? 'bg-success'
+                : data.quality === 'fair' ? 'bg-warning'
+                : data.quality === 'marginal' ? 'bg-danger'
+                : 'bg-secondary';
+            appendChildren(content,
+                ' ',
+                badge(`${data.quality}${data.spreading_factor ? ` · SF${data.spreading_factor}` : ''}`, `${qualityClass} signal-badge`));
+            if (data.estimated_reliability !== null && data.estimated_reliability !== undefined) {
+                appendChildren(content, ' ', badge(`Est. reliability ${data.estimated_reliability.toFixed(1)}%`, 'bg-info signal-badge'));
+            }
+            if (data.is_bidirectional === false) {
+                appendChildren(content, ' ', badge('Incomplete coverage', 'bg-secondary signal-badge'));
+            }
         }
+
+        // Explicitly labelled per-direction measurements relative to URL order
+        const fromLabel = formatNodeIdForDisplay(fromNodeId);
+        const toLabel = formatNodeIdForDisplay(toNodeId);
+        const total = forwardCount + returnCount;
+        const formatDirection = (label, avgSnr, count, quality, reliability) => {
+            const snrText = avgSnr !== null && avgSnr !== undefined
+                ? `${avgSnr.toFixed(1)} dB` : 'SNR N/A';
+            const percentage = total > 0 ? ` (${(count / total * 100).toFixed(1)}%)` : '';
+            const qualityText = quality && quality !== 'unknown'
+                ? ` — ${quality}${reliability !== null && reliability !== undefined ? ` · est. ${reliability.toFixed(1)}%` : ''}`
+                : '';
+            return `${label}: ${snrText}${qualityText} — ${count} measurements${percentage}`;
+        };
+        const details = el('small', { className: 'text-muted mt-1 d-block' });
+        details.append(formatDirection(`${fromLabel} → ${toLabel}`, data.forward_avg_snr, forwardCount, data.forward_quality, data.forward_estimated_reliability));
+        details.appendChild(el('br'));
+        details.append(formatDirection(`${toLabel} → ${fromLabel}`, data.return_avg_snr, returnCount, data.return_quality, data.return_estimated_reliability));
+        appendChildren(content, el('br'), details);
 
         setChildren(directionDiv, content);
     }

@@ -62,7 +62,7 @@ def prepare_traceroutes(
             rows = cursor.execute(
                 f"""
                 SELECT id, timestamp, mesh_packet_id, from_node_id, to_node_id,
-                       hop_start, hop_limit, channel_id, raw_payload
+                       hop_start, hop_limit, raw_payload
                 FROM packet_history
                 WHERE {TRACEROUTE_PREDICATE} AND id <= ? {lower_bound}
                     AND NOT EXISTS (

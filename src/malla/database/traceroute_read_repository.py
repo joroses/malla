@@ -211,9 +211,15 @@ def get_traceroute_packets(
             packet["route"] = packet["route_nodes_json"]
             if group_packets:
                 packet["is_grouped"] = True
-                packet["rssi_range"] = _range(packet["min_rssi"], packet["max_rssi"], "dBm", 1)
-                packet["snr_range"] = _range(packet["min_snr"], packet["max_snr"], "dB", 2)
-                packet["hop_range"] = _range(packet["min_hops"], packet["max_hops"], "", 0)
+                packet["rssi_range"] = _range(
+                    packet["min_rssi"], packet["max_rssi"], "dBm", 1
+                )
+                packet["snr_range"] = _range(
+                    packet["min_snr"], packet["max_snr"], "dB", 2
+                )
+                packet["hop_range"] = _range(
+                    packet["min_hops"], packet["max_hops"], "", 0
+                )
                 packet["rssi"] = packet["rssi_range"]
                 packet["snr"] = packet["snr_range"]
                 packet["hop_count"] = packet["min_hops"]
@@ -256,29 +262,80 @@ def get_traceroute_link(
             node2_id,
             node1_id,
         ]
+        # Directional averages and quality aggregates follow graph eligibility:
+        # zero-SNR hops and implausible SNR contribute no SNR and do not count
+        # as evidenced topology observations. The -32.0 "unknown SNR" sentinel
+        # counts as an observation (volume) but contributes no numeric SNR.
+        # Raw observation counts and the combined average keep their historical
+        # definitions. The recency rank picks the most recent channel from
+        # eligible hops deterministically (timestamp, then packet id).
         stats = cursor.execute(
             f"""
+            WITH matching AS (
+                SELECT
+                    h.packet_id,
+                    h.from_node_id,
+                    h.to_node_id,
+                    h.snr,
+                    p.channel_id,
+                    r.timestamp AS route_timestamp,
+                    p.id AS packet_row_id,
+                    CASE WHEN (h.snr = {TRACEROUTE_UNKNOWN_SNR}
+                               OR (h.snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX} AND h.snr != 0))
+                              AND h.from_node_id != 4294967295 AND h.to_node_id != 4294967295
+                         THEN 1 ELSE 0 END AS is_eligible,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY CASE WHEN (h.snr = {TRACEROUTE_UNKNOWN_SNR}
+                                               OR (h.snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX} AND h.snr != 0))
+                                              AND h.from_node_id != 4294967295 AND h.to_node_id != 4294967295
+                                         THEN 1 ELSE 0 END
+                        ORDER BY r.timestamp DESC, p.id DESC
+                    ) AS eligible_recency_rank
+                FROM traceroute_hops h
+                JOIN traceroute_routes r ON r.packet_id = h.packet_id
+                JOIN packet_history p ON p.id = h.packet_id
+                WHERE r.parser_version = ? AND r.parse_status = 'parsed'
+                  AND {match_sql}
+            )
             SELECT
-                COUNT(DISTINCT h.packet_id) AS total_attempts,
-                SUM(CASE WHEN h.from_node_id = ? AND h.to_node_id = ?
+                COUNT(DISTINCT packet_id) AS total_attempts,
+                SUM(CASE WHEN from_node_id = ? AND to_node_id = ?
                          THEN 1 ELSE 0 END) AS forward_count,
-                SUM(CASE WHEN h.from_node_id = ? AND h.to_node_id = ?
+                SUM(CASE WHEN from_node_id = ? AND to_node_id = ?
                          THEN 1 ELSE 0 END) AS reverse_count,
-                AVG(CASE WHEN h.snr = {TRACEROUTE_UNKNOWN_SNR}
-                              OR h.snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX}
-                         THEN h.snr END) AS avg_snr
-            FROM traceroute_hops h
-            JOIN traceroute_routes r ON r.packet_id = h.packet_id
-            WHERE r.parser_version = ? AND r.parse_status = 'parsed'
-              AND {match_sql}
+                SUM(CASE WHEN from_node_id = ? AND to_node_id = ? AND is_eligible = 1
+                         THEN 1 ELSE 0 END) AS forward_observations,
+                SUM(CASE WHEN from_node_id = ? AND to_node_id = ? AND is_eligible = 1
+                         THEN 1 ELSE 0 END) AS reverse_observations,
+                AVG(CASE WHEN snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX}
+                              AND snr != 0
+                         THEN snr END) AS avg_snr,
+                AVG(CASE WHEN from_node_id = ? AND to_node_id = ?
+                         AND snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX}
+                         AND snr != 0
+                         THEN snr END) AS forward_avg_snr,
+                AVG(CASE WHEN from_node_id = ? AND to_node_id = ?
+                         AND snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX}
+                         AND snr != 0
+                         THEN snr END) AS reverse_avg_snr,
+                MAX(CASE WHEN is_eligible = 1 AND eligible_recency_rank = 1 THEN channel_id END) AS channel_id
+            FROM matching
             """,
             [
-                node1_id,
-                node2_id,
-                node2_id,
-                node1_id,
                 PARSER_VERSION,
                 *match_params,
+                node1_id,
+                node2_id,
+                node2_id,
+                node1_id,
+                node1_id,
+                node2_id,
+                node2_id,
+                node1_id,
+                node1_id,
+                node2_id,
+                node2_id,
+                node1_id,
             ],
         ).fetchone()
 
@@ -294,7 +351,7 @@ def get_traceroute_link(
                     ROW_NUMBER() OVER (
                         PARTITION BY h.packet_id
                         ORDER BY CASE h.direction WHEN 'forward' THEN 0 ELSE 1 END,
-                                 h.hop_index
+                                  h.hop_index
                     ) AS target_rank
                 FROM traceroute_hops h
                 JOIN traceroute_routes r ON r.packet_id = h.packet_id
@@ -325,7 +382,12 @@ def get_traceroute_link(
             "total_attempts": total_count,
             "forward_count": int(stats["forward_count"] or 0),
             "reverse_count": int(stats["reverse_count"] or 0),
+            "forward_observations": int(stats["forward_observations"] or 0),
+            "reverse_observations": int(stats["reverse_observations"] or 0),
             "avg_snr": stats["avg_snr"],
+            "forward_avg_snr": stats["forward_avg_snr"],
+            "reverse_avg_snr": stats["reverse_avg_snr"],
+            "channel_id": stats["channel_id"],
         }
     finally:
         conn.close()
@@ -362,6 +424,10 @@ def get_traceroute_hops_for_graph(
     links) would splice the remaining hops of one route into a shorter,
     connected-looking path. Quality filtering and continuity validation are the
     caller's responsibility.
+
+    packet_history is always joined so each hop carries the MQTT channel_id it
+    was received on; consumers resolve the modem preset (spreading factor) from
+    that channel hint, falling back to the configured preset.
     """
     filters = dict(filters or {})
     conn = get_db_connection()
@@ -381,18 +447,13 @@ def get_traceroute_hops_for_graph(
         if filters.get("end_time") is not None:
             conditions.append("h.timestamp <= ?")
             params.append(filters["end_time"])
-
-        join_packet = False
         if filters.get("gateway_id"):
-            join_packet = True
             conditions.append("p.gateway_id = ?")
             params.append(filters["gateway_id"])
         if filters.get("primary_channel"):
-            join_packet = True
             conditions.append("p.channel_id = ?")
             params.append(filters["primary_channel"])
 
-        join_clause = "JOIN packet_history p ON p.id = h.packet_id" if join_packet else ""
         where_clause = " AND ".join(conditions)
 
         query = f"""
@@ -403,10 +464,11 @@ def get_traceroute_hops_for_graph(
                 h.timestamp,
                 h.from_node_id,
                 h.to_node_id,
-                h.snr
+                h.snr,
+                p.channel_id
             FROM traceroute_hops h
             JOIN traceroute_routes r ON r.packet_id = h.packet_id
-            {join_clause}
+            JOIN packet_history p ON p.id = h.packet_id
             WHERE {where_clause}
             ORDER BY h.timestamp DESC, h.packet_id, h.direction, h.hop_index
         """
@@ -480,7 +542,9 @@ def get_route_patterns_data(
         """
         rows = cursor.execute(query, (PARSER_VERSION, start_time, end_time)).fetchall()
 
-        route_patterns: dict[tuple[tuple[int, int], tuple[int, ...]], dict[str, Any]] = {}
+        route_patterns: dict[
+            tuple[tuple[int, int], tuple[int, ...]], dict[str, Any]
+        ] = {}
 
         for row in rows:
             try:
@@ -497,9 +561,6 @@ def get_route_patterns_data(
                 route_patterns[pattern_key] = {
                     "count": 0,
                     "endpoints": endpoints,
-                    # Legacy placeholder / dead code: always 0, never computed or updated;
-                    # retained for API response schema backwards-compatibility.
-                    "avg_success_rate": 0,
                     "examples": [],
                 }
 
@@ -593,19 +654,19 @@ def get_node_traceroute_statistics(
             *time_params,
             node_id,
         ]
-        participation_count = cursor.execute(intermediate_query, intermediate_params).fetchone()[0]
+        participation_count = cursor.execute(
+            intermediate_query, intermediate_params
+        ).fetchone()[0]
 
         return {
             "node_id": node_id,
             "as_source": {
                 "total": source_total,
                 "successful": source_successful,
-                "success_rate": (source_successful / source_total * 100) if source_total > 0 else 0,
             },
             "as_destination": {
                 "total": dest_total,
                 "successful": dest_successful,
-                "success_rate": (dest_successful / dest_total * 100) if dest_total > 0 else 0,
             },
             "as_intermediate_hop": {"participation_count": participation_count},
             "total_involvement": source_total + dest_total + participation_count,

@@ -27,6 +27,7 @@ from ..services.location_service import LocationService
 from ..services.meshtastic_service import MeshtasticService
 from ..services.node_service import NodeService
 from ..services.traceroute_service import TracerouteService
+from ..utils.link_quality import enrich_link_quality
 from ..utils.node_utils import (
     convert_node_id,
     get_bulk_node_names,
@@ -1129,12 +1130,18 @@ def api_traceroute_hops_nodes():
                     WHERE timestamp >= ? AND timestamp <= ? AND parse_status != 'pending'
                     """,
                     (
-                        window_start.timestamp(), window_end.timestamp(),
-                        window_start.timestamp(), window_end.timestamp(),
-                        window_start.timestamp(), window_end.timestamp(),
-                        window_start.timestamp(), window_end.timestamp(),
-                        window_start.timestamp(), window_end.timestamp(),
-                        window_start.timestamp(), window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
                     ),
                 )
                 if row[0] is not None and row[0] != BROADCAST_NODE_ID
@@ -1324,7 +1331,9 @@ def api_traceroute_link(node1_id, node2_id):
                 ):
                     if path is None:
                         continue
-                    path.node_names = [display_name(node_id) for node_id in path.node_ids]
+                    path.node_names = [
+                        display_name(node_id) for node_id in path.node_ids
+                    ]
                     for hop in path.hops:
                         hop.from_node_name = display_name(hop.from_node_id)
                         hop.to_node_name = display_name(hop.to_node_id)
@@ -1368,7 +1377,9 @@ def api_traceroute_link(node1_id, node2_id):
                         if is_plausible_traceroute_snr(target_snr)
                         else None,
                         "route_hops": route_hops,
-                        "complete_path_display": tr_packet.format_path_display("display"),
+                        "complete_path_display": tr_packet.format_path_display(
+                            "display"
+                        ),
                     }
                 )
             except Exception as e:
@@ -1389,6 +1400,38 @@ def api_traceroute_link(node1_id, node2_id):
         else:
             direction_counts = {"forward": 0, "reverse": 0}
 
+        # Same shared metrics every link consumer reports (graph, map,
+        # packet links): quality tiers, estimated reliability per direction,
+        # balance and observation-volume strength. Forward follows the URL
+        # node order (node1 → node2), matching the averages above. Averages
+        # are rounded to one decimal before classification so every consumer
+        # produces identical tiers from identical observations.
+        forward_avg_snr = link_result.get("forward_avg_snr")
+        return_avg_snr = link_result.get("reverse_avg_snr")
+        forward_avg_snr = (
+            round(forward_avg_snr, 1) if forward_avg_snr is not None else None
+        )
+        return_avg_snr = round(return_avg_snr, 1) if return_avg_snr is not None else None
+        forward_observations = int(
+            link_result.get(
+                "forward_observations", link_result.get("forward_count", 0)
+            )
+            or 0
+        )
+        return_observations = int(
+            link_result.get(
+                "reverse_observations", link_result.get("reverse_count", 0)
+            )
+            or 0
+        )
+        link_enrichment = enrich_link_quality(
+            channel_id=link_result.get("channel_id"),
+            forward_avg_snr=forward_avg_snr,
+            return_avg_snr=return_avg_snr,
+            forward_observations=forward_observations,
+            return_observations=return_observations,
+        )
+
         response_data = {
             "from_node_id": node1_id_int,
             "to_node_id": node2_id_int,
@@ -1396,6 +1439,15 @@ def api_traceroute_link(node1_id, node2_id):
             "to_node_name": display_name(node2_id_int),
             "total_attempts": link_result["total_attempts"],
             "avg_snr": link_result["avg_snr"],
+            # Directional measurements relative to URL node order:
+            # forward = node1 → node2, return = node2 → node1.
+            "forward_avg_snr": forward_avg_snr,
+            "return_avg_snr": return_avg_snr,
+            "forward_count": link_result.get("forward_count", 0),
+            "return_count": link_result.get("reverse_count", 0),
+            "forward_observations": forward_observations,
+            "return_observations": return_observations,
+            **link_enrichment,
             "direction_counts": direction_counts,
             "traceroutes": processed_traceroutes,
             "page": page,
@@ -2003,7 +2055,9 @@ def api_traceroute_data():
                 if route_data and route_data.get("route_nodes"):
                     route_nodes = route_data["route_nodes"]
                     for node_id in route_nodes:
-                        node_name = node_short_names.get(node_id, f"!{node_id:08x}"[-4:])
+                        node_name = node_short_names.get(
+                            node_id, f"!{node_id:08x}"[-4:]
+                        )
                         route_names.append(node_name)
 
             # Final fallback: use from -> to

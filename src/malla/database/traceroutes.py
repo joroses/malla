@@ -104,36 +104,23 @@ def write_traceroute(cursor: sqlite3.Cursor, packet: dict[str, Any]) -> None:
             time.time(),
         ),
     )
-    raw_mesh_id = packet.get("mesh_packet_id")
-    effective_mesh_id = int(raw_mesh_id) if raw_mesh_id else -int(packet["id"])
-    if effective_mesh_id < 0:
-        cursor.execute("DELETE FROM traceroute_hops WHERE mesh_packet_id = ?", (effective_mesh_id,))
+    cursor.execute("DELETE FROM traceroute_hops WHERE packet_id = ?", (packet["id"],))
     indices = {"forward_rf": 0, "return_rf": 0}
-    channel_id = packet.get("channel_id")
     for hop in decoded.hops:
-        direction = "forward" if hop.direction == "forward_rf" else "return"
-        hop_idx = indices[hop.direction]
         cursor.execute(
             """
             INSERT INTO traceroute_hops
-                (packet_id, mesh_packet_id, direction, hop_index, timestamp,
-                 from_node_id, to_node_id, snr, channel_id, reception_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-            ON CONFLICT(mesh_packet_id, direction, hop_index, from_node_id, to_node_id) DO UPDATE SET
-                reception_count = traceroute_hops.reception_count + 1,
-                timestamp = MAX(traceroute_hops.timestamp, excluded.timestamp),
-                channel_id = COALESCE(traceroute_hops.channel_id, excluded.channel_id)
+                (packet_id, direction, hop_index, timestamp, from_node_id, to_node_id, snr)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 packet["id"],
-                effective_mesh_id,
-                direction,
-                hop_idx,
+                "forward" if hop.direction == "forward_rf" else "return",
+                indices[hop.direction],
                 packet["timestamp"],
                 hop.from_node_id,
                 hop.to_node_id,
                 hop.snr,
-                channel_id,
             ),
         )
         indices[hop.direction] += 1

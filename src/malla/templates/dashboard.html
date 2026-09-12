@@ -83,16 +83,6 @@
                 </div>
             </div>
         </div>
-        <div class="col-md-2">
-            <div class="card h-100">
-                <div class="card-body card-metric">
-                    {% set success_class = 'text-success' if stats.success_rate >= 95 else 'text-warning' if stats.success_rate >= 85 else 'text-danger' %}
-                    <div class="metric-value {{ success_class }}">{{ stats.success_rate }}%</div>
-                    <div class="metric-label">Processing Success</div>
-                    <small class="text-muted">Message reliability</small>
-                </div>
-            </div>
-        </div>
     </div>
 
     <!-- Network Health and Activity Row -->
@@ -172,17 +162,6 @@
                             </div>
                         </div>
                         <small class="text-muted">{{ stats.active_nodes_24h }} of {{ stats.nodes_seen_7d }} nodes seen this week active in 24h</small>
-                    </div>
-
-                    <div class="mb-3">
-                        <h6>Message Success Rate</h6>
-                        <div class="progress mb-2">
-                            {% set success_bar_class = 'bg-success' if stats.success_rate >= 95 else 'bg-warning' if stats.success_rate >= 85 else 'bg-danger' %}
-                            <div class="progress-bar {{ success_bar_class }}" style="width: {{ stats.success_rate }}%;">
-                                {{ stats.success_rate }}%
-                            </div>
-                        </div>
-                        <small class="text-muted">Packet processing reliability</small>
                     </div>
 
                     <div class="mb-3">
@@ -419,14 +398,6 @@
                         <div class="col-6">
                             <strong>Recent (1h):</strong><br>
                             <span class="text-success">{{ stats.recent_packets }}</span>
-                        </div>
-                    </div>
-                    <hr>
-                    <div class="row">
-                        <div class="col-12">
-                            <strong>Success Rate:</strong><br>
-                            {% set success_class = 'text-success' if stats.success_rate >= 95 else 'text-warning' if stats.success_rate >= 85 else 'text-danger' %}
-                            <span class="{{ success_class }}">{{ stats.success_rate }}%</span>
                         </div>
                     </div>
                 </div>

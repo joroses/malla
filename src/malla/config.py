@@ -5,7 +5,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, get_args
 
 import yaml
 
@@ -54,6 +54,14 @@ class AppConfig:
     # Supports comma-separated list of base64-encoded keys
     default_channel_key: str = "1PG7OiApB1nwvP+rz05pAQ=="
 
+    # LoRa modem preset used by the preset-aware signal-quality estimates
+    # (standard Meshtastic preset names, e.g. "LongFast"). Optional explicit
+    # spreading factor (7-12) takes precedence over the preset when valid;
+    # blank or invalid values are ignored so the preset applies instead.
+    # Corresponding env vars: MALLA_LORA_PRESET / MALLA_LORA_SPREADING_FACTOR
+    lora_preset: str = "LongFast"
+    lora_spreading_factor: int | None = None
+
     # Logging
     log_level: str = "INFO"
 
@@ -101,6 +109,17 @@ class AppConfig:
         # Filter out empty keys
         return [key for key in keys if key]
 
+    def __post_init__(self) -> None:
+        """Normalize configuration attributes after initialization."""
+        if isinstance(self.lora_spreading_factor, str):
+            v = self.lora_spreading_factor.strip()
+            if v.lower().startswith("sf"):
+                v = v[2:].strip()
+            try:
+                self.lora_spreading_factor = int(v)
+            except ValueError:
+                self.lora_spreading_factor = None
+
 
 # ---------------------------------------------------------------------------
 # Loader helpers
@@ -122,24 +141,46 @@ def _resolve_type(t: Any) -> Any:  # noqa: ANN001
     return t
 
 
-def _coerce_value(value: str, target_type):  # noqa: ANN001
-    """Coerce *value* (a string from env) to *target_type* (which may be a string)."""
+def _annotation_allows_none(t: Any) -> bool:
+    """True when the (possibly string) dataclass field annotation permits None."""
+    if isinstance(t, str):
+        return "None" in t
+    return type(None) in get_args(t)
+
+
+def _coerce_value(value: str, target_type, *, allows_none: bool = False):  # noqa: ANN001
+    """Coerce *value* (a string from env) to *target_type* (which may be a string).
+
+    Blank or uncoercible values for optional fields (``allows_none``) become
+    ``None`` so a leftover ``MALLA_FOO=""`` cannot smuggle a string into an
+    ``int | None`` setting. Non-optional fields keep the historic fallback of
+    storing the raw string.
+    """
 
     target_type = _resolve_type(target_type)
+
+    if allows_none and not value.strip():
+        return None
 
     try:
         if target_type is bool:
             return value.lower() in {"1", "true", "yes", "on"}
         if target_type is int:
-            return int(value)
+            normalized = value.strip()
+            if normalized.lower().startswith("sf"):
+                normalized = normalized[2:].strip()
+            return int(normalized)
         if target_type is float:
             return float(value)
     except ValueError:
         logger.warning(
-            "Could not coerce environment variable '%s' to %s – using raw string",
+            "Could not coerce environment variable value '%s' to %s – %s",
             value,
-            target_type,
+            getattr(target_type, "__name__", target_type),
+            "treating as unset" if allows_none else "using raw string",
         )
+        if allows_none:
+            return None
     return value
 
 
@@ -181,7 +222,11 @@ def load_config(config_path: str | os.PathLike | None = None) -> AppConfig:  # n
     for field_name, field_obj in AppConfig.__dataclass_fields__.items():  # type: ignore[attr-defined]
         env_key = f"{_ENV_PREFIX}{field_name}".upper()
         if env_key in os.environ:
-            data[field_name] = _coerce_value(os.environ[env_key], field_obj.type)
+            data[field_name] = _coerce_value(
+                os.environ[env_key],
+                field_obj.type,
+                allows_none=_annotation_allows_none(field_obj.type),
+            )
 
     # Construct the config instance
     config = AppConfig(**data)  # type: ignore[arg-type]

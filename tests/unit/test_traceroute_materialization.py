@@ -124,17 +124,17 @@ def test_capture_preserves_repeated_hops_and_gateway_receptions(database):
     for route in routes:
         assert route["parse_status"] == "parsed"
         assert json.loads(route["route_nodes_json"]) == [110, 100, 110]
-    hops = conn.execute(
-        "SELECT hop_index, from_node_id, to_node_id, snr, reception_count FROM traceroute_hops "
-        "WHERE mesh_packet_id = 42 ORDER BY hop_index"
-    ).fetchall()
-    assert [tuple(hop) for hop in hops] == [
-        (0, 200, 110, 1.0, 2),
-        (1, 110, 100, 2.0, 2),
-        (2, 100, 110, 3.0, 2),
-        (3, 110, 100, 4.0, 2),
-    ]
-    assert conn.execute("SELECT COUNT(*) FROM traceroute_hops").fetchone()[0] == 4
+        hops = conn.execute(
+            "SELECT hop_index, from_node_id, to_node_id, snr FROM traceroute_hops "
+            "WHERE packet_id = ? ORDER BY hop_index",
+            (route["packet_id"],),
+        ).fetchall()
+        assert [tuple(hop) for hop in hops] == [
+            (0, 200, 110, 1.0),
+            (1, 110, 100, 2.0),
+            (2, 100, 110, 3.0),
+            (3, 110, 100, 4.0),
+        ]
 
 
 def test_capture_and_backfill_are_identical(database):

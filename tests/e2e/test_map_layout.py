@@ -517,14 +517,16 @@ class TestMapLayout:
         unknown_role_legend = legend_content.locator("text=Unknown Role")
         expect(unknown_role_legend).to_be_visible()
 
-        # Check that the unknown role has the red color indicator
+        # Check that the unknown role has the red color indicator. The
+        # legend swatches use CSS custom properties (var(--bs-danger)), so
+        # assert on the computed color instead of the raw attribute.
         role_indicators = legend_content.locator(".role-color-indicator")
         red_indicator_found = False
 
         for i in range(role_indicators.count()):
             indicator = role_indicators.nth(i)
-            style = indicator.get_attribute("style")
-            if style and ("rgb(220, 53, 69)" in style or "#dc3545" in style):
+            background = indicator.evaluate("el => getComputedStyle(el).backgroundColor")
+            if background == "rgb(220, 53, 69)":
                 red_indicator_found = True
                 break
 
