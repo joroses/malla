@@ -21,6 +21,8 @@ services:
       - MALLA_NAME=${MALLA_NAME:-Malla}
       - MALLA_SECRET_KEY=${MALLA_SECRET_KEY:-dev-secret-key-change-in-production}
       - MALLA_DEBUG=${MALLA_DEBUG:-false}
+      - MALLA_LORA_PRESET
+      - MALLA_LORA_SPREADING_FACTOR
     volumes:
       - malla_data:/app/data
       # Optional: mount your own config file (uncomment if you have one)
