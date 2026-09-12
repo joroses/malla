@@ -501,6 +501,7 @@ class TestPacketLinksMetrics:
                 from_node_id INTEGER,
                 gateway_id TEXT,
                 channel_id TEXT,
+                mesh_packet_id INTEGER,
                 hop_start INTEGER,
                 hop_limit INTEGER,
                 rssi REAL,
@@ -511,15 +512,17 @@ class TestPacketLinksMetrics:
         return conn
 
     @staticmethod
-    def _insert(conn, timestamp, from_node, gateway_hex, rssi, snr, channel=None):
+    def _insert(
+        conn, timestamp, from_node, gateway_hex, rssi, snr, channel=None, mesh_packet_id=None
+    ):
         conn.execute(
             """
             INSERT INTO packet_history (
-                timestamp, from_node_id, gateway_id, channel_id,
+                timestamp, from_node_id, gateway_id, channel_id, mesh_packet_id,
                 hop_start, hop_limit, rssi, snr
-            ) VALUES (?, ?, ?, ?, 3, 3, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, 3, 3, ?, ?)
             """,
-            (timestamp, from_node, gateway_hex, channel, rssi, snr),
+            (timestamp, from_node, gateway_hex, channel, mesh_packet_id, rssi, snr),
         )
 
     def _packet_links(self, conn):
@@ -618,6 +621,37 @@ class TestPacketLinksMetrics:
 
         assert reconfigured[0]["quality"] == QUALITY_MARGINAL
         assert reconfigured[0]["spreading_factor"] == 7
+
+    def test_packet_observations_deduplicated_by_mesh_packet_id(self):
+        conn = self._database()
+        # Reproduction: 3 receptions representing 2 mesh packet IDs.
+        # Transmission 1 (mesh_packet_id=101): received twice with SNR -7.4 dB.
+        self._insert(
+            conn, 1000.0, 100, "!000000c8", -60.0, -7.4, "SFNarrow", mesh_packet_id=101
+        )
+        self._insert(
+            conn, 1001.0, 100, "!000000c8", -60.0, -7.4, "SFNarrow", mesh_packet_id=101
+        )
+        # Transmission 2 (mesh_packet_id=102): received once with SNR -15.2 dB.
+        self._insert(
+            conn, 1002.0, 100, "!000000c8", -60.0, -15.2, "SFNarrow", mesh_packet_id=102
+        )
+        conn.commit()
+
+        links = self._packet_links(conn)
+        assert len(links) == 1
+        link = links[0]
+
+        # Observations deduplicated to 2; reception_count retains total 3 receptions.
+        assert link["forward_count"] == 2
+        assert link["observation_count"] == 2
+        assert link["total_hops_seen"] == 2
+        assert link["forward_reception_count"] == 3
+        assert link["reception_count"] == 3
+
+        # SNR average: (-7.4 + -15.2) / 2 = -11.3 dB (not raw -10.0 dB).
+        assert link["forward_avg_snr"] == -11.3
+        assert link["avg_snr"] == -11.3
 
 
 class TestHopQueryChannelSelection:

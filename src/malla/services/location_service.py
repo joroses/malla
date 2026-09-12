@@ -1004,20 +1004,47 @@ class LocationService:
 
             where_sql = "WHERE " + " AND ".join(where_clauses)
 
+            # Check if mesh_packet_id column is present in packet_history to
+            # safely support in-memory test databases or older schemas.
+            cursor.execute("PRAGMA table_info(packet_history)")
+            ph_columns = {r[1] for r in cursor.fetchall()}
+            tx_id_expr = (
+                "COALESCE(NULLIF(mesh_packet_id, 0), -id)"
+                if "mesh_packet_id" in ph_columns
+                else "-id"
+            )
+
             query = f"""
+                WITH transmissions AS (
+                    SELECT
+                        from_node_id,
+                        gateway_id,
+                        {tx_id_expr}                              AS tx_id,
+                        COUNT(*)                                  AS reception_count,
+                        AVG(CASE WHEN {snr_valid_sql()} THEN snr END) AS snr,
+                        MAX(CASE WHEN {snr_valid_sql()} THEN 1 ELSE 0 END) AS has_valid_snr,
+                        AVG(CASE WHEN {rssi_valid_sql()} THEN rssi END) AS rssi,
+                        MAX(CASE WHEN {rssi_valid_sql()} THEN 1 ELSE 0 END) AS has_valid_rssi,
+                        id                                        AS latest_packet_id,
+                        MAX(timestamp)                            AS last_seen,
+                        channel_id
+                    FROM packet_history
+                    {where_sql}
+                    GROUP BY from_node_id, gateway_id, {tx_id_expr}
+                )
                 SELECT
                     from_node_id,
                     gateway_id,
-                    COUNT(*)               AS packet_count,
-                    SUM(CASE WHEN {rssi_valid_sql()} THEN rssi END) AS rssi_sum,
-                    COUNT(CASE WHEN {rssi_valid_sql()} THEN 1 END) AS rssi_count,
-                    SUM(CASE WHEN {snr_valid_sql()} THEN snr END) AS snr_sum,
-                    COUNT(CASE WHEN {snr_valid_sql()} THEN 1 END) AS snr_count,
+                    COUNT(*)                                        AS packet_count,
+                    SUM(reception_count)                            AS reception_count,
+                    SUM(CASE WHEN has_valid_rssi = 1 THEN rssi END) AS rssi_sum,
+                    SUM(has_valid_rssi)                             AS rssi_count,
+                    SUM(CASE WHEN has_valid_snr = 1 THEN snr END)   AS snr_sum,
+                    SUM(has_valid_snr)                              AS snr_count,
                     channel_id,
-                    id                     AS latest_packet_id,
-                    MAX(timestamp)         AS last_seen
-                FROM packet_history
-                {where_sql}
+                    latest_packet_id,
+                    MAX(last_seen)                                  AS last_seen
+                FROM transmissions
                 GROUP BY from_node_id, gateway_id
             """
             cursor.execute(query, params)
@@ -1077,6 +1104,9 @@ class LocationService:
                         "to_node_id": key[1],
                         "forward_count": 0,
                         "return_count": 0,
+                        "forward_reception_count": 0,
+                        "return_reception_count": 0,
+                        "reception_count": 0,
                         "forward_snr_sum": 0.0,
                         "forward_snr_count": 0,
                         "return_snr_sum": 0.0,
@@ -1103,6 +1133,9 @@ class LocationService:
                 # Raw gateway aliases can produce several rows for the same
                 # direction. Merge observations and each metric's valid samples.
                 link[f"{direction}_count"] += row["packet_count"]
+                receptions = row.get("reception_count") or row["packet_count"]
+                link[f"{direction}_reception_count"] += receptions
+                link["reception_count"] += receptions
                 for metric in ("snr", "rssi"):
                     link[f"{direction}_{metric}_sum"] += row[f"{metric}_sum"] or 0.0
                     link[f"{direction}_{metric}_count"] += row[f"{metric}_count"]
