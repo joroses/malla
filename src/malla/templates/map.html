@@ -169,26 +169,34 @@
             </select>
         </div>
 
+        {# Role swatches reuse the CSS custom properties that getRoleColor()
+           reads, and quality lines come from the backend palette
+           (QUALITY_COLORS, injected from signal_quality.py), so the legend
+           can never drift from the rendered markers and link halves. #}
         {% set map_legend_items = [
-            {"type": "span", "class": "role-color-indicator", "style": "background-color: #007bff;", "content": "", "text": "Client"},
-            {"type": "span", "class": "role-color-indicator", "style": "background-color: #28a745;", "content": "", "text": "Router"},
-            {"type": "span", "class": "role-color-indicator", "style": "background-color: #28a745;", "content": "", "text": "Router Late"},
-            {"type": "span", "class": "role-color-indicator", "style": "background-color: #ffc107;", "content": "", "text": "Repeater"},
-            {"type": "span", "class": "role-color-indicator", "style": "background-color: #6c757d;", "content": "", "text": "Client Mute"},
-            {"type": "span", "class": "role-color-indicator", "style": "background-color: #17a2b8;", "content": "", "text": "Router Client"},
-            {"type": "span", "class": "role-color-indicator", "style": "background-color: #e83e8c;", "content": "", "text": "Sensor"},
-            {"type": "span", "class": "role-color-indicator", "style": "background-color: #dc3545;", "content": "", "text": "Unknown Role"},
-            {"type": "span", "class": "signal-indicator bg-success", "content": "", "text": "Excellent coverage"},
-            {"type": "span", "class": "signal-indicator bg-warning", "content": "", "text": "Good coverage"},
-            {"type": "span", "class": "signal-indicator bg-danger", "content": "", "text": "Limited coverage"},
-            {"type": "span", "class": "legend-line", "style": "border-top: 4px solid #0d6efd;", "content": "", "text": "Traceroute link"},
-            {"type": "span", "class": "legend-line", "style": "border-top: 4px dashed #0d6efd;", "content": "", "text": "Packet link"}
+            {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-primary);", "content": "", "text": "Client"},
+            {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-success);", "content": "", "text": "Router"},
+            {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-success);", "content": "", "text": "Router Late"},
+            {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-warning);", "content": "", "text": "Repeater"},
+            {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-secondary);", "content": "", "text": "Client Mute"},
+            {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-info);", "content": "", "text": "Router Client"},
+            {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-sensor);", "content": "", "text": "Sensor"},
+            {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-danger);", "content": "", "text": "Unknown Role"},
+            {"type": "legend-line", "style": "border-top: 4px solid " ~ QUALITY_COLORS.good ~ ";", "content": "", "text": "Good quality (half nearest receiver)"},
+            {"type": "legend-line", "style": "border-top: 4px solid " ~ QUALITY_COLORS.fair ~ ";", "content": "", "text": "Fair quality"},
+            {"type": "legend-line", "style": "border-top: 4px solid " ~ QUALITY_COLORS.marginal ~ ";", "content": "", "text": "Marginal quality"},
+            {"type": "legend-line", "style": "border-top: 4px dashed " ~ QUALITY_COLORS.unknown ~ "; opacity: 0.55;", "content": "", "text": "Direction not observed (dashed, faded)"},
+            {"type": "legend-line", "style": "height: 4px; border-radius: 2px; background: linear-gradient(90deg, " ~ QUALITY_COLORS.good ~ " 50%, " ~ QUALITY_COLORS.marginal ~ " 50%);", "content": "", "text": "Asymmetric link — color changes midway"},
+            {"type": "legend-line", "style": "border-top: 8px solid " ~ QUALITY_COLORS.unknown ~ ";", "content": "", "text": "Thicker = more observations"},
+            {"type": "legend-line", "style": "border-top: 4px solid " ~ QUALITY_COLORS.unknown ~ ";", "content": "", "text": "Traceroute link (solid)"},
+            {"type": "legend-line", "style": "border-top: 4px dotted " ~ QUALITY_COLORS.unknown ~ ";", "content": "", "text": "Packet link (dotted)"}
         ] %}
         {% call legend_section(map_legend_items) %}
             <div class="legend-item mt-2">
                 <small class="text-muted">Node colors indicate role types<br>
                 Click nodes for details<br>
-                RF links show radio connections<br>
+                Each RF link half is colored by the quality the node at that end receives<br>
+                Line width shows observation volume; missing directions are dashed and faded<br>
                 Clusters group nearby nodes</small>
             </div>
         {% endcall %}
@@ -271,13 +279,6 @@
 .node-list-item.selected {
     background-color: rgba(var(--bs-primary-rgb), 0.2);
     border-color: var(--bs-primary);
-}
-
-.signal-indicator {
-    display: inline-block;
-    width: 12px;
-    height: 12px;
-    border-radius: 50%;
 }
 
 .role-color-indicator {
@@ -417,6 +418,7 @@
 <script src="https://unpkg.com/leaflet.markercluster@1.4.1/dist/leaflet.markercluster.js"></script>
 {% include 'components/openfreemap_js.html' %}
 <script src="{{ url_for('static', filename='js/openfreemap.js') }}?v={{ ASSET_VERSION }}"></script>
+<script src="{{ url_for('static', filename='js/rf-link-ui.js') }}?v={{ ASSET_VERSION }}"></script>
 
 <script>
 let map;
@@ -1474,8 +1476,8 @@ function togglePacketLinks() {
     if (showPacketLinks) {
         drawPacketLinks();
         if (btn) {
-            setChildren(btn, icon('bi bi-envelope-open'), textNode(' Show Packet Links'));
-            btn.className = 'btn btn-sm btn-outline-secondary';
+            setChildren(btn, icon('bi bi-envelope-open'), textNode(' Hide Packet Links'));
+            btn.className = 'btn btn-sm btn-outline-info';
         }
     } else {
         if (btn) {
@@ -1492,67 +1494,7 @@ function drawTracerouteLinks() {
 
 // Draw traceroute links with optional filtering by node
 function drawTracerouteLinksFiltered(filterNodeId = null) {
-    // Clear existing traceroute polylines
-    tracerouteLinks.forEach(link => map.removeLayer(link));
-    tracerouteLinks = [];
-
-    const nodePositions = {};
-
-    // Build node position lookup
-    nodeData.forEach(node => {
-        nodePositions[node.node_id] = [node.latitude, node.longitude];
-    });
-
-    // Start with traceroute link data only
-    let linksToShow = tracerouteLinkData;
-    if (filterNodeId !== null) {
-        linksToShow = linksToShow.filter(link =>
-            link.from_node_id === filterNodeId ||
-            link.to_node_id === filterNodeId
-        );
-    }
-
-    linksToShow.forEach(link => {
-        const fromPos = nodePositions[link.from_node_id];
-        const toPos = nodePositions[link.to_node_id];
-
-        if (!fromPos || !toPos) {
-            return; // Skip if either node doesn't have position
-        }
-
-        // Color shows link quality (preset-aware tier); thickness shows
-        // observation volume ("how much data").
-        let linkColor = '#999999';
-        let linkWeight = 2;
-        let linkOpacity = 0.6;
-
-        if (link.quality_color) {
-            linkColor = link.quality_color;
-        }
-        if (link.strength) {
-            linkWeight = link.strength;
-        }
-
-        // If filtering by node, highlight the selected node's links
-        if (filterNodeId !== null) {
-            linkWeight = Math.max(3, linkWeight); // Make filtered links thicker
-            linkOpacity = 0.9; // Make them more opaque
-        }
-
-        // Create the line
-        const line = L.polyline([fromPos, toPos], {
-            color: linkColor,
-            weight: linkWeight,
-            opacity: linkOpacity
-        });
-
-        // Add popup with link information
-        const popupContent = createLinkPopupContent(link);
-        line.bindPopup(popupContent);
-
-        line.addTo(map);
-        tracerouteLinks.push(line);
-    });
+    drawRfLinks('traceroute', filterNodeId);
 }
 
 // Draw only links connected to a specific node
@@ -1567,19 +1509,41 @@ function drawPacketLinks() {
 
 // Draw packet links with optional filtering by node
 function drawPacketLinksFiltered(filterNodeId = null) {
-    // Clear existing packet polylines
-    packetLinks.forEach(link => map.removeLayer(link));
-    packetLinks = [];
+    drawRfLinks('packet', filterNodeId);
+}
+
+// Draw only links connected to a specific node
+function drawFilteredPacketLinks(nodeId) {
+    drawPacketLinksFiltered(nodeId);
+}
+
+// Remove every layer of a link set from the map.
+function clearRfLinkLayers(layers) {
+    layers.forEach(layer => map.removeLayer(layer));
+}
+
+// Shared RF-link renderer for both link types (traceroute + packet).
+//
+// Every link is drawn as two half-segments joined at the displayed
+// midpoint. For canonical endpoints A (from_node_id) and B (to_node_id)
+// the half nearest B carries the forward quality (measured at B, the
+// receiver of A→B) and the half nearest A carries the return quality
+// (measured at A), so asymmetric links visibly change color midway.
+// A direction without measurements renders with the unknown color,
+// reduced opacity and a dash pattern — it is never averaged away.
+function drawRfLinks(linkType, filterNodeId = null) {
+    const isPacket = linkType === 'packet';
+    const dataset = isPacket ? packetLinkData : tracerouteLinkData;
+    const currentLayers = isPacket ? packetLinks : tracerouteLinks;
+
+    clearRfLinkLayers(currentLayers);
 
     const nodePositions = {};
-
-    // Build node position lookup
     nodeData.forEach(node => {
         nodePositions[node.node_id] = [node.latitude, node.longitude];
     });
 
-    // Start with packet link data only
-    let linksToShow = packetLinkData;
+    let linksToShow = dataset;
     if (filterNodeId !== null) {
         linksToShow = linksToShow.filter(link =>
             link.from_node_id === filterNodeId ||
@@ -1587,6 +1551,7 @@ function drawPacketLinksFiltered(filterNodeId = null) {
         );
     }
 
+    const created = [];
     linksToShow.forEach(link => {
         const fromPos = nodePositions[link.from_node_id];
         const toPos = nodePositions[link.to_node_id];
@@ -1595,65 +1560,126 @@ function drawPacketLinksFiltered(filterNodeId = null) {
             return; // Skip if either node doesn't have position
         }
 
-        // Same visual language as traceroute links: color = quality,
-        // thickness = observation volume. Packet links keep a dashed style
-        // to stay visually distinct.
-        let linkColor = '#999999';
-        let linkWeight = 2;
-        let linkOpacity = 0.6;
-
-        if (link.quality_color) {
-            linkColor = link.quality_color;
-        }
-        if (link.strength) {
-            linkWeight = link.strength;
-        }
-
-        // If filtering by node, highlight the selected node's links
-        if (filterNodeId !== null) {
-            linkWeight = Math.max(3, linkWeight); // Make filtered links thicker
-            linkOpacity = 0.9; // Make them more opaque
-        }
-
-        // Packet links get dashed style to visually distinguish
-        const isPacket = link.link_type === 'packet';
-
-        const line = L.polyline([fromPos, toPos], {
-            color: linkColor,
-            weight: linkWeight,
-            opacity: linkOpacity,
-            dashArray: isPacket ? '3, 6' : null
-        });
-
-        // Add popup with link information
-        const popupContent = createLinkPopupContent(link);
-        line.bindPopup(popupContent);
-
-        line.addTo(map);
-        packetLinks.push(line);
+        const group = createRfLinkLayer(link, fromPos, toPos, filterNodeId, isPacket);
+        group.addTo(map);
+        created.push(group);
     });
+
+    if (isPacket) {
+        packetLinks = created;
+    } else {
+        tracerouteLinks = created;
+    }
 }
 
-// Draw only links connected to a specific node
-function drawFilteredPacketLinks(nodeId) {
-    drawPacketLinksFiltered(nodeId);
+// Unwrap the longitudes of a from/to position pair so the link spans the
+// short way across the antimeridian (|lngTo - lngFrom| <= 180).
+function unwrapLinkLongitudes(fromPos, toPos) {
+    let lngFrom = fromPos[1];
+    const lngTo = toPos[1];
+    if (Math.abs(lngTo - lngFrom) > 180) {
+        lngFrom += lngTo > lngFrom ? 360 : -360;
+    }
+    return [lngFrom, lngTo];
 }
 
-// Create popup content for traceroute links
+// Midpoint of the displayed straight line between two positions, computed
+// in projected space so it matches the rendered polyline at any zoom.
+// Longitudes are unwrapped across the antimeridian first so links spanning
+// ±180° bend the short way. The longitude is normalized back into
+// [-180, 180] unless `unwrapped` is requested, which keeps it contiguous
+// with the unwrapped endpoints for building segment geometry.
+function rfLinkMidpoint(fromPos, toPos, unwrapped = false) {
+    const [lngFrom, lngTo] = unwrapLinkLongitudes(fromPos, toPos);
+    let lat;
+    let lng;
+    if (!map) {
+        lat = (fromPos[0] + toPos[0]) / 2;
+        lng = (lngFrom + lngTo) / 2;
+    } else {
+        const p1 = map.project([fromPos[0], lngFrom]);
+        const p2 = map.project([toPos[0], lngTo]);
+        const mid = map.unproject([(p1.x + p2.x) / 2, (p1.y + p2.y) / 2]);
+        lat = mid.lat;
+        lng = mid.lng;
+    }
+    if (unwrapped) {
+        return [lat, lng];
+    }
+    // Normalize back into [-180, 180].
+    return [lat, ((lng + 540) % 360) - 180];
+}
+
+// Replicate one unwrapped [lat, lng] segment into every world copy it
+// touches. A segment bent across the ±180° seam must appear on both sides
+// of the seam at any pan offset, and stock Leaflet never repeats vector
+// overlays, so each intersecting copy gets its own shifted polyline.
+function worldCopySegmentCopies(a, b) {
+    const lo = Math.min(a[1], b[1]);
+    const hi = Math.max(a[1], b[1]);
+    const copies = [];
+    for (let k = Math.ceil((lo - 180) / 360); k <= Math.floor((hi + 180) / 360); k++) {
+        copies.push([[a[0], a[1] - 360 * k], [b[0], b[1] - 360 * k]]);
+    }
+    return copies;
+}
+
+// Build one logical RF link: a feature group of two half-segments sharing a
+// single popup, filter treatment and removal path. Both halves use the
+// backend observation-volume strength as their width.
+function createRfLinkLayer(link, fromPos, toPos, filterNodeId, isPacket) {
+    // A direction counts as measured only with a usable average SNR;
+    // missing quality keeps the backend unknown color and gets faded +
+    // dashed so it can never be mistaken for a measured half.
+    const forwardKnown = RFLinkUI.hasValue(link.forward_avg_snr);
+    const returnKnown = RFLinkUI.hasValue(link.return_avg_snr);
+
+    // Thickness encodes observation volume (backend strength scale);
+    // color encodes per-direction quality.
+    let weight = link.strength || 2;
+    let opacity = 0.6;
+    if (filterNodeId !== null) {
+        weight = Math.max(3, weight); // Make filtered links thicker
+        opacity = 0.9; // Make them more opaque
+    }
+
+    // Packet links keep their distinct dot dash even when both directions
+    // are measured; an unmeasured traceroute half uses a long dash so the
+    // two patterns stay distinguishable.
+    const dashFor = known => {
+        if (isPacket) return '3, 6';
+        return known ? null : '8, 6';
+    };
+
+    const makeHalf = (fromLL, toLL, color, known) =>
+        worldCopySegmentCopies(fromLL, toLL).map(positions => L.polyline(positions, {
+            color: color || RFLinkUI.qualityColor(),
+            weight: weight,
+            opacity: known ? opacity : opacity * 0.55,
+            dashArray: dashFor(known)
+        }));
+
+    // Half nearest B shows what B receives (forward); half nearest A shows
+    // what A receives (return). Endpoints and midpoint are unwrapped
+    // consistently so every half-segment is contiguous in projected space
+    // and takes the short way across the antimeridian.
+    const unwrapped = unwrapLinkLongitudes(fromPos, toPos);
+    const midPos = rfLinkMidpoint(fromPos, toPos, true);
+    const bHalf = makeHalf(midPos, [toPos[0], unwrapped[1]], link.forward_color, forwardKnown);
+    const aHalf = makeHalf([fromPos[0], unwrapped[0]], midPos, link.return_color, returnKnown);
+
+    const group = L.featureGroup(aHalf.concat(bHalf));
+    group.bindPopup(createLinkPopupContent(link));
+    return group;
+}
+
+// Create popup content for RF links (shared by both halves of a link)
 function createLinkPopupContent(link) {
     const fromNode = nodeData.find(n => n.node_id === link.from_node_id);
     const toNode = nodeData.find(n => n.node_id === link.to_node_id);
 
     const fromName = fromNode ? fromNode.display_name : `!${link.from_node_id.toString(16).padStart(8, '0')}`;
     const toName = toNode ? toNode.display_name : `!${link.to_node_id.toString(16).padStart(8, '0')}`;
-
-    // Shared quality metrics (same fields as the network graph): quality
-    // tier, estimated reliability and direction coverage.
-    const hasQuality = link.quality !== undefined && link.quality !== null;
-    const qualityClass = link.quality === 'good' ? 'text-success'
-        : link.quality === 'fair' ? 'text-warning'
-        : link.quality === 'marginal' ? 'text-danger'
-        : 'text-muted';
 
     // Format timestamp using timezone preference
     const formattedTime = (typeof formatTimestamp === 'function' && link.last_seen)
@@ -1675,53 +1701,30 @@ function createLinkPopupContent(link) {
         losButton.addEventListener('click', () => showLineOfSight(link.from_node_id, link.to_node_id));
     }
 
-    // Null-safe value check: a real 0.0 dB measurement must still display.
-    const hasValue = v => v !== null && v !== undefined && !Number.isNaN(v);
-
-    // Per-direction breakdown: forward = from_node → to_node, return = to_node → from_node.
-    const directionalRows = [];
-    if (hasValue(link.forward_avg_snr) || (link.forward_count ?? 0) > 0) {
-        directionalRows.push(el('div', { className: 'small' },
-            el('strong', null, `${fromName} → ${toName}:`),
-            textNode(` ${hasValue(link.forward_avg_snr) ? `${link.forward_avg_snr.toFixed(1)} dB` : 'N/A'} (${link.forward_count ?? 0} measurements)`)));
-    }
-    if (hasValue(link.return_avg_snr) || (link.return_count ?? 0) > 0) {
-        directionalRows.push(el('div', { className: 'small' },
-            el('strong', null, `${toName} → ${fromName}:`),
-            textNode(` ${hasValue(link.return_avg_snr) ? `${link.return_avg_snr.toFixed(1)} dB` : 'N/A'} (${link.return_count ?? 0} measurements)`)));
-    }
-    if (hasValue(link.forward_avg_rssi)) {
-        directionalRows.push(el('div', { className: 'small' },
-            el('strong', null, `${fromName} → ${toName} RSSI:`),
-            textNode(` ${link.forward_avg_rssi.toFixed(1)} dBm`)));
-    }
-    if (hasValue(link.return_avg_rssi)) {
-        directionalRows.push(el('div', { className: 'small' },
-            el('strong', null, `${toName} → ${fromName} RSSI:`),
-            textNode(` ${link.return_avg_rssi.toFixed(1)} dBm`)));
-    }
-
     return el('div', { className: 'traceroute-link-info' },
         el('div', { className: 'fw-bold mb-2' }, link.link_type === 'packet' ? 'Direct Packet Link' : 'Traceroute RF Hop'),
         el('div', null, el('strong', null, 'From:'), textNode(` ${fromName}`)),
         el('div', null, el('strong', null, 'To:'), textNode(` ${toName}`)),
-        hasQuality
-            ? el('div', null, el('strong', null, 'Quality:'), textNode(' '), el('span', { className: qualityClass }, `${link.quality.charAt(0).toUpperCase() + link.quality.slice(1)}${link.spreading_factor ? ` (SF${link.spreading_factor}${link.channel_id ? ` · ${link.channel_id}` : ''})` : ''}`))
+        // Per-direction measurements rendered from the backend payload:
+        // tier colors, counts, RSSI (where available) and which node
+        // received each direction.
+        el('div', { className: 'mt-1' },
+            RFLinkUI.directionSection({
+                senderName: fromName, receiverName: toName, prefix: 'forward', link
+            }),
+            RFLinkUI.directionSection({
+                senderName: toName, receiverName: fromName, prefix: 'return', link
+            })),
+        RFLinkUI.reliabilityRow(link.estimated_reliability),
+        RFLinkUI.balanceMessage(link),
+        link.spreading_factor
+            ? el('div', { className: 'small text-muted' }, `Quality model: SF${link.spreading_factor}${link.channel_id ? ` · ${link.channel_id}` : ''}`)
             : null,
-        hasValue(link.estimated_reliability)
-            ? el('div', null, el('strong', null, 'Estimated reliability:'), textNode(` ${link.estimated_reliability.toFixed(1)}%`))
-            : null,
-        hasQuality && link.is_bidirectional === false
-            ? el('div', { className: 'small text-muted' }, 'One direction observed — incomplete coverage')
-            : null,
-        hasValue(link.worst_snr)
+        RFLinkUI.hasValue(link.worst_snr)
             ? el('div', null, el('strong', null, 'Worst-direction SNR:'), textNode(` ${link.worst_snr.toFixed(1)} dB`))
             : null,
         el('div', null, el('strong', null, 'Observations:'), textNode(` ${link.observation_count ?? link.total_hops_seen ?? 0}`)),
         el('div', null, el('strong', null, 'Last Seen:'), textNode(` ${formattedTime}`)),
-        hasValue(link.avg_snr) ? el('div', null, el('strong', null, 'Avg SNR:'), textNode(` ${link.avg_snr.toFixed(1)} dB`)) : null,
-        hasValue(link.avg_rssi) ? el('div', null, el('strong', null, 'Avg RSSI:'), textNode(` ${link.avg_rssi.toFixed(0)} dBm`)) : null,
-        directionalRows.length ? el('div', { className: 'mt-1' }, ...directionalRows) : null,
         el('div', { className: 'mt-2 d-flex gap-1' }, historyButton, losButton)
     );
 }

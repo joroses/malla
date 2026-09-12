@@ -30,6 +30,7 @@ from .utils.node_utils import (
     start_cache_cleanup,
     stop_cache_cleanup,
 )
+from .utils.signal_quality import QUALITY_COLORS
 
 # Configure logging
 logging.basicConfig(
@@ -264,6 +265,10 @@ def create_app(cfg: AppConfig | None = None):  # noqa: D401
             # starts (i.e. on every deploy/restart), so browsers reliably pick
             # up updated JS/CSS instead of serving a stale cached copy.
             "ASSET_VERSION": _ASSET_VERSION,
+            # Single source of the link-quality palette
+            # (src/malla/utils/signal_quality.py) for every template and the
+            # window.MALLA_QUALITY_COLORS script in base.html.
+            "QUALITY_COLORS": QUALITY_COLORS,
         }
 
     # Initialize database

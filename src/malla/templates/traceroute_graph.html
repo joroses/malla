@@ -238,6 +238,12 @@
 
 <script src="https://d3js.org/d3.v7.min.js"></script>
 <script>
+// Quality palette from the backend single source (signal_quality.py),
+// injected by base.html as window.MALLA_QUALITY_COLORS. Never hardcode
+// quality hex values here.
+const qualityPalette = window.MALLA_QUALITY_COLORS || {};
+const UNKNOWN_QUALITY_COLOR = qualityPalette.unknown;
+
 let currentGraph = null;
 let simulation = null;
 let selectedNode = null;
@@ -640,7 +646,9 @@ function renderGraph(data) {
 
         // Create links. Color comes from the shared quality palette
         // (preset-aware tier); thickness is pure observation volume.
-        const linkColor = d => d.quality_color || snrColorScale(d.avg_snr);
+        // Missing quality falls back to the palette's unknown color —
+        // never recomputed client-side from SNR.
+        const linkColor = d => d.quality_color || UNKNOWN_QUALITY_COLOR;
         const link = g.append('g')
             .attr('class', 'links')
             .selectAll('line')
@@ -677,8 +685,8 @@ function renderGraph(data) {
                 .selectAll('line')
                 .data(data.indirect_connections)
                 .join('line')
-                .attr('class', 'link indirect')
-                .attr('stroke', '#6c757d')
+            .attr('class', 'link indirect')
+            .attr('stroke', UNKNOWN_QUALITY_COLOR)
                 .attr('stroke-width', d => Math.max(1, d.strength))
                 .attr('stroke-opacity', 0.4)
                 .attr('stroke-dasharray', '5,5')
@@ -738,7 +746,7 @@ function renderGraph(data) {
         // Add circles for nodes
         node.append('circle')
             .attr('r', d => d.size)
-            .attr('fill', d => d.avg_snr ? snrColorScale(d.avg_snr) : '#6c757d')
+            .attr('fill', d => d.avg_snr ? snrColorScale(d.avg_snr) : UNKNOWN_QUALITY_COLOR)
             .attr('stroke', '#fff')
             .attr('stroke-width', 2);
 
@@ -1113,7 +1121,7 @@ function clearSelection() {
     d3.selectAll('.indirect-links line').each(function(d) {
         d3.select(this)
             .style('opacity', 0.4)
-            .attr('stroke', '#6c757d')
+            .attr('stroke', UNKNOWN_QUALITY_COLOR)
             .attr('stroke-width', d3.select(this).attr('data-original-width'));
     });
 
@@ -1380,7 +1388,7 @@ function highlightPathsBetweenNodes() {
 
         d3.select(this)
             .style('opacity', isInPath ? 0.7 : 0.1)
-            .attr('stroke', isInPath ? '#ffc107' : '#6c757d')
+            .attr('stroke', isInPath ? '#ffc107' : UNKNOWN_QUALITY_COLOR)
             .attr('stroke-width', isInPath ? 5 : d3.select(this).attr('data-original-width'));
     });
 }
@@ -1401,7 +1409,7 @@ function showSelectedLinkDetails(link) {
                 el('strong', null, 'Quality:'),
                 el('br'),
                 link.quality
-                    ? el('span', { className: 'h5', style: `color:${link.quality_color || '#6c757d'}` },
+                    ? el('span', { className: 'h5', style: `color:${link.quality_color || UNKNOWN_QUALITY_COLOR}` },
                         `${link.quality.charAt(0).toUpperCase() + link.quality.slice(1)}`)
                     : el('span', { className: `h5 ${link.avg_snr > -10 ? 'text-success' : 'text-warning'}` }, `${link.avg_snr} dB`)
             ),
@@ -1811,7 +1819,7 @@ function highlightPathToNode(hoveredNode) {
         const isInPath = pathLinks.has(linkKey);
 
         d3.select(this)
-            .attr('stroke', isInPath ? '#ffc107' : '#6c757d')
+            .attr('stroke', isInPath ? '#ffc107' : UNKNOWN_QUALITY_COLOR)
             .attr('stroke-width', isInPath ? 5 : d3.select(this).attr('data-original-width'));
     });
 }
@@ -1836,7 +1844,7 @@ function clearPathHighlight() {
 
     d3.selectAll('.indirect-links line').each(function(d) {
         d3.select(this)
-            .attr('stroke', '#6c757d')
+            .attr('stroke', UNKNOWN_QUALITY_COLOR)
             .attr('stroke-width', d3.select(this).attr('data-original-width'));
     });
 }
