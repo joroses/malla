@@ -148,15 +148,11 @@ class AnalyticsService:
 
         total_packets = row["total_packets"] or 0
         successful_packets = row["successful_packets"] or 0
-        success_rate = (
-            (successful_packets / total_packets * 100) if total_packets > 0 else 0
-        )
 
         return {
             "total_packets": total_packets,
             "successful_packets": successful_packets,
             "failed_packets": total_packets - successful_packets,
-            "success_rate": round(success_rate, 2),
             "average_payload_size": round(row["avg_payload_size"] or 0, 2),
         }
 
@@ -474,14 +470,12 @@ class AnalyticsService:
         for hour in range(24):
             count = hourly_counts.get(hour, 0)
             success = hourly_success.get(hour, 0)
-            success_rate = (success / count * 100) if count > 0 else 0
 
             hourly_data.append(
                 {
                     "hour": hour,
                     "total_packets": count,
                     "successful_packets": success,
-                    "success_rate": round(success_rate, 2),
                 }
             )
 
@@ -1026,7 +1020,7 @@ class AnalyticsService:
         conn = get_db_connection()
         cursor = conn.cursor()
 
-        # Get gateway distribution with success rates and percentages
+        # Get gateway distribution with percentages
         cursor.execute(
             f"""
             WITH gateway_stats AS (
@@ -1045,7 +1039,6 @@ class AnalyticsService:
                 gs.gateway_id,
                 gs.total_packets,
                 gs.successful_packets,
-                ROUND(gs.successful_packets * 100.0 / gs.total_packets, 2) as success_rate,
                 ROUND(gs.total_packets * 100.0 / t.total, 2) as percentage_of_total
             FROM gateway_stats gs, total_count t
             ORDER BY gs.total_packets DESC

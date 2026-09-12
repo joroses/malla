@@ -226,8 +226,8 @@ class TestTracerouteServiceLongestLinks:
         """Test node traceroute stats delegates to SQL statistics."""
         mock_get_stats.return_value = {
             "node_id": 12345,
-            "as_source": {"total": 10, "successful": 8, "success_rate": 80.0},
-            "as_destination": {"total": 5, "successful": 4, "success_rate": 80.0},
+            "as_source": {"total": 10, "successful": 8},
+            "as_destination": {"total": 5, "successful": 4},
             "as_intermediate_hop": {"participation_count": 3},
             "total_involvement": 18,
         }

@@ -8,7 +8,9 @@ import time
 from datetime import UTC, datetime
 from typing import Any
 
+from ..config import get_config
 from ..database.repositories import LocationRepository
+from ..utils.link_quality import ENRICHMENT_FIELDS, enrich_link_quality
 from ..utils.signal_quality import rssi_valid_sql, snr_valid_sql
 
 logger = logging.getLogger(__name__)
@@ -19,9 +21,16 @@ _PACKET_LINKS_CACHE_MAX_ENTRIES = 64
 
 
 def _cache_key_from_filters(filters: dict[str, Any] | None) -> str:
-    if not filters:
-        return ""
-    return repr(sorted(filters.items()))
+    # Link quality is preset-aware, so the RF configuration belongs to the
+    # cache identity: a changed preset must recompute tiers immediately.
+    cfg = get_config()
+    return repr(
+        (
+            sorted((filters or {}).items()),
+            cfg.lora_preset,
+            cfg.lora_spreading_factor,
+        )
+    )
 
 
 def _prune_packet_links_cache(now: float) -> None:
@@ -432,10 +441,6 @@ class LocationService:
                 last_seen_dt = datetime.fromtimestamp(link["last_seen"], UTC)
                 last_seen_str = last_seen_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
-                # Calculate success rate (using packet count as proxy)
-                # Higher packet count suggests more reliable link
-                success_rate = min(100, max(10, link["packet_count"] * 10))
-
                 forward_count = link.get("forward_count")
                 return_count = link.get("return_count")
                 if forward_count is None or return_count is None:
@@ -447,7 +452,6 @@ class LocationService:
                 traceroute_link = {
                     "from_node_id": link["source"],
                     "to_node_id": link["target"],
-                    "success_rate": success_rate,
                     "avg_snr": link.get("avg_snr"),
                     "forward_avg_snr": link.get("forward_avg_snr"),
                     "return_avg_snr": link.get("return_avg_snr"),
@@ -462,6 +466,18 @@ class LocationService:
                     "total_hops_seen": link["packet_count"],
                     "last_packet_id": link.get("last_packet_id"),
                 }
+                # The graph already enriched this link with the shared
+                # quality/reliability/balance metrics — pass them through
+                # verbatim so map consumers see exactly what the graph API
+                # reports, without recalculating anything here.
+                if link.get("quality") is not None:
+                    is_bidirectional = link.get(
+                        "is_bidirectional", is_bidirectional
+                    )
+                    traceroute_link["is_bidirectional"] = is_bidirectional
+                    for field in ENRICHMENT_FIELDS:
+                        if field in link:
+                            traceroute_link[field] = link[field]
 
                 traceroute_links.append(traceroute_link)
 
@@ -997,6 +1013,8 @@ class LocationService:
                     COUNT(CASE WHEN {rssi_valid_sql()} THEN 1 END) AS rssi_count,
                     SUM(CASE WHEN {snr_valid_sql()} THEN snr END) AS snr_sum,
                     COUNT(CASE WHEN {snr_valid_sql()} THEN 1 END) AS snr_count,
+                    channel_id,
+                    id                     AS latest_packet_id,
                     MAX(timestamp)         AS last_seen
                 FROM packet_history
                 {where_sql}
@@ -1053,14 +1071,10 @@ class LocationService:
                     else None
                 )
 
-                # Crude success-rate proxy: scale packet count to 10-100 like traceroute_links
-                success_rate = max(10, min(100, row["packet_count"] * 10))
-
                 if key not in link_map:
                     link_map[key] = {
                         "from_node_id": key[0],
                         "to_node_id": key[1],
-                        "success_rate": success_rate,
                         "forward_count": 0,
                         "return_count": 0,
                         "forward_snr_sum": 0.0,
@@ -1077,11 +1091,15 @@ class LocationService:
                         "last_seen_str": last_seen_str,
                         "total_hops_seen": 0,
                         "last_packet_id": None,
+                        # Most recent channel across all rows of this link
+                        # (timestamp, then packet id as tie-breaker).
+                        "last_seen_ts": row["last_seen"],
+                        "latest_packet_id": row["latest_packet_id"],
+                        "channel_id": row["channel_id"],
                     }
 
                 link = link_map[key]
                 link["total_hops_seen"] += row["packet_count"]
-                link["success_rate"] = max(link["success_rate"], success_rate)
                 # Raw gateway aliases can produce several rows for the same
                 # direction. Merge observations and each metric's valid samples.
                 link[f"{direction}_count"] += row["packet_count"]
@@ -1093,6 +1111,13 @@ class LocationService:
                 ):
                     link["age_hours"] = round(age_hours, 2)
                     link["last_seen_str"] = last_seen_str
+                if (
+                    row["last_seen"],
+                    row["latest_packet_id"],
+                ) > (link["last_seen_ts"], link["latest_packet_id"] or -1):
+                    link["last_seen_ts"] = row["last_seen"]
+                    link["latest_packet_id"] = row["latest_packet_id"]
+                    link["channel_id"] = row["channel_id"]
 
             # Finalize combined averages as a mean of the directional means and
             # round everything only once, after the merge, so a 0.0 dB reading
@@ -1136,6 +1161,22 @@ class LocationService:
                 ):
                     if link[field] is not None:
                         link[field] = round(link[field], 1)
+
+                # Same shared metrics as the traceroute graph and the link
+                # analysis endpoint: quality tiers, estimated reliability,
+                # balance and observation-volume strength.
+                link.update(
+                    enrich_link_quality(
+                        channel_id=link.get("channel_id"),
+                        forward_avg_snr=link["forward_avg_snr"],
+                        return_avg_snr=link["return_avg_snr"],
+                        forward_observations=link["forward_count"],
+                        return_observations=link["return_count"],
+                    )
+                )
+                # Keep the newest packet id for parity with graph links.
+                link["last_packet_id"] = link.pop("latest_packet_id", None)
+                link.pop("last_seen_ts", None)
 
             logger.info("Generated %d packet-based RF links", len(link_map))
             result = list(link_map.values())

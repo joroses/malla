@@ -121,8 +121,24 @@ class TestNetworkGraphDirectionalAggregation:
         assert link["forward_count"] == 1  # observed...
         assert link["forward_avg_snr"] is None  # ...but SNR unrecorded
         assert link["return_count"] == 0
-        # Combined behavior unchanged: the sentinel is still averaged in.
-        assert link["avg_snr"] == -32.0
+        # The sentinel is excluded from the combined average too.
+        assert link["avg_snr"] is None
+
+    def test_combined_and_node_averages_exclude_unknown_snr_sentinel(self):
+        now = time.time()
+        graph = self._graph(
+            [
+                _hop(9, 0, 100, 200, -10.0, now),
+                _hop(10, 0, 100, 200, -32.0, now),
+            ]
+        )
+
+        link = graph["links"][0]
+        assert link["forward_count"] == 2  # sentinel still an observation
+        assert link["forward_avg_snr"] == -10.0
+        assert link["avg_snr"] == -10.0
+        node = {n["id"]: n for n in graph["nodes"]}[100]
+        assert node["avg_snr"] == -10.0
 
     def test_zero_snr_hop_excluded_from_every_bucket(self):
         now = time.time()
@@ -225,6 +241,7 @@ class TestPacketLinksDirectionalMerge:
                 timestamp REAL NOT NULL,
                 from_node_id INTEGER,
                 gateway_id TEXT,
+                channel_id TEXT,
                 hop_start INTEGER,
                 hop_limit INTEGER,
                 rssi REAL,
@@ -235,14 +252,15 @@ class TestPacketLinksDirectionalMerge:
         return conn
 
     @staticmethod
-    def _insert(conn, timestamp, from_node, gateway_hex, rssi, snr):
+    def _insert(conn, timestamp, from_node, gateway_hex, rssi, snr, channel=None):
         conn.execute(
             """
             INSERT INTO packet_history (
-                timestamp, from_node_id, gateway_id, hop_start, hop_limit, rssi, snr
-            ) VALUES (?, ?, ?, 3, 3, ?, ?)
+                timestamp, from_node_id, gateway_id, channel_id,
+                hop_start, hop_limit, rssi, snr
+            ) VALUES (?, ?, ?, ?, 3, 3, ?, ?)
             """,
-            (timestamp, from_node, gateway_hex, rssi, snr),
+            (timestamp, from_node, gateway_hex, channel, rssi, snr),
         )
 
     def _packet_links(self, conn):
@@ -432,12 +450,9 @@ class TestTracerouteLinkRepositoryDirectionalStats:
         assert result["forward_avg_snr"] == pytest.approx(-20.0)
         assert result["reverse_count"] == 2
         # The -32.0 sentinel is an observation without SNR: excluded from
-        # the directional average, kept as a count.
+        # every average, kept as a count.
         assert result["reverse_avg_snr"] == pytest.approx(-5.0)
-        # Combined average keeps its historical validity window (sentinel in).
-        assert result["avg_snr"] == pytest.approx(
-            (-10.0 - 20.0 - 30.0 - 5.0 - 32.0) / 5
-        )
+        assert result["avg_snr"] == pytest.approx((-10.0 - 20.0 - 30.0 - 5.0) / 4)
 
     def test_reversed_node_order_flips_directional_fields(self):
         connection, now = self._database()
@@ -484,11 +499,13 @@ class TestTracerouteLinkRepositoryDirectionalStats:
         )
         assert result["forward_avg_snr"] == graph_link[f"{forward_direction}_avg_snr"]
         assert result["reverse_avg_snr"] == graph_link[f"{reverse_direction}_avg_snr"]
-        # Raw observations and legacy combined statistics remain available.
+        # Raw observations remain available; the combined average uses the
+        # same validity predicate as the directional ones (0 and -32.0
+        # sentinels excluded).
         assert result["total_attempts"] == 5
         assert result["forward_count"] == (3 if node_order[0] == 100 else 2)
         assert result["reverse_count"] == (2 if node_order[0] == 100 else 3)
-        assert result["avg_snr"] == pytest.approx((-10.0 - 32.0) / 5)
+        assert result["avg_snr"] == pytest.approx(-10.0)
         assert sum(packet["target_hop_snr"] == 0 for packet in result["packets"]) == 3
 
 

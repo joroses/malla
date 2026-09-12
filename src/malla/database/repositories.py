@@ -271,11 +271,7 @@ class DashboardRepository:
                     COUNT(DISTINCT CASE WHEN from_node_id IS NOT NULL THEN from_node_id END) as active_nodes_24h,
                     COUNT(CASE WHEN timestamp > ? THEN 1 END) as recent_packets,
                     AVG(CASE WHEN {rssi_valid_sql()} THEN rssi END) as avg_rssi,
-                    AVG(CASE WHEN {snr_valid_sql()} THEN snr END) as avg_snr,
-                    SUM(CASE WHEN processed_successfully = 1 THEN 1 ELSE 0 END) as successful_packets,
-                    CASE WHEN COUNT(*) > 0
-                         THEN ROUND(SUM(CASE WHEN processed_successfully = 1 THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 1)
-                         ELSE 0 END as success_rate
+                    AVG(CASE WHEN {snr_valid_sql()} THEN snr END) as avg_snr
                 FROM packet_history
                 WHERE timestamp > ?{gateway_filter}
             """,
@@ -339,7 +335,6 @@ class DashboardRepository:
                 "avg_rssi": round(stats_row["avg_rssi"] or 0, 1),
                 "avg_snr": round(stats_row["avg_snr"] or 0, 1),
                 "packet_types": packet_types,
-                "success_rate": stats_row["success_rate"] or 0,
             }
 
             _dashboard_stats_cache[gateway_id] = (now, dict(stats))

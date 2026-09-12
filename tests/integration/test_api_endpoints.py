@@ -26,7 +26,6 @@ class TestStatsEndpoint:
                 "avg_rssi",
                 "avg_snr",
                 "packet_types",
-                "success_rate",
             ],
         )
 
@@ -34,7 +33,6 @@ class TestStatsEndpoint:
         assert data["total_packets"] > 0
         assert data["total_nodes"] >= 5  # We have 5 test nodes
         assert isinstance(data["packet_types"], list)
-        assert data["success_rate"] >= 0
 
     @pytest.mark.integration
     @pytest.mark.api
@@ -466,7 +464,6 @@ class TestLocationEndpoints:
             required_link_fields = [
                 "from_node_id",
                 "to_node_id",
-                "success_rate",
                 "avg_snr",
                 "age_hours",
                 "last_seen_str",
@@ -479,7 +476,6 @@ class TestLocationEndpoints:
             # Test link field types
             assert isinstance(link["from_node_id"], int)
             assert isinstance(link["to_node_id"], int)
-            assert isinstance(link["success_rate"], int | float)
             assert isinstance(link["age_hours"], int | float)
             assert isinstance(link["last_seen_str"], str)
             assert isinstance(link["is_bidirectional"], bool)

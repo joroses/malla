@@ -1520,31 +1520,30 @@ function drawTracerouteLinksFiltered(filterNodeId = null) {
             return; // Skip if either node doesn't have position
         }
 
-        // Determine link color and style based on success rate and SNR
+        // Color shows link quality (preset-aware tier); thickness shows
+        // observation volume ("how much data").
         let linkColor = '#999999';
         let linkWeight = 2;
         let linkOpacity = 0.6;
 
-        // If filtering by node, highlight the selected node's links
-        if (filterNodeId !== null) {
-            linkWeight = 3; // Make filtered links thicker
-            linkOpacity = 0.9; // Make them more opaque
+        if (link.quality_color) {
+            linkColor = link.quality_color;
+        }
+        if (link.strength) {
+            linkWeight = link.strength;
         }
 
-        if (link.success_rate >= 80) {
-            linkColor = '#28a745'; // Green for high success
-        } else if (link.success_rate >= 50) {
-            linkColor = '#ffc107'; // Yellow for medium success
-        } else {
-            linkColor = '#dc3545'; // Red for low success
+        // If filtering by node, highlight the selected node's links
+        if (filterNodeId !== null) {
+            linkWeight = Math.max(3, linkWeight); // Make filtered links thicker
+            linkOpacity = 0.9; // Make them more opaque
         }
 
         // Create the line
         const line = L.polyline([fromPos, toPos], {
             color: linkColor,
             weight: linkWeight,
-            opacity: linkOpacity,
-            dashArray: link.success_rate < 50 ? '5, 5' : null // Dashed for unreliable links
+            opacity: linkOpacity
         });
 
         // Add popup with link information
@@ -1596,23 +1595,24 @@ function drawPacketLinksFiltered(filterNodeId = null) {
             return; // Skip if either node doesn't have position
         }
 
-        // Determine link color and style based on success rate and SNR
+        // Same visual language as traceroute links: color = quality,
+        // thickness = observation volume. Packet links keep a dashed style
+        // to stay visually distinct.
         let linkColor = '#999999';
         let linkWeight = 2;
         let linkOpacity = 0.6;
 
-        // If filtering by node, highlight the selected node's links
-        if (filterNodeId !== null) {
-            linkWeight = 3; // Make filtered links thicker
-            linkOpacity = 0.9; // Make them more opaque
+        if (link.quality_color) {
+            linkColor = link.quality_color;
+        }
+        if (link.strength) {
+            linkWeight = link.strength;
         }
 
-        if (link.success_rate >= 80) {
-            linkColor = '#28a745'; // Green for high success
-        } else if (link.success_rate >= 50) {
-            linkColor = '#ffc107'; // Yellow for medium success
-        } else {
-            linkColor = '#dc3545'; // Red for low success
+        // If filtering by node, highlight the selected node's links
+        if (filterNodeId !== null) {
+            linkWeight = Math.max(3, linkWeight); // Make filtered links thicker
+            linkOpacity = 0.9; // Make them more opaque
         }
 
         // Packet links get dashed style to visually distinguish
@@ -1622,7 +1622,7 @@ function drawPacketLinksFiltered(filterNodeId = null) {
             color: linkColor,
             weight: linkWeight,
             opacity: linkOpacity,
-            dashArray: isPacket ? '3, 6' : (link.success_rate < 50 ? '5, 5' : null)
+            dashArray: isPacket ? '3, 6' : null
         });
 
         // Add popup with link information
@@ -1647,9 +1647,13 @@ function createLinkPopupContent(link) {
     const fromName = fromNode ? fromNode.display_name : `!${link.from_node_id.toString(16).padStart(8, '0')}`;
     const toName = toNode ? toNode.display_name : `!${link.to_node_id.toString(16).padStart(8, '0')}`;
 
-    let qualityClass = 'text-success';
-    if (link.success_rate < 50) qualityClass = 'text-danger';
-    else if (link.success_rate < 80) qualityClass = 'text-warning';
+    // Shared quality metrics (same fields as the network graph): quality
+    // tier, estimated reliability and direction coverage.
+    const hasQuality = link.quality !== undefined && link.quality !== null;
+    const qualityClass = link.quality === 'good' ? 'text-success'
+        : link.quality === 'fair' ? 'text-warning'
+        : link.quality === 'marginal' ? 'text-danger'
+        : 'text-muted';
 
     // Format timestamp using timezone preference
     const formattedTime = (typeof formatTimestamp === 'function' && link.last_seen)
@@ -1701,8 +1705,19 @@ function createLinkPopupContent(link) {
         el('div', { className: 'fw-bold mb-2' }, link.link_type === 'packet' ? 'Direct Packet Link' : 'Traceroute RF Hop'),
         el('div', null, el('strong', null, 'From:'), textNode(` ${fromName}`)),
         el('div', null, el('strong', null, 'To:'), textNode(` ${toName}`)),
-        el('div', null, el('strong', null, 'Success Rate:'), textNode(' '), el('span', { className: qualityClass }, `${link.success_rate.toFixed(1)}%`)),
-        el('div', null, el('strong', null, 'Attempts:'), textNode(` ${link.total_hops_seen}`)),
+        hasQuality
+            ? el('div', null, el('strong', null, 'Quality:'), textNode(' '), el('span', { className: qualityClass }, `${link.quality.charAt(0).toUpperCase() + link.quality.slice(1)}${link.spreading_factor ? ` (SF${link.spreading_factor}${link.channel_id ? ` · ${link.channel_id}` : ''})` : ''}`))
+            : null,
+        hasValue(link.estimated_reliability)
+            ? el('div', null, el('strong', null, 'Estimated reliability:'), textNode(` ${link.estimated_reliability.toFixed(1)}%`))
+            : null,
+        hasQuality && link.is_bidirectional === false
+            ? el('div', { className: 'small text-muted' }, 'One direction observed — incomplete coverage')
+            : null,
+        hasValue(link.worst_snr)
+            ? el('div', null, el('strong', null, 'Worst-direction SNR:'), textNode(` ${link.worst_snr.toFixed(1)} dB`))
+            : null,
+        el('div', null, el('strong', null, 'Observations:'), textNode(` ${link.observation_count ?? link.total_hops_seen ?? 0}`)),
         el('div', null, el('strong', null, 'Last Seen:'), textNode(` ${formattedTime}`)),
         hasValue(link.avg_snr) ? el('div', null, el('strong', null, 'Avg SNR:'), textNode(` ${link.avg_snr.toFixed(1)} dB`)) : null,
         hasValue(link.avg_rssi) ? el('div', null, el('strong', null, 'Avg RSSI:'), textNode(` ${link.avg_rssi.toFixed(0)} dBm`)) : null,
