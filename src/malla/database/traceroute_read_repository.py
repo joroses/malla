@@ -211,9 +211,15 @@ def get_traceroute_packets(
             packet["route"] = packet["route_nodes_json"]
             if group_packets:
                 packet["is_grouped"] = True
-                packet["rssi_range"] = _range(packet["min_rssi"], packet["max_rssi"], "dBm", 1)
-                packet["snr_range"] = _range(packet["min_snr"], packet["max_snr"], "dB", 2)
-                packet["hop_range"] = _range(packet["min_hops"], packet["max_hops"], "", 0)
+                packet["rssi_range"] = _range(
+                    packet["min_rssi"], packet["max_rssi"], "dBm", 1
+                )
+                packet["snr_range"] = _range(
+                    packet["min_snr"], packet["max_snr"], "dB", 2
+                )
+                packet["hop_range"] = _range(
+                    packet["min_hops"], packet["max_hops"], "", 0
+                )
                 packet["rssi"] = packet["rssi_range"]
                 packet["snr"] = packet["snr_range"]
                 packet["hop_count"] = packet["min_hops"]
@@ -256,6 +262,9 @@ def get_traceroute_link(
             node2_id,
             node1_id,
         ]
+        # Directional averages follow graph eligibility: zero-SNR hops and the
+        # -32.0 "unknown SNR" sentinel contribute no SNR. Raw observation counts
+        # and the combined average keep their historical definitions.
         stats = cursor.execute(
             f"""
             SELECT
@@ -266,13 +275,25 @@ def get_traceroute_link(
                          THEN 1 ELSE 0 END) AS reverse_count,
                 AVG(CASE WHEN h.snr = {TRACEROUTE_UNKNOWN_SNR}
                               OR h.snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX}
-                         THEN h.snr END) AS avg_snr
+                         THEN h.snr END) AS avg_snr,
+                AVG(CASE WHEN h.from_node_id = ? AND h.to_node_id = ?
+                         AND h.snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX}
+                         AND h.snr != 0
+                         THEN h.snr END) AS forward_avg_snr,
+                AVG(CASE WHEN h.from_node_id = ? AND h.to_node_id = ?
+                         AND h.snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX}
+                         AND h.snr != 0
+                         THEN h.snr END) AS reverse_avg_snr
             FROM traceroute_hops h
             JOIN traceroute_routes r ON r.packet_id = h.packet_id
             WHERE r.parser_version = ? AND r.parse_status = 'parsed'
               AND {match_sql}
             """,
             [
+                node1_id,
+                node2_id,
+                node2_id,
+                node1_id,
                 node1_id,
                 node2_id,
                 node2_id,
@@ -326,6 +347,8 @@ def get_traceroute_link(
             "forward_count": int(stats["forward_count"] or 0),
             "reverse_count": int(stats["reverse_count"] or 0),
             "avg_snr": stats["avg_snr"],
+            "forward_avg_snr": stats["forward_avg_snr"],
+            "reverse_avg_snr": stats["reverse_avg_snr"],
         }
     finally:
         conn.close()
@@ -392,7 +415,9 @@ def get_traceroute_hops_for_graph(
             conditions.append("p.channel_id = ?")
             params.append(filters["primary_channel"])
 
-        join_clause = "JOIN packet_history p ON p.id = h.packet_id" if join_packet else ""
+        join_clause = (
+            "JOIN packet_history p ON p.id = h.packet_id" if join_packet else ""
+        )
         where_clause = " AND ".join(conditions)
 
         query = f"""
@@ -480,7 +505,9 @@ def get_route_patterns_data(
         """
         rows = cursor.execute(query, (PARSER_VERSION, start_time, end_time)).fetchall()
 
-        route_patterns: dict[tuple[tuple[int, int], tuple[int, ...]], dict[str, Any]] = {}
+        route_patterns: dict[
+            tuple[tuple[int, int], tuple[int, ...]], dict[str, Any]
+        ] = {}
 
         for row in rows:
             try:
@@ -593,19 +620,25 @@ def get_node_traceroute_statistics(
             *time_params,
             node_id,
         ]
-        participation_count = cursor.execute(intermediate_query, intermediate_params).fetchone()[0]
+        participation_count = cursor.execute(
+            intermediate_query, intermediate_params
+        ).fetchone()[0]
 
         return {
             "node_id": node_id,
             "as_source": {
                 "total": source_total,
                 "successful": source_successful,
-                "success_rate": (source_successful / source_total * 100) if source_total > 0 else 0,
+                "success_rate": (source_successful / source_total * 100)
+                if source_total > 0
+                else 0,
             },
             "as_destination": {
                 "total": dest_total,
                 "successful": dest_successful,
-                "success_rate": (dest_successful / dest_total * 100) if dest_total > 0 else 0,
+                "success_rate": (dest_successful / dest_total * 100)
+                if dest_total > 0
+                else 0,
             },
             "as_intermediate_hop": {"participation_count": participation_count},
             "total_involvement": source_total + dest_total + participation_count,

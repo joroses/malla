@@ -1129,12 +1129,18 @@ def api_traceroute_hops_nodes():
                     WHERE timestamp >= ? AND timestamp <= ? AND parse_status != 'pending'
                     """,
                     (
-                        window_start.timestamp(), window_end.timestamp(),
-                        window_start.timestamp(), window_end.timestamp(),
-                        window_start.timestamp(), window_end.timestamp(),
-                        window_start.timestamp(), window_end.timestamp(),
-                        window_start.timestamp(), window_end.timestamp(),
-                        window_start.timestamp(), window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
+                        window_start.timestamp(),
+                        window_end.timestamp(),
                     ),
                 )
                 if row[0] is not None and row[0] != BROADCAST_NODE_ID
@@ -1324,7 +1330,9 @@ def api_traceroute_link(node1_id, node2_id):
                 ):
                     if path is None:
                         continue
-                    path.node_names = [display_name(node_id) for node_id in path.node_ids]
+                    path.node_names = [
+                        display_name(node_id) for node_id in path.node_ids
+                    ]
                     for hop in path.hops:
                         hop.from_node_name = display_name(hop.from_node_id)
                         hop.to_node_name = display_name(hop.to_node_id)
@@ -1368,7 +1376,9 @@ def api_traceroute_link(node1_id, node2_id):
                         if is_plausible_traceroute_snr(target_snr)
                         else None,
                         "route_hops": route_hops,
-                        "complete_path_display": tr_packet.format_path_display("display"),
+                        "complete_path_display": tr_packet.format_path_display(
+                            "display"
+                        ),
                     }
                 )
             except Exception as e:
@@ -1396,6 +1406,12 @@ def api_traceroute_link(node1_id, node2_id):
             "to_node_name": display_name(node2_id_int),
             "total_attempts": link_result["total_attempts"],
             "avg_snr": link_result["avg_snr"],
+            # Directional measurements relative to URL node order:
+            # forward = node1 → node2, return = node2 → node1.
+            "forward_avg_snr": link_result.get("forward_avg_snr"),
+            "return_avg_snr": link_result.get("reverse_avg_snr"),
+            "forward_count": link_result.get("forward_count", 0),
+            "return_count": link_result.get("reverse_count", 0),
             "direction_counts": direction_counts,
             "traceroutes": processed_traceroutes,
             "page": page,
@@ -2003,7 +2019,9 @@ def api_traceroute_data():
                 if route_data and route_data.get("route_nodes"):
                     route_nodes = route_data["route_nodes"]
                     for node_id in route_nodes:
-                        node_name = node_short_names.get(node_id, f"!{node_id:08x}"[-4:])
+                        node_name = node_short_names.get(
+                            node_id, f"!{node_id:08x}"[-4:]
+                        )
                         route_names.append(node_name)
 
             # Final fallback: use from -> to

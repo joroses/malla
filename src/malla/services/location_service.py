@@ -211,9 +211,15 @@ class LocationService:
                 packet_count = link.get("total_hops_seen", 0)
                 link_ts = link.get("last_seen")
                 if link_ts:
-                    if from_node_id not in packet_last_seen or link_ts > packet_last_seen[from_node_id]:
+                    if (
+                        from_node_id not in packet_last_seen
+                        or link_ts > packet_last_seen[from_node_id]
+                    ):
                         packet_last_seen[from_node_id] = link_ts
-                    if to_node_id not in packet_last_seen or link_ts > packet_last_seen[to_node_id]:
+                    if (
+                        to_node_id not in packet_last_seen
+                        or link_ts > packet_last_seen[to_node_id]
+                    ):
                         packet_last_seen[to_node_id] = link_ts
 
                 # Initialize neighbor tracking if not already present
@@ -430,17 +436,29 @@ class LocationService:
                 # Higher packet count suggests more reliable link
                 success_rate = min(100, max(10, link["packet_count"] * 10))
 
+                forward_count = link.get("forward_count")
+                return_count = link.get("return_count")
+                if forward_count is None or return_count is None:
+                    # Legacy payload without directional observations
+                    is_bidirectional = True
+                else:
+                    is_bidirectional = forward_count > 0 and return_count > 0
+
                 traceroute_link = {
                     "from_node_id": link["source"],
                     "to_node_id": link["target"],
                     "success_rate": success_rate,
                     "avg_snr": link.get("avg_snr"),
+                    "forward_avg_snr": link.get("forward_avg_snr"),
+                    "return_avg_snr": link.get("return_avg_snr"),
+                    "forward_count": forward_count,
+                    "return_count": return_count,
                     "age_hours": round(age_hours, 2),
                     "last_seen": link[
                         "last_seen"
                     ],  # Raw Unix timestamp for client-side formatting
                     "last_seen_str": last_seen_str,
-                    "is_bidirectional": True,  # Network graph links are bidirectional by design
+                    "is_bidirectional": is_bidirectional,
                     "total_hops_seen": link["packet_count"],
                     "last_packet_id": link.get("last_packet_id"),
                 }
@@ -908,8 +926,9 @@ class LocationService:
 
         Returns:
             A list of dictionaries describing each RF link.  Where the same two
-            nodes are seen in both directions we merge the statistics and mark
-            the link as bidirectional.
+            nodes are seen in both directions we merge the statistics, keep
+            per-direction SNR/RSSI averages and counts, and mark the link as
+            bidirectional.
         """
         if filters is None:
             filters = {}
@@ -974,8 +993,10 @@ class LocationService:
                     from_node_id,
                     gateway_id,
                     COUNT(*)               AS packet_count,
-                    AVG(CASE WHEN {rssi_valid_sql()} THEN rssi END) AS avg_rssi,
-                    AVG(CASE WHEN {snr_valid_sql()} THEN snr END) AS avg_snr,
+                    SUM(CASE WHEN {rssi_valid_sql()} THEN rssi END) AS rssi_sum,
+                    COUNT(CASE WHEN {rssi_valid_sql()} THEN 1 END) AS rssi_count,
+                    SUM(CASE WHEN {snr_valid_sql()} THEN snr END) AS snr_sum,
+                    COUNT(CASE WHEN {snr_valid_sql()} THEN 1 END) AS snr_count,
                     MAX(timestamp)         AS last_seen
                 FROM packet_history
                 {where_sql}
@@ -1016,6 +1037,10 @@ class LocationService:
                 else:
                     key = (to_node_id, from_node_id)
 
+                # Rows are directional (transmitter → receiving gateway): place
+                # each grouped row in its canonical direction before merging.
+                direction = "forward" if from_node_id == key[0] else "return"
+
                 # Calculate derived metrics.
                 age_hours = (
                     (now_ts - row["last_seen"]) / 3600.0 if row["last_seen"] else None
@@ -1031,51 +1056,86 @@ class LocationService:
                 # Crude success-rate proxy: scale packet count to 10-100 like traceroute_links
                 success_rate = max(10, min(100, row["packet_count"] * 10))
 
-                link_payload = {
-                    "from_node_id": key[0],
-                    "to_node_id": key[1],
-                    "success_rate": success_rate,
-                    "avg_snr": row["avg_snr"],
-                    "avg_rssi": row["avg_rssi"],
-                    "age_hours": round(age_hours, 2) if age_hours is not None else None,
-                    "last_seen_str": last_seen_str,
-                    "is_bidirectional": False,  # will be updated below if we see both directions
-                    "total_hops_seen": row["packet_count"],
-                    "last_packet_id": None,
-                }
+                if key not in link_map:
+                    link_map[key] = {
+                        "from_node_id": key[0],
+                        "to_node_id": key[1],
+                        "success_rate": success_rate,
+                        "forward_count": 0,
+                        "return_count": 0,
+                        "forward_snr_sum": 0.0,
+                        "forward_snr_count": 0,
+                        "return_snr_sum": 0.0,
+                        "return_snr_count": 0,
+                        "forward_rssi_sum": 0.0,
+                        "forward_rssi_count": 0,
+                        "return_rssi_sum": 0.0,
+                        "return_rssi_count": 0,
+                        "age_hours": round(age_hours, 2)
+                        if age_hours is not None
+                        else None,
+                        "last_seen_str": last_seen_str,
+                        "total_hops_seen": 0,
+                        "last_packet_id": None,
+                    }
 
-                if key in link_map:
-                    # We have already seen the opposite direction – merge stats.
-                    existing = link_map[key]
-                    existing["total_hops_seen"] += row["packet_count"]
-                    existing["success_rate"] = min(
-                        100, max(existing["success_rate"], success_rate)
-                    )
-                    existing["is_bidirectional"] = True
-                    # Update recency if this direction newer
-                    if age_hours is not None and (
-                        existing.get("age_hours") is None
-                        or age_hours < existing["age_hours"]
-                    ):
-                        existing["age_hours"] = round(age_hours, 2)
-                        existing["last_seen_str"] = last_seen_str
-                    # Merge SNR / RSSI averages (simple mean of means)
-                    if row["avg_snr"] is not None:
-                        if existing["avg_snr"] is None:
-                            existing["avg_snr"] = row["avg_snr"]
-                        else:
-                            existing["avg_snr"] = (
-                                existing["avg_snr"] + row["avg_snr"]
-                            ) / 2.0
-                    if row["avg_rssi"] is not None:
-                        if existing["avg_rssi"] is None:
-                            existing["avg_rssi"] = row["avg_rssi"]
-                        else:
-                            existing["avg_rssi"] = (
-                                existing["avg_rssi"] + row["avg_rssi"]
-                            ) / 2.0
-                else:
-                    link_map[key] = link_payload
+                link = link_map[key]
+                link["total_hops_seen"] += row["packet_count"]
+                link["success_rate"] = max(link["success_rate"], success_rate)
+                # Raw gateway aliases can produce several rows for the same
+                # direction. Merge observations and each metric's valid samples.
+                link[f"{direction}_count"] += row["packet_count"]
+                for metric in ("snr", "rssi"):
+                    link[f"{direction}_{metric}_sum"] += row[f"{metric}_sum"] or 0.0
+                    link[f"{direction}_{metric}_count"] += row[f"{metric}_count"]
+                if age_hours is not None and (
+                    link["age_hours"] is None or age_hours < link["age_hours"]
+                ):
+                    link["age_hours"] = round(age_hours, 2)
+                    link["last_seen_str"] = last_seen_str
+
+            # Finalize combined averages as a mean of the directional means and
+            # round everything only once, after the merge, so a 0.0 dB reading
+            # survives as a real measurement.
+            for link in link_map.values():
+                for direction in ("forward", "return"):
+                    for metric in ("snr", "rssi"):
+                        sample_sum = link.pop(f"{direction}_{metric}_sum")
+                        sample_count = link.pop(f"{direction}_{metric}_count")
+                        link[f"{direction}_avg_{metric}"] = (
+                            sample_sum / sample_count if sample_count else None
+                        )
+                link["is_bidirectional"] = (
+                    link["forward_count"] > 0 and link["return_count"] > 0
+                )
+                snr_components = [
+                    value
+                    for value in (link["forward_avg_snr"], link["return_avg_snr"])
+                    if value is not None
+                ]
+                rssi_components = [
+                    value
+                    for value in (link["forward_avg_rssi"], link["return_avg_rssi"])
+                    if value is not None
+                ]
+                link["avg_snr"] = (
+                    round(sum(snr_components) / len(snr_components), 1)
+                    if snr_components
+                    else None
+                )
+                link["avg_rssi"] = (
+                    round(sum(rssi_components) / len(rssi_components), 1)
+                    if rssi_components
+                    else None
+                )
+                for field in (
+                    "forward_avg_snr",
+                    "return_avg_snr",
+                    "forward_avg_rssi",
+                    "return_avg_rssi",
+                ):
+                    if link[field] is not None:
+                        link[field] = round(link[field], 1)
 
             logger.info("Generated %d packet-based RF links", len(link_map))
             result = list(link_map.values())
