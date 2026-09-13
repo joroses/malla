@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "components/sidebar_macros.html" import sidebar_container, selected_details_section, search_section, controls_section, stats_section, legend_section, sidebar_styles %}
+{% from "components/sidebar_macros.html" import rf_link_quality_legend_items with context %}
 
 {% block content %}
 <!-- Override the base template's container to make this page full-width/full-height -->
@@ -127,16 +128,25 @@
             </div>
         </div>
 
+        {# Same quality legend language as the map: palette comes from the
+           backend-injected QUALITY_COLORS, never hardcoded hex values. #}
         {% set legend_items = [
-            {"type": "icon", "class": "bi bi-circle-fill text-primary", "text": "Active nodes"},
-            {"type": "line", "class": "direct", "text": "Direct RF links"},
-            {"type": "line", "class": "indirect", "text": "Multi-hop paths"}
+            {"type": "icon", "class": "bi bi-circle-fill text-primary", "text": "Active nodes"}
         ] %}
         {% call legend_section(legend_items) %}
+            {{ rf_link_quality_legend_items() }}
+            <div class="legend-item">
+                <span class="legend-line" style="border-top: 4px solid {{ QUALITY_COLORS.unknown }};"></span>
+                <small>Direct RF link (solid)</small>
+            </div>
+            <div class="legend-item">
+                <span class="legend-line" style="border-top: 4px dashed {{ QUALITY_COLORS.unknown }};"></span>
+                <small>Multi-hop path (inferred, dashed)</small>
+            </div>
             <div class="legend-item mt-2">
                 <small class="text-muted">Node size = traffic volume<br>
-                Link thickness = observation volume<br>
-                Link color = link quality (preset-aware)</small>
+                Each RF link half is colored by the quality the node at that end receives<br>
+                Line width shows observation volume; missing directions are dashed and faded</small>
             </div>
         {% endcall %}
     {% endcall %}
@@ -215,9 +225,23 @@
     stroke-width: 4;
 }
 
-.link.selected {
-    stroke: #007bff !important;
-    stroke-width: 4 !important;
+/* Interaction highlights never touch the link halves themselves: a wider
+   outline line sits beneath the halves so selection and path highlighting
+   preserve the underlying quality colors and observation widths. */
+.link-outline {
+    stroke: transparent;
+    fill: none;
+    pointer-events: none;
+}
+
+.link.path-highlight .link-outline {
+    stroke: #ffc107;
+    stroke-opacity: 0.9;
+}
+
+.link.selected .link-outline {
+    stroke: #007bff;
+    stroke-opacity: 0.95;
 }
 
 /* Additional mobile adjustments specific to graph */
@@ -237,12 +261,20 @@
 {{ sidebar_styles() }}
 
 <script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="{{ url_for('static', filename='js/rf-link-ui.js') }}?v={{ ASSET_VERSION }}"></script>
 <script>
 // Quality palette from the backend single source (signal_quality.py),
 // injected by base.html as window.MALLA_QUALITY_COLORS. Never hardcode
 // quality hex values here.
 const qualityPalette = window.MALLA_QUALITY_COLORS || {};
 const UNKNOWN_QUALITY_COLOR = qualityPalette.unknown;
+
+// Baseline stroke opacity of measured graph link halves, plus the styling
+// for a direction without usable SNR samples (backend "unknown" tier) —
+// the same visual language as the map's split-half links.
+const LINK_HALF_OPACITY = 0.8;
+const UNKNOWN_HALF_OPACITY = LINK_HALF_OPACITY * 0.55;
+const UNKNOWN_HALF_DASH = '8, 6';
 
 let currentGraph = null;
 let simulation = null;
@@ -522,10 +554,6 @@ function renderGraph(data) {
         // Initialize with identity transform to avoid NaN values
         svg.call(zoom.transform, d3.zoomIdentity);
 
-        // Color scales
-        const snrColorScale = d3.scaleSequential(d3.interpolateRdYlGn)
-            .domain([-30, 10]); // SNR range
-
                 // Set up geographical positioning if location data is available
         const nodesWithLocation = data.nodes.filter(n => n.location);
         const nodesWithoutLocation = data.nodes.filter(n => !n.location);
@@ -610,9 +638,14 @@ function renderGraph(data) {
             console.log('Set geographical positions for nodes with location data');
         }
 
-        // Create force simulation
+        // Create force simulation. Link distance is deliberately decoupled
+        // from the (renamed) link strength: strength now encodes pure
+        // observation volume for the display width, and layout spacing must
+        // not change when observation counts change. Direct links are all
+        // one-hop RF neighbours, so they share a constant distance.
+        const DIRECT_LINK_DISTANCE = 160;
         simulation = d3.forceSimulation(data.nodes)
-            .force('link', d3.forceLink(data.links).id(d => d.id).distance(d => Math.max(140, 360 - d.strength * 20)))
+            .force('link', d3.forceLink(data.links).id(d => d.id).distance(DIRECT_LINK_DISTANCE))
             .force('charge', d3.forceManyBody().strength(-650))
             .force('center', d3.forceCenter(width / 2, height / 2))
             .force('collision', d3.forceCollide().radius(d => d.size + 50));
@@ -624,7 +657,7 @@ function renderGraph(data) {
                 .force('charge', d3.forceManyBody().strength(-350)) // Stronger repulsion for more spacing
                 .force('center', null) // Remove centering force
                 .force('link', d3.forceLink(data.links).id(d => d.id)
-                    .distance(d => Math.max(180, 420 - d.strength * 40)) // Longer links for more spacing
+                    .distance(DIRECT_LINK_DISTANCE * 1.25) // Longer links for more spacing
                     .strength(0.6)) // Slightly softer links
                 // Gentle pull back towards geographic positions to preserve rough layout
                 .force('geoX', d3.forceX(d => d.location ? xScale(d.location.longitude) : width / 2).strength(d => d.location ? 0.12 : 0.05))
@@ -644,22 +677,26 @@ function renderGraph(data) {
 
         console.log('Created simulation with', data.nodes.length, 'nodes');
 
-        // Create links. Color comes from the shared quality palette
-        // (preset-aware tier); thickness is pure observation volume.
-        // Missing quality falls back to the palette's unknown color —
-        // never recomputed client-side from SNR.
-        const linkColor = d => d.quality_color || UNKNOWN_QUALITY_COLOR;
-        const link = g.append('g')
+        // Every direct RF link renders as two half-segments joined at the
+        // displayed midpoint — the same receiver rule as the map: the half
+        // nearest the target carries the forward quality (measured at the
+        // target, the receiver of source→target) and the half nearest the
+        // source carries the return quality (measured at the source), so
+        // asymmetric links visibly change color midway. Both halves use the
+        // backend observation-volume width; one <g> per logical edge keeps
+        // the D3 force simulation on a single edge per node pair. A
+        // direction without measurements renders with the unknown color,
+        // reduced opacity and a dash pattern — it is never averaged away.
+        const linkWidth = d => d.strength || 1.5;
+        const forwardKnown = d => RFLinkUI.hasValue(d.forward_avg_snr);
+        const returnKnown = d => RFLinkUI.hasValue(d.return_avg_snr);
+
+        const linkGroup = g.append('g')
             .attr('class', 'links')
-            .selectAll('line')
+            .selectAll('g.link')
             .data(data.links)
-            .join('line')
+            .join('g')
             .attr('class', 'link')
-            .attr('stroke', linkColor)
-            .attr('stroke-width', d => Math.max(1, d.strength))
-            .attr('stroke-opacity', 0.8)
-            .attr('data-original-stroke', linkColor)
-            .attr('data-original-width', d => Math.max(1, d.strength))
             .style('cursor', 'pointer')
             .on('mouseover', function(event, d) {
                 showLinkHoverDetails(d);
@@ -676,21 +713,53 @@ function renderGraph(data) {
                 }
             });
 
+        // Interaction outline: a wider stroke beneath the halves. Selection
+        // and path highlighting restyle only this outline, so interaction
+        // preserves the underlying quality colors and observation widths.
+        const linkOutline = linkGroup.append('line')
+            .attr('class', 'link-outline')
+            .attr('stroke-width', d => linkWidth(d) + 4);
+
+        // Half nearest the source = what the source receives (return
+        // direction), measured at the source.
+        const linkReturn = linkGroup.append('line')
+            .attr('class', 'link-half half-return')
+            .attr('stroke', d => (returnKnown(d) ? d.return_color : null) || UNKNOWN_QUALITY_COLOR)
+            .attr('stroke-width', linkWidth)
+            .attr('stroke-opacity', d => returnKnown(d) ? LINK_HALF_OPACITY : UNKNOWN_HALF_OPACITY)
+            .attr('stroke-dasharray', d => returnKnown(d) ? null : UNKNOWN_HALF_DASH);
+
+        // Half nearest the target = what the target receives (forward
+        // direction), measured at the target.
+        const linkForward = linkGroup.append('line')
+            .attr('class', 'link-half half-forward')
+            .attr('stroke', d => (forwardKnown(d) ? d.forward_color : null) || UNKNOWN_QUALITY_COLOR)
+            .attr('stroke-width', linkWidth)
+            .attr('stroke-opacity', d => forwardKnown(d) ? LINK_HALF_OPACITY : UNKNOWN_HALF_OPACITY)
+            .attr('stroke-dasharray', d => forwardKnown(d) ? null : UNKNOWN_HALF_DASH);
+
         console.log('Created', data.links.length, 'links');
 
         // Add indirect connections if present
+        let indirectGroup = null;
+        let indirectOutline = null;
+        let indirectHalf = null;
         if (data.indirect_connections && data.indirect_connections.length > 0) {
-            const indirectLink = g.append('g')
+            // Resolve endpoint ids to the simulation's node objects
+            // (forceLink only resolves direct links) so inferred paths
+            // follow node movement, including dragging.
+            const nodesById = new Map(data.nodes.map(n => [n.id, n]));
+            data.indirect_connections.forEach(conn => {
+                conn.source = nodesById.get(conn.source) || conn.source;
+                conn.target = nodesById.get(conn.target) || conn.target;
+            });
+
+            indirectGroup = g.append('g')
                 .attr('class', 'indirect-links')
-                .selectAll('line')
+                .selectAll('g.link')
                 .data(data.indirect_connections)
-                .join('line')
-            .attr('class', 'link indirect')
-            .attr('stroke', UNKNOWN_QUALITY_COLOR)
-                .attr('stroke-width', d => Math.max(1, d.strength))
-                .attr('stroke-opacity', 0.4)
-                .attr('stroke-dasharray', '5,5')
-                .attr('data-original-width', d => Math.max(1, d.strength))
+                .join('g')
+                .attr('class', 'link indirect')
                 .style('cursor', 'pointer')
                 .on('mouseover', function(event, d) {
                     showLinkHoverDetails(d);
@@ -706,6 +775,19 @@ function renderGraph(data) {
                         selectLink(d);
                     }
                 });
+
+            indirectOutline = indirectGroup.append('line')
+                .attr('class', 'link-outline')
+                .attr('stroke-width', d => linkWidth(d) + 4);
+
+            // Inferred multi-hop paths render as one dashed unknown-color
+            // line: an inferred path has no measured direct RF quality.
+            indirectHalf = indirectGroup.append('line')
+                .attr('class', 'link-half half-indirect')
+                .attr('stroke', UNKNOWN_QUALITY_COLOR)
+                .attr('stroke-width', linkWidth)
+                .attr('stroke-opacity', 0.4)
+                .attr('stroke-dasharray', '5,5');
 
             console.log('Created', data.indirect_connections.length, 'indirect connections');
         }
@@ -743,10 +825,11 @@ function renderGraph(data) {
 
         console.log('Created node groups');
 
-        // Add circles for nodes
+        // Add circles for nodes. Fill comes from the backend quality tier
+        // (preset-aware), never from a client-side SNR color scale.
         node.append('circle')
             .attr('r', d => d.size)
-            .attr('fill', d => d.avg_snr ? snrColorScale(d.avg_snr) : UNKNOWN_QUALITY_COLOR)
+            .attr('fill', d => d.quality_color || UNKNOWN_QUALITY_COLOR)
             .attr('stroke', '#fff')
             .attr('stroke-width', 2);
 
@@ -768,23 +851,64 @@ function renderGraph(data) {
             }
         });
 
-        // Update positions on simulation tick
-        simulation.on('tick', () => {
-            link
+        // Update positions on simulation tick. Direct link halves meet at
+        // the displayed midpoint; indirect lines span the full edge.
+        // Selections are retained from element creation to avoid thousands
+        // of descendant selector queries per tick. Direct and indirect geometry
+        // are updated separately without searching for child types that cannot
+        // exist on that edge. Outline geometry is updated only for highlighted
+        // edges during tick because unhighlighted outlines have transparent stroke.
+        const positionDirectLinks = () => {
+            linkReturn
                 .attr('x1', d => d.source.x)
                 .attr('y1', d => d.source.y)
+                .attr('x2', d => (d.source.x + d.target.x) / 2)
+                .attr('y2', d => (d.source.y + d.target.y) / 2);
+
+            linkForward
+                .attr('x1', d => (d.source.x + d.target.x) / 2)
+                .attr('y1', d => (d.source.y + d.target.y) / 2)
                 .attr('x2', d => d.target.x)
                 .attr('y2', d => d.target.y);
+        };
 
-            if (data.indirect_connections && data.indirect_connections.length > 0) {
-                d3.selectAll('.indirect-links line')
+        const positionIndirectLinks = () => {
+            if (indirectHalf) {
+                indirectHalf
                     .attr('x1', d => d.source.x)
                     .attr('y1', d => d.source.y)
                     .attr('x2', d => d.target.x)
                     .attr('y2', d => d.target.y);
             }
+        };
+
+        const positionOutlines = () => {
+            linkOutline
+                .attr('x1', d => d.source.x)
+                .attr('y1', d => d.source.y)
+                .attr('x2', d => d.target.x)
+                .attr('y2', d => d.target.y);
+            if (indirectOutline) {
+                indirectOutline
+                    .attr('x1', d => d.source.x)
+                    .attr('y1', d => d.source.y)
+                    .attr('x2', d => d.target.x)
+                    .attr('y2', d => d.target.y);
+            }
+        };
+
+        simulation.on('tick', () => {
+            positionDirectLinks();
+            if (indirectGroup) {
+                positionIndirectLinks();
+            }
+            updateHighlightedOutlines();
 
             node.attr('transform', d => `translate(${d.x},${d.y})`);
+        });
+
+        simulation.on('end', () => {
+            positionOutlines();
         });
 
         console.log('Set up simulation event handlers');
@@ -796,7 +920,7 @@ function renderGraph(data) {
         window.graphWidth = width;
         window.graphHeight = height;
         window.graphNodes = node;
-        window.graphLinks = link;
+        window.graphLinks = linkGroup;
 
         console.log('renderGraph completed successfully. Stored references:', {
             graphSvg: !!window.graphSvg,
@@ -811,6 +935,22 @@ function renderGraph(data) {
         console.error('Error in renderGraph:', error);
         console.error('Error stack:', error.stack);
         showError('Failed to render graph: ' + error.message);
+    }
+}
+
+// Synchronize geometry for outlines of highlighted/selected links only.
+// Called during simulation ticks and whenever interaction highlights change.
+function updateHighlightedOutlines() {
+    if (!selectedLink && !document.querySelector('.link.path-highlight')) {
+        return;
+    }
+    const highlighted = d3.selectAll('.link.selected .link-outline, .link.path-highlight .link-outline');
+    if (!highlighted.empty()) {
+        highlighted
+            .attr('x1', d => d.source.x)
+            .attr('y1', d => d.source.y)
+            .attr('x2', d => d.target.x)
+            .attr('y2', d => d.target.y);
     }
 }
 
@@ -1056,10 +1196,10 @@ function clearComparisonNode() {
         if (hopFilterEnabled) {
             applyHopFilter();
         } else {
-            // Reset visibility
-            d3.selectAll('.node').style('opacity', 1);
-            d3.selectAll('.link').style('opacity', 0.8);
-            d3.selectAll('.indirect-links line').style('opacity', 0.4);
+            // Reset visibility; removing the inline opacity restores the
+            // halves' own stroke opacities and dash patterns.
+            d3.selectAll('.node').style('opacity', null);
+            d3.selectAll('.link').style('opacity', null);
         }
     }
 }
@@ -1070,10 +1210,13 @@ function selectLink(link) {
     selectedLink = link;
     selectedNode = null;
 
-    // Highlight the link visually
+    // Selection rides on the wider outline beneath the halves; the halves
+    // keep their quality colors and observation widths untouched.
     d3.selectAll('.link')
         .filter(d => d === link)
         .classed('selected', true);
+
+    updateHighlightedOutlines();
 
     // Show detailed information
     showSelectedLinkDetails(link);
@@ -1093,7 +1236,14 @@ function clearSelection() {
         .attr('stroke', '#fff')
         .attr('stroke-width', 2);
 
-    d3.selectAll('.link').classed('selected', false);
+    // Remove highlight classes and inline opacity only. The link halves
+    // were never restyled, so their original quality colors, observation
+    // widths, opacities and dash patterns are restored automatically.
+    d3.selectAll('.link')
+        .classed('selected', false)
+        .classed('path-highlight', false)
+        .style('opacity', null);
+    d3.selectAll('.node').style('opacity', null);
     d3.selectAll('.node-label').classed('highlighted', false);
 
     // Clear search result highlights
@@ -1106,24 +1256,6 @@ function clearSelection() {
 
     // Hide hop filter controls
     document.getElementById('hopFilterSection').style.display = 'none';
-
-    // Reset visibility of all nodes and links
-    d3.selectAll('.node').style('opacity', 1);
-
-    // Reset links to original colors
-    d3.selectAll('.link').each(function(d) {
-        d3.select(this)
-            .style('opacity', 0.8)
-            .attr('stroke', d3.select(this).attr('data-original-stroke'))
-            .attr('stroke-width', d3.select(this).attr('data-original-width'));
-    });
-
-    d3.selectAll('.indirect-links line').each(function(d) {
-        d3.select(this)
-            .style('opacity', 0.4)
-            .attr('stroke', UNKNOWN_QUALITY_COLOR)
-            .attr('stroke-width', d3.select(this).attr('data-original-width'));
-    });
 
     // Clear hop filter state
     visibleNodeIds = null;
@@ -1166,7 +1298,14 @@ function showSelectedNodeDetails(node) {
             el('div', { className: 'col-6' },
                 el('strong', null, 'Avg SNR:'),
                 el('br'),
-                el('span', { className: `h6 ${node.avg_snr ? (node.avg_snr > -10 ? 'text-success' : 'text-warning') : 'text-muted'}` }, node.avg_snr ? `${node.avg_snr} dB` : 'N/A')
+                // Quality tier (badge + color) comes from the backend
+                // payload; a raw-SNR cutoff class never reclassifies it.
+                el('span', { className: 'h6' },
+                    textNode(`${node.avg_snr !== null && node.avg_snr !== undefined ? `${node.avg_snr} dB ` : 'N/A '}`)),
+                RFLinkUI.qualityBadge(node.quality, node.quality_color),
+                node.spreading_factor
+                    ? el('div', { className: 'small text-muted mt-1' }, `Quality model: SF${node.spreading_factor}${node.channel_id ? ` · ${node.channel_id}` : ''}`)
+                    : null
             ),
             el('div', { className: 'col-6' },
                 el('strong', null, 'Last Seen:'),
@@ -1344,7 +1483,6 @@ function highlightPathsBetweenNodes() {
         // No paths found - dim everything
         d3.selectAll('.node').style('opacity', 0.2);
         d3.selectAll('.link').style('opacity', 0.1);
-        d3.selectAll('.indirect-links line').style('opacity', 0.1);
 
         // Keep selected nodes visible
         d3.selectAll('.node').filter(d => d.id === selectedNode.id || d.id === comparisonNode.id)
@@ -1367,75 +1505,94 @@ function highlightPathsBetweenNodes() {
     // Dim nodes not in paths
     d3.selectAll('.node').style('opacity', d => pathNodeIds.has(d.id) ? 1 : 0.15);
 
-    // Dim links not in paths
-    d3.selectAll('.link').each(function(d) {
-        const sourceId = typeof d.source === 'object' ? d.source.id : d.source;
-        const targetId = typeof d.target === 'object' ? d.target.id : d.target;
-        const linkKey = `${sourceId}-${targetId}`;
-        const isInPath = pathLinks.has(linkKey);
+    // Dim links not in paths and highlight path links through the outline
+    // overlay; the halves keep their quality colors and widths.
+    d3.selectAll('.link')
+        .style('opacity', d => {
+            const key = `${linkEndpointId(d.source)}-${linkEndpointId(d.target)}`;
+            return pathLinks.has(key) ? null : 0.1;
+        })
+        .classed('path-highlight', d => {
+            const key = `${linkEndpointId(d.source)}-${linkEndpointId(d.target)}`;
+            return pathLinks.has(key);
+        });
 
-        d3.select(this)
-            .style('opacity', isInPath ? 0.9 : 0.1)
-            .attr('stroke', isInPath ? '#ffc107' : d3.select(this).attr('data-original-stroke'))
-            .attr('stroke-width', isInPath ? 5 : d3.select(this).attr('data-original-width'));
-    });
+    updateHighlightedOutlines();
+}
 
-    d3.selectAll('.indirect-links line').each(function(d) {
-        const sourceId = typeof d.source === 'object' ? d.source.id : d.source;
-        const targetId = typeof d.target === 'object' ? d.target.id : d.target;
-        const linkKey = `${sourceId}-${targetId}`;
-        const isInPath = pathLinks.has(linkKey);
+// Node id from either a raw endpoint id or a simulation node object.
+function linkEndpointId(endpoint) {
+    return typeof endpoint === 'object' ? endpoint.id : endpoint;
+}
 
-        d3.select(this)
-            .style('opacity', isInPath ? 0.7 : 0.1)
-            .attr('stroke', isInPath ? '#ffc107' : UNKNOWN_QUALITY_COLOR)
-            .attr('stroke-width', isInPath ? 5 : d3.select(this).attr('data-original-width'));
-    });
+// Shared link details renderer (hover + selected panels mirror the map
+// popup exactly): directional labels with receiver names, counts with
+// forward/return breakdown, reliability with quality badges, balance
+// warnings and the preset-aware quality model line. All values come from
+// the backend payload; nothing is recomputed client-side.
+function linkDetailsContent(link) {
+    const sourceName = getNodeName(link.source);
+    const targetName = getNodeName(link.target);
+    const isIndirect = link.type !== 'direct';
+
+    let measurements;
+    if (isIndirect) {
+        // Indirect connections are inferred paths, not measured direct
+        // links: no RF quality metrics exist, so they stay identifiable
+        // as inferred instead of presenting path averages as quality.
+        measurements = fragment(
+            el('div', { className: 'small text-muted' },
+                icon('bi bi-signpost-split'),
+                textNode(' Inferred multi-hop path — RF quality not measured')),
+            link.hop_count ? el('div', null, el('strong', null, 'Hops:'), textNode(` ${link.hop_count}`)) : null,
+            el('div', null, el('strong', null, 'Paths seen:'), textNode(` ${link.path_count ?? 0}`)),
+            el('div', null, el('strong', null, 'Path SNR:'), textNode(` ${RFLinkUI.hasValue(link.avg_snr) ? `${link.avg_snr.toFixed(1)} dB (path average)` : 'N/A'}`))
+        );
+    } else {
+        measurements = fragment(
+            el('div', { className: 'mt-1' },
+                RFLinkUI.directionSection({
+                    senderName: sourceName, receiverName: targetName, prefix: 'forward', link
+                }),
+                RFLinkUI.directionSection({
+                    senderName: targetName, receiverName: sourceName, prefix: 'return', link
+                })),
+            RFLinkUI.reliabilityRow(link.estimated_reliability),
+            RFLinkUI.balanceMessage(link),
+            link.spreading_factor
+                ? el('div', { className: 'small text-muted' }, `Quality model: SF${link.spreading_factor}${link.channel_id ? ` · ${link.channel_id}` : ''}`)
+                : null,
+            RFLinkUI.hasValue(link.worst_snr)
+                ? el('div', { className: 'small' },
+                    el('strong', null, 'Worst-direction SNR:'),
+                    textNode(` ${link.worst_snr.toFixed(1)} dB`))
+                : null
+        );
+    }
+
+    return fragment(
+        el('div', null, el('strong', null, `${sourceName} ↔ ${targetName}`)),
+        el('div', { className: 'text-muted mb-1' }, isIndirect ? 'Multi-hop Connection (inferred)' : 'Direct RF Link'),
+        el('hr', { className: 'my-2' }),
+        measurements,
+        el('div', { className: 'mt-1' },
+            el('strong', null, 'Observations:'),
+            textNode(` ${link.observation_count ?? link.packet_count ?? link.path_count ?? 0}`)),
+        el('div', null, el('strong', null, 'Last Seen:'), el('br'),
+            el('small', { className: 'text-muted' }, new Date(link.last_seen * 1000).toLocaleString()))
+    );
 }
 
 function showSelectedLinkDetails(link) {
-    const sourceNode = currentGraph.nodes.find(n => n.id === link.source.id || n.id === link.source);
-    const targetNode = currentGraph.nodes.find(n => n.id === link.target.id || n.id === link.target);
-
     setSelectedDetails('Selected Link',
-        el('div', { className: 'row' },
-            el('div', { className: 'col-12' },
-                el('h6', null, `${sourceNode ? sourceNode.name : link.source} ↔ ${targetNode ? targetNode.name : link.target}`),
-                el('p', { className: 'text-muted' }, link.type === 'direct' ? 'Direct RF Link' : 'Multi-hop Connection')
-            )
-        ),
-        el('div', { className: 'row' },
-            el('div', { className: 'col-6' },
-                el('strong', null, 'Quality:'),
-                el('br'),
-                link.quality
-                    ? el('span', { className: 'h5', style: `color:${link.quality_color || UNKNOWN_QUALITY_COLOR}` },
-                        `${link.quality.charAt(0).toUpperCase() + link.quality.slice(1)}`)
-                    : el('span', { className: `h5 ${link.avg_snr > -10 ? 'text-success' : 'text-warning'}` }, `${link.avg_snr} dB`)
-            ),
-            el('div', { className: 'col-6' },
-                el('strong', null, link.estimated_reliability !== null && link.estimated_reliability !== undefined ? 'Est. Reliability:' : 'Packets:'),
-                el('br'),
-                link.estimated_reliability !== null && link.estimated_reliability !== undefined
-                    ? el('span', { className: 'h5 text-info' }, `${link.estimated_reliability.toFixed(1)}%`)
-                    : el('span', { className: 'h5 text-info' }, String(link.observation_count || link.packet_count || link.path_count || 0))
-            )
-        ),
-        link.worst_snr !== null && link.worst_snr !== undefined ? el('div', { className: 'small text-muted' },
-            textNode(`Worst-direction SNR ${link.worst_snr.toFixed(1)} dB${link.spreading_factor ? ` · SF${link.spreading_factor}${link.channel_id ? ` (${link.channel_id})` : ''}` : ''}${link.is_bidirectional === false ? ' · one direction observed' : ''}`)
-        ) : null,
-        link.hop_count ? el('div', { className: 'row mt-2' },
-            el('div', { className: 'col-6' }, el('strong', null, 'Hop Count:'), el('br'), el('span', { className: 'h6 text-primary' }, String(link.hop_count)))
-        ) : null,
+        linkDetailsContent(link),
         el('div', { className: 'row mt-2' },
-            el('div', { className: 'col-6' },
-                el('strong', null, 'Last Seen:'),
-                el('br'),
-                el('small', { className: 'text-muted' }, new Date(link.last_seen * 1000).toLocaleString())
-            ),
-            el('div', { className: 'col-6' },
+            el('div', { className: 'col-12' },
                 buttonLink({
-                    href: safePath('/traceroute-hops', { from_node: link.source.id, to_node: link.target.id }),
+                    href: safePath('/traceroute-hops', {
+                        from_node: linkEndpointId(link.source),
+                        to_node: linkEndpointId(link.target)
+                    }),
                     className: 'btn btn-outline-primary btn-sm',
                     iconClass: 'bi bi-diagram-3',
                     text: 'View Link'
@@ -1485,24 +1642,25 @@ function showNodeHoverDetails(node) {
         pathInfoNode ? el('hr', { className: 'my-2' }) : null,
         el('div', null, el('strong', null, 'Connections:'), textNode(` ${node.connections}`)),
         el('div', null, el('strong', null, 'Packets:'), textNode(` ${node.packet_count}`)),
-        el('div', null, el('strong', null, 'Avg SNR:'), textNode(` ${node.avg_snr ? `${node.avg_snr} dB` : 'N/A'}`)),
+        el('div', { className: 'mb-1' },
+            el('strong', null, 'Avg SNR:'),
+            textNode(` ${node.avg_snr !== null && node.avg_snr !== undefined ? `${node.avg_snr} dB` : 'N/A'} `),
+            RFLinkUI.qualityBadge(node.quality, node.quality_color),
+            node.spreading_factor
+                ? el('div', { className: 'small text-muted' }, `Quality model: SF${node.spreading_factor}${node.channel_id ? ` · ${node.channel_id}` : ''}`)
+                : null),
         el('div', null, el('strong', null, 'Last Seen:'), el('br'), el('small', null, new Date(node.last_seen * 1000).toLocaleString()))
     );
 }
 
+// Hover mirrors the selected-link panel: both render through
+// linkDetailsContent so directional labels, counts, reliability, badges
+// and warnings are identical between the two panels and the map popup.
 function showLinkHoverDetails(link) {
-    const sourceNode = currentGraph.nodes.find(n => n.id === link.source.id || n.id === link.source);
-    const targetNode = currentGraph.nodes.find(n => n.id === link.target.id || n.id === link.target);
-
     setHoverDetails(
-        el('div', null, el('strong', null, 'Link')),
-        el('div', { className: 'text-muted' }, `${sourceNode ? sourceNode.name : link.source} ↔ ${targetNode ? targetNode.name : link.target}`),
+        linkDetailsContent(link),
         el('hr', { className: 'my-2' }),
-        el('div', null, el('strong', null, 'Type:'), textNode(` ${link.type === 'direct' ? 'Direct RF' : 'Multi-hop'}`)),
-        el('div', null, el('strong', null, 'Avg SNR:'), textNode(` ${link.avg_snr} dB`)),
-        el('div', null, el('strong', null, 'Packets:'), textNode(` ${link.packet_count || link.path_count || 0}`)),
-        link.hop_count ? el('div', null, el('strong', null, 'Hops:'), textNode(` ${link.hop_count}`)) : null,
-        el('div', null, el('strong', null, 'Last Seen:'), el('br'), el('small', null, new Date(link.last_seen * 1000).toLocaleString()))
+        el('small', { className: 'text-muted' }, 'Click the link to keep these details')
     );
 }
 
@@ -1800,28 +1958,12 @@ function highlightPathToNode(hoveredNode) {
             .attr('stroke-width', isInPath ? 4 : 2);
     });
 
-    // Highlight links in any path
-    d3.selectAll('.link').each(function(d) {
-        const sourceId = typeof d.source === 'object' ? d.source.id : d.source;
-        const targetId = typeof d.target === 'object' ? d.target.id : d.target;
-        const linkKey = `${sourceId}-${targetId}`;
-        const isInPath = pathLinks.has(linkKey);
+    // Highlight links in any path through the outline overlay; the halves
+    // keep their quality colors and observation widths.
+    d3.selectAll('.link')
+        .classed('path-highlight', d => pathLinks.has(`${linkEndpointId(d.source)}-${linkEndpointId(d.target)}`));
 
-        d3.select(this)
-            .attr('stroke', isInPath ? '#ffc107' : d3.select(this).attr('data-original-stroke'))
-            .attr('stroke-width', isInPath ? 5 : d3.select(this).attr('data-original-width'));
-    });
-
-    d3.selectAll('.indirect-links line').each(function(d) {
-        const sourceId = typeof d.source === 'object' ? d.source.id : d.source;
-        const targetId = typeof d.target === 'object' ? d.target.id : d.target;
-        const linkKey = `${sourceId}-${targetId}`;
-        const isInPath = pathLinks.has(linkKey);
-
-        d3.select(this)
-            .attr('stroke', isInPath ? '#ffc107' : UNKNOWN_QUALITY_COLOR)
-            .attr('stroke-width', isInPath ? 5 : d3.select(this).attr('data-original-width'));
-    });
+    updateHighlightedOutlines();
 }
 
 // Function to clear path highlighting
@@ -1835,18 +1977,10 @@ function clearPathHighlight() {
         }
     });
 
-    // Reset link colors to their original values
-    d3.selectAll('.link').each(function(d) {
-        d3.select(this)
-            .attr('stroke', d3.select(this).attr('data-original-stroke'))
-            .attr('stroke-width', d3.select(this).attr('data-original-width'));
-    });
-
-    d3.selectAll('.indirect-links line').each(function(d) {
-        d3.select(this)
-            .attr('stroke', UNKNOWN_QUALITY_COLOR)
-            .attr('stroke-width', d3.select(this).attr('data-original-width'));
-    });
+    // Removing the class restores the transparent outline; the halves were
+    // never restyled, so quality colors, widths, opacities and dash
+    // patterns are preserved throughout.
+    d3.selectAll('.link').classed('path-highlight', false);
 }
 
 // Function to apply hop filter to the graph
@@ -1856,10 +1990,10 @@ function applyHopFilter() {
     }
 
     if (!hopFilterEnabled) {
-        // Reset all visibility
-        d3.selectAll('.node').style('opacity', 1);
-        d3.selectAll('.link').style('opacity', 0.8);
-        d3.selectAll('.indirect-links line').style('opacity', 0.4);
+        // Reset all visibility. Removing the inline opacity restores the
+        // halves' own stroke opacities (0.8 measured / 0.4 inferred).
+        d3.selectAll('.node').style('opacity', null);
+        d3.selectAll('.link').style('opacity', null);
         document.getElementById('hopFilterStats').style.display = 'none';
         visibleNodeIds = null;
         nodeDistances = null;
@@ -1884,17 +2018,12 @@ function applyHopFilter() {
         return visibleNodeIds.has(d.id) ? 1 : 0.1;
     });
 
-    // Update link visibility - show only links where both endpoints are visible
+    // Update link visibility - show only links (direct and indirect) where
+    // both endpoints are visible
     d3.selectAll('.link').style('opacity', d => {
-        const sourceId = typeof d.source === 'object' ? d.source.id : d.source;
-        const targetId = typeof d.target === 'object' ? d.target.id : d.target;
-        return (visibleNodeIds.has(sourceId) && visibleNodeIds.has(targetId)) ? 0.8 : 0.05;
-    });
-
-    d3.selectAll('.indirect-links line').style('opacity', d => {
-        const sourceId = typeof d.source === 'object' ? d.source.id : d.source;
-        const targetId = typeof d.target === 'object' ? d.target.id : d.target;
-        return (visibleNodeIds.has(sourceId) && visibleNodeIds.has(targetId)) ? 0.4 : 0.05;
+        const sourceId = linkEndpointId(d.source);
+        const targetId = linkEndpointId(d.target);
+        return (visibleNodeIds.has(sourceId) && visibleNodeIds.has(targetId)) ? null : 0.05;
     });
 }
 

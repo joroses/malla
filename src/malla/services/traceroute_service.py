@@ -36,8 +36,10 @@ from ..utils.signal_quality import (
     BALANCE_UNKNOWN,
     QUALITY_UNKNOWN,
     TRACEROUTE_UNKNOWN_SNR,
+    classify_signal_quality,
     get_quality_color,
     is_plausible_traceroute_snr,
+    resolve_spreading_factor,
 )
 
 logger = logging.getLogger(__name__)
@@ -888,6 +890,7 @@ class TracerouteService:
                         continue
 
                     # Add nodes to the graph
+                    hop_channel = hop.get("channel_id")
                     for node_id in (from_id, to_id):
                         if node_id not in nodes:
                             nodes[node_id] = {
@@ -898,10 +901,17 @@ class TracerouteService:
                                 "snr_count": 0,
                                 "connections": set(),
                                 "last_seen": ts,
+                                "last_packet_id": packet_id,
+                                "last_channel": hop_channel,
                             }
                         nodes[node_id]["packet_count"] += 1
-                        if ts > nodes[node_id]["last_seen"]:
+                        if (ts, packet_id) > (
+                            nodes[node_id]["last_seen"],
+                            nodes[node_id].get("last_packet_id", 0),
+                        ):
                             nodes[node_id]["last_seen"] = ts
+                            nodes[node_id]["last_packet_id"] = packet_id
+                            nodes[node_id]["last_channel"] = hop_channel
 
                     link_key = tuple(sorted([from_id, to_id]))
                     # Direction is derived from the hop's own endpoints, not
@@ -1030,7 +1040,9 @@ class TracerouteService:
                 forward_count = link_data["forward_observations"]
                 return_count = link_data["return_observations"]
                 snr_sum = link_data["forward_snr_sum"] + link_data["return_snr_sum"]
-                snr_count = link_data["forward_snr_count"] + link_data["return_snr_count"]
+                snr_count = (
+                    link_data["forward_snr_count"] + link_data["return_snr_count"]
+                )
                 avg_snr = snr_sum / snr_count if snr_count else None
                 forward_avg_snr = (
                     link_data["forward_snr_sum"] / link_data["forward_snr_count"]
@@ -1043,9 +1055,7 @@ class TracerouteService:
                     else None
                 )
                 forward_avg_snr_rounded = (
-                    round(forward_avg_snr, 1)
-                    if forward_avg_snr is not None
-                    else None
+                    round(forward_avg_snr, 1) if forward_avg_snr is not None else None
                 )
                 return_avg_snr_rounded = (
                     round(return_avg_snr, 1) if return_avg_snr is not None else None
@@ -1130,6 +1140,16 @@ class TracerouteService:
                     )
 
             # Process nodes - calculate average SNR and connectivity, add location data
+            # Node quality uses the active channel filter if present, the node's
+            # most recent channel hint, or falls back to the configured preset.
+            channel_filter = None
+            if filters:
+                raw_channel = filters.get("primary_channel") or filters.get("channel")
+                if isinstance(raw_channel, str) and raw_channel.strip():
+                    channel_filter = raw_channel.strip()
+                elif raw_channel:
+                    channel_filter = raw_channel
+
             processed_nodes = []
             for node_data in nodes.values():
                 # Convert set to count for JSON serialization
@@ -1140,6 +1160,15 @@ class TracerouteService:
                 if node_data["snr_count"] > 0:
                     avg_snr = round(node_data["total_snr"] / node_data["snr_count"], 1)
 
+                raw_node_channel = channel_filter or node_data.get("last_channel")
+                node_channel = (
+                    raw_node_channel.strip()
+                    if isinstance(raw_node_channel, str)
+                    else raw_node_channel
+                ) or None
+                node_spreading_factor = resolve_spreading_factor(preset=node_channel)
+                node_quality = classify_signal_quality(avg_snr, node_spreading_factor)
+
                 # Get location data for this node
                 location = location_map.get(node_data["id"])
 
@@ -1149,6 +1178,10 @@ class TracerouteService:
                     "packet_count": node_data["packet_count"],
                     "connections": node_data["connections"],
                     "avg_snr": avg_snr,
+                    "channel_id": node_channel,
+                    "spreading_factor": node_spreading_factor,
+                    "quality": node_quality,
+                    "quality_color": get_quality_color(node_quality),
                     "last_seen": node_data["last_seen"],
                     "size": min(
                         20, max(5, math.log10(node_data["packet_count"] + 1) * 3)

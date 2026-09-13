@@ -224,9 +224,12 @@ class TestEnrichLinkQuality:
 class TestGraphLinkMetrics:
     """TracerouteService.get_network_graph_data enriches every direct link."""
 
-    def _graph(self, hops, *, include_indirect=False):
+    def _graph(self, hops, *, include_indirect=False, extra_filters=None):
         now = time.time()
         _NETWORK_GRAPH_CACHE.clear()
+        filters = {"start_time": now - 60, "end_time": now + 60}
+        if extra_filters:
+            filters.update(extra_filters)
         try:
             with (
                 patch(
@@ -246,7 +249,7 @@ class TestGraphLinkMetrics:
                     hours=24,
                     min_snr=-200.0,
                     include_indirect=include_indirect,
-                    filters={"start_time": now - 60, "end_time": now + 60},
+                    filters=filters,
                 )
         finally:
             _NETWORK_GRAPH_CACHE.clear()
@@ -318,6 +321,60 @@ class TestGraphLinkMetrics:
         # Same timestamp: the higher packet id is the more recent hint.
         assert graph["links"][0]["channel_id"] == "SFNarrow"
         assert graph["links"][0]["spreading_factor"] == 7
+
+    def test_node_quality_respects_channel_filter(self):
+        """When graph is filtered by channel (e.g. ShortFast), node quality
+        uses that SF rather than silently defaulting to LongFast (SF11)."""
+        now = time.time()
+        # -7.5 dB at SF7 (ShortFast) has 0 dB fade margin -> Marginal.
+        # At SF11 (LongFast), it would have +10 dB margin -> Good.
+        graph = self._graph(
+            [_hop(1, 0, 100, 200, -7.5, now, channel_id="ShortFast")],
+            extra_filters={"primary_channel": "ShortFast"},
+        )
+        nodes_by_id = {node["id"]: node for node in graph["nodes"]}
+        node = nodes_by_id[100]
+        assert node["spreading_factor"] == 7
+        assert node["channel_id"] == "ShortFast"
+        assert node["quality"] == QUALITY_MARGINAL
+        assert node["quality_color"] == QUALITY_COLORS[QUALITY_MARGINAL]
+
+        # Link also matches
+        link = graph["links"][0]
+        assert link["quality"] == QUALITY_MARGINAL
+        assert link["spreading_factor"] == 7
+
+    def test_node_quality_resolves_per_node_channel_hint_when_unfiltered(self):
+        """When unfiltered, each node's spreading factor and quality resolve
+        from its own observed channel hint rather than falling back to global SF."""
+        now = time.time()
+        graph = self._graph(
+            [
+                _hop(1, 0, 100, 200, -7.5, now, channel_id="LongFast"),
+                _hop(2, 0, 300, 400, -7.5, now, channel_id="SFNarrow"),
+            ]
+        )
+        nodes_by_id = {node["id"]: node for node in graph["nodes"]}
+
+        node_longfast = nodes_by_id[100]
+        assert node_longfast["spreading_factor"] == 11
+        assert node_longfast["quality"] == QUALITY_GOOD
+        assert node_longfast["quality_color"] == QUALITY_COLORS[QUALITY_GOOD]
+
+        node_sfnarrow = nodes_by_id[300]
+        assert node_sfnarrow["spreading_factor"] == 7
+        assert node_sfnarrow["quality"] == QUALITY_MARGINAL
+        assert node_sfnarrow["quality_color"] == QUALITY_COLORS[QUALITY_MARGINAL]
+
+    def test_node_quality_falls_back_to_configured_preset(self):
+        """When no channel hints or filters exist, node quality uses configured preset."""
+        now = time.time()
+        graph = self._graph([_hop(1, 0, 100, 200, -7.5, now)])
+        node = graph["nodes"][0]
+        assert node["channel_id"] is None
+        assert node["spreading_factor"] == 11  # Default LongFast
+        assert node["quality"] == QUALITY_GOOD
+        assert node["quality_color"] == QUALITY_COLORS[QUALITY_GOOD]
 
     def test_width_is_observation_volume_not_snr(self):
         now = time.time()
@@ -439,6 +496,23 @@ class TestGraphLinkMetrics:
 
         assert reconfigured["links"][0]["quality"] == QUALITY_MARGINAL
         assert reconfigured["links"][0]["spreading_factor"] == 7
+
+    def test_sample_graph_fixture_deterministic_under_shortfast_preset(
+        self, monkeypatch
+    ):
+        """The sample graph fixture must specify SF11 explicitly and not drift with ambient preset."""
+        from tests.fixtures.traceroute_graph_data import (
+            NODE_ALPHA,
+            NODE_FOX,
+            _build_sample_graph_data,
+        )
+
+        monkeypatch.setenv("MALLA_LORA_PRESET", "ShortFast")
+        _clear_config_cache()
+        data = _build_sample_graph_data()
+        nodes_by_id = {n["id"]: n for n in data["nodes"]}
+        assert nodes_by_id[NODE_ALPHA]["quality"] == QUALITY_GOOD
+        assert nodes_by_id[NODE_FOX]["quality"] == QUALITY_FAIR
 
 
 class TestTracerouteLinksPassThrough:

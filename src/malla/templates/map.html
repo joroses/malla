@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% from "components/sidebar_macros.html" import sidebar_container, selected_details_section, search_section, controls_section, stats_section, legend_section, sidebar_styles %}
+{% from "components/sidebar_macros.html" import rf_link_quality_legend_items with context %}
 
 {% block title %}Node Map - Malla{% endblock %}
 
@@ -170,8 +171,9 @@
         </div>
 
         {# Role swatches reuse the CSS custom properties that getRoleColor()
-           reads, and quality lines come from the backend palette
-           (QUALITY_COLORS, injected from signal_quality.py), so the legend
+           reads, and quality lines come from the shared
+           rf_link_quality_legend_items macro (backend palette
+           QUALITY_COLORS, injected from signal_quality.py), so the legend
            can never drift from the rendered markers and link halves. #}
         {% set map_legend_items = [
             {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-primary);", "content": "", "text": "Client"},
@@ -181,17 +183,18 @@
             {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-secondary);", "content": "", "text": "Client Mute"},
             {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-info);", "content": "", "text": "Router Client"},
             {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-sensor);", "content": "", "text": "Sensor"},
-            {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-danger);", "content": "", "text": "Unknown Role"},
-            {"type": "legend-line", "style": "border-top: 4px solid " ~ QUALITY_COLORS.good ~ ";", "content": "", "text": "Good quality (half nearest receiver)"},
-            {"type": "legend-line", "style": "border-top: 4px solid " ~ QUALITY_COLORS.fair ~ ";", "content": "", "text": "Fair quality"},
-            {"type": "legend-line", "style": "border-top: 4px solid " ~ QUALITY_COLORS.marginal ~ ";", "content": "", "text": "Marginal quality"},
-            {"type": "legend-line", "style": "border-top: 4px dashed " ~ QUALITY_COLORS.unknown ~ "; opacity: 0.55;", "content": "", "text": "Direction not observed (dashed, faded)"},
-            {"type": "legend-line", "style": "height: 4px; border-radius: 2px; background: linear-gradient(90deg, " ~ QUALITY_COLORS.good ~ " 50%, " ~ QUALITY_COLORS.marginal ~ " 50%);", "content": "", "text": "Asymmetric link — color changes midway"},
-            {"type": "legend-line", "style": "border-top: 8px solid " ~ QUALITY_COLORS.unknown ~ ";", "content": "", "text": "Thicker = more observations"},
-            {"type": "legend-line", "style": "border-top: 4px solid " ~ QUALITY_COLORS.unknown ~ ";", "content": "", "text": "Traceroute link (solid)"},
-            {"type": "legend-line", "style": "border-top: 4px dotted " ~ QUALITY_COLORS.unknown ~ ";", "content": "", "text": "Packet link (dotted)"}
+            {"type": "span", "class": "role-color-indicator", "style": "background-color: var(--bs-danger);", "content": "", "text": "Unknown Role"}
         ] %}
         {% call legend_section(map_legend_items) %}
+            {{ rf_link_quality_legend_items() }}
+            <div class="legend-item">
+                <span class="legend-line" style="border-top: 4px solid {{ QUALITY_COLORS.unknown }};"></span>
+                <small>Traceroute link (solid)</small>
+            </div>
+            <div class="legend-item">
+                <span class="legend-line" style="border-top: 4px dotted {{ QUALITY_COLORS.unknown }};"></span>
+                <small>Packet link (dotted)</small>
+            </div>
             <div class="legend-item mt-2">
                 <small class="text-muted">Node colors indicate role types<br>
                 Click nodes for details<br>

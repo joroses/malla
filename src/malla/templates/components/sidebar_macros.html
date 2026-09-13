@@ -76,7 +76,9 @@
         {% for item in legend_items %}
         <div class="legend-item">
             {% if item.type == "span" %}
-            <{{ item.type }} class="{{ item.class }}"{% if item.style %} style="{{ item.style }}"{% endif %}>{{ item.content }}</{{ item.type }}>
+            <span class="{{ item.class }}"{% if item.style %} style="{{ item.style }}"{% endif %}>{{ item.content }}</span>
+            {% elif item.type == "legend-line" %}
+            <span class="legend-line"{% if item.style %} style="{{ item.style }}"{% endif %}></span>
             {% else %}
             <i class="{{ item.class }}"></i>
             {% endif %}
@@ -85,6 +87,37 @@
         {% endfor %}
         {{ caller() if caller }}
     </div>
+</div>
+{% endmacro %}
+
+{% macro rf_link_quality_legend_items() %}
+{# Shared RF link quality legend entries (map + graph), rendered inside a
+   legend_section call block. The palette is the backend-injected
+   QUALITY_COLORS (signal_quality.py), so the legend can never drift from
+   the rendered link halves. #}
+<div class="legend-item">
+    <span class="legend-line" style="border-top: 4px solid {{ QUALITY_COLORS.good }};"></span>
+    <small>Good quality (half nearest receiver)</small>
+</div>
+<div class="legend-item">
+    <span class="legend-line" style="border-top: 4px solid {{ QUALITY_COLORS.fair }};"></span>
+    <small>Fair quality</small>
+</div>
+<div class="legend-item">
+    <span class="legend-line" style="border-top: 4px solid {{ QUALITY_COLORS.marginal }};"></span>
+    <small>Marginal quality</small>
+</div>
+<div class="legend-item">
+    <span class="legend-line" style="border-top: 4px dashed {{ QUALITY_COLORS.unknown }}; opacity: 0.55;"></span>
+    <small>Direction not observed (dashed, faded)</small>
+</div>
+<div class="legend-item">
+    <span class="legend-line" style="height: 4px; border-radius: 2px; background: linear-gradient(90deg, {{ QUALITY_COLORS.good }} 50%, {{ QUALITY_COLORS.marginal }} 50%);"></span>
+    <small>Asymmetric link — color changes midway</small>
+</div>
+<div class="legend-item">
+    <span class="legend-line" style="border-top: 8px solid {{ QUALITY_COLORS.unknown }};"></span>
+    <small>Thicker = more observations</small>
 </div>
 {% endmacro %}
 
@@ -169,19 +202,14 @@
 }
 
 .legend-line {
-    width: 20px;
-    height: 2px;
+    /* Line swatch: height comes from the inline border/background so the
+       backend-injected quality colors render as clean strokes. */
     display: inline-block;
+    width: 22px;
+    height: 0;
     margin-right: 0.5rem;
-}
-
-.legend-line.direct {
-    background-color: var(--bs-success);
-}
-
-.legend-line.indirect {
-    background: linear-gradient(90deg, var(--bs-warning) 50%, transparent 50%);
-    background-size: 8px 2px;
+    vertical-align: middle;
+    flex-shrink: 0;
 }
 
 .search-results {
