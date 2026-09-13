@@ -10,6 +10,7 @@ Features:
 - Automatic packet capture and storage
 - Node information caching
 - Packet decryption support for multiple channels
+- Ingest filtering of low-information traffic (undecryptable, map-report spam)
 - Automatic data cleanup based on retention settings
 
 Usage:
@@ -28,6 +29,14 @@ Data Cleanup:
     the specified number of hours, and node_info records for nodes that haven't
     been seen recently and have no packets in the packet_history table.
     The cleanup runs every hour. Set to 0 (default) to disable cleanup.
+
+Ingest Filtering:
+    Low-information traffic is filtered before it reaches the database:
+    ``capture_drop_undecryptable`` (default true) skips UNKNOWN_APP /
+    PRIVATE_APP packets whose decryption failed, and
+    ``map_report_min_interval_minutes`` (default 60) stores at most one
+    MAP_REPORT packet per node per interval. Set the interval to 0 to store
+    every map report.
 """
 
 import base64
@@ -93,6 +102,11 @@ DECRYPTION_KEYS: list[str] = _cfg.get_decryption_keys()
 # Data retention settings
 DATA_RETENTION_HOURS: int = _cfg.data_retention_hours
 
+# Ingest filtering: uninformative-traffic guards. These bound database growth
+# at the source instead of relying solely on retention deletes.
+DROP_UNDECRYPTABLE_PACKETS: bool = _cfg.capture_drop_undecryptable
+MAP_REPORT_MIN_INTERVAL_SECONDS: int = _cfg.map_report_min_interval_minutes * 60
+
 # Logging configuration – falls back to INFO if an invalid level was supplied
 LOG_LEVEL = _cfg.log_level.upper()
 logging.basicConfig(
@@ -145,6 +159,71 @@ node_cache: dict[
 ] = {}  # In-memory cache: {node_id_numeric: {'hex_id': '!abc123', 'long_name': 'Name', 'short_name': 'Short', 'last_updated': timestamp}}
 cleanup_thread: threading.Thread | None = None  # Background thread for data cleanup
 stop_cleanup = threading.Event()  # Event to signal cleanup thread to stop
+
+# Ingest-filter state. ``_last_map_report_ts`` is keyed by node id and only
+# ever grows with the number of map-reporting nodes (a small subset of the
+# roster), so it needs no eviction. The drop counters are surfaced hourly by
+# the cleanup worker for operational visibility.
+_last_map_report_ts: dict[int | None, float] = {}
+_dropped_undecryptable_count: int = 0
+_dropped_map_report_count: int = 0
+
+
+def reset_ingest_filter_state() -> None:
+    """Clear in-memory ingest-filter bookkeeping (used by tests)."""
+    global _dropped_undecryptable_count, _dropped_map_report_count
+    _last_map_report_ts.clear()
+    _dropped_undecryptable_count = 0
+    _dropped_map_report_count = 0
+
+
+def _should_store_packet(mesh_packet: Any | None) -> bool:
+    """Return True when **mesh_packet** should be persisted.
+
+    Filters low-information traffic configured away from storage:
+
+    - ``UNKNOWN_APP`` / ``PRIVATE_APP`` packets that survived the decryption
+      attempt carry no decodable payload. On the public broker they are the
+      single largest source of row bloat. Packets decrypted successfully get
+      their real portnum rewritten before this check and always pass.
+    - ``MAP_REPORT_APP`` packets are highly repetitive per-node
+      advertisements; at most one per node is stored per configured
+      interval.
+    """
+    global _dropped_undecryptable_count, _dropped_map_report_count
+
+    if mesh_packet is None or not hasattr(mesh_packet, "decoded"):
+        return True
+
+    portnum = mesh_packet.decoded.portnum
+
+    if DROP_UNDECRYPTABLE_PACKETS and portnum in (
+        portnums_pb2.PortNum.UNKNOWN_APP,
+        portnums_pb2.PortNum.PRIVATE_APP,
+    ):
+        # An empty/undersized envelope also parses to portnum UNKNOWN_APP
+        # (protobuf default 0); keep genuinely malformed packets for
+        # debugging and only drop traffic that actually carries encrypted
+        # bytes or a payload we cannot decode.
+        has_encrypted = bool(getattr(mesh_packet, "encrypted", b""))
+        has_payload = bool(getattr(mesh_packet.decoded, "payload", b""))
+        if has_encrypted or has_payload:
+            _dropped_undecryptable_count += 1
+            return False
+
+    if (
+        MAP_REPORT_MIN_INTERVAL_SECONDS > 0
+        and portnum == portnums_pb2.PortNum.MAP_REPORT_APP
+    ):
+        now = time.time()
+        node_id = getattr(mesh_packet, "from", None)
+        last = _last_map_report_ts.get(node_id)
+        if last is not None and (now - last) < MAP_REPORT_MIN_INTERVAL_SECONDS:
+            _dropped_map_report_count += 1
+            return False
+        _last_map_report_ts[node_id] = now
+
+    return True
 
 
 # --- Decryption Functions ---
@@ -1046,6 +1125,16 @@ def cleanup_old_data() -> None:
 
             conn.commit()
 
+            # Truncate the WAL after retention deletes so the on-disk
+            # footprint of cleaned-up rows is actually reclaimed. Without
+            # this the -wal file keeps growing even though rows were
+            # deleted. Best-effort: readers may delay the checkpoint, which
+            # is fine (auto-checkpoint still bounds the WAL eventually).
+            try:
+                cursor.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.Error as e:
+                logging.debug(f"WAL checkpoint after cleanup skipped: {e}")
+
             if packets_deleted > 0 or nodes_deleted > 0:
                 logging.info(
                     f"🧹 Cleaned up {packets_deleted} old packets and {nodes_deleted} unused nodes "
@@ -1073,6 +1162,11 @@ def cleanup_worker() -> None:
     # Then run cleanup every hour
     while not stop_cleanup.wait(3600):  # Wait for 1 hour or until stop signal
         cleanup_old_data()
+        if _dropped_undecryptable_count or _dropped_map_report_count:
+            logging.info(
+                f"Ingest filter: dropped {_dropped_undecryptable_count} undecryptable "
+                f"and {_dropped_map_report_count} duplicate map-report packets so far"
+            )
 
     logging.info("Cleanup worker thread stopped")
 
@@ -1492,16 +1586,18 @@ def on_message(client: mqtt.Client, userdata: Any, msg: mqtt.MQTTMessage) -> Non
         )
         logging.debug(f"Raw payload length: {len(msg.payload)} bytes")
 
-    # Always log packet to database, regardless of parsing success
+    # Always log packet to database, regardless of parsing success — unless
+    # the ingest filter determined it is low-information traffic we skip.
     try:
-        log_packet_to_database(
-            msg.topic,
-            service_envelope,
-            mesh_packet,
-            processed_successfully,
-            raw_service_envelope_data,
-            parsing_error,
-        )
+        if _should_store_packet(mesh_packet):
+            log_packet_to_database(
+                msg.topic,
+                service_envelope,
+                mesh_packet,
+                processed_successfully,
+                raw_service_envelope_data,
+                parsing_error,
+            )
     except Exception as db_error:
         logging.error(f"Failed to log packet to database: {db_error}")
 

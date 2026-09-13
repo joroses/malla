@@ -69,6 +69,18 @@ class AppConfig:
     # Number of hours after which to delete old data (0 = never delete)
     data_retention_hours: int = 0
 
+    # Ingest filtering of low-information packets (capture tool only)
+    # Drop UNKNOWN_APP / PRIVATE_APP packets whose decryption failed instead
+    # of storing them: they carry no decodable payload and dominate row growth
+    # on the public broker. Successfully decrypted packets keep their real
+    # portnum and are always stored.
+    capture_drop_undecryptable: bool = True
+    # Minimum minutes between stored MAP_REPORT packets per node
+    # (0 = store every map report). Map reports are highly repetitive
+    # per-node advertisements; on the public broker they are the second
+    # largest source of row bloat.
+    map_report_min_interval_minutes: int = 60
+
     # Reverse proxy settings
     # Comma-separated IPs of trusted reverse proxies. When set, ProxyFix trusts
     # one trusted proto hop, and Gunicorn is configured to accept forwarded
