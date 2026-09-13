@@ -130,7 +130,9 @@ class TestPayloadSizeLimit:
         )
         assert stored == []
 
-    def test_within_limit_protobuf_topic_reaches_store(self, monkeypatch):
+    def test_within_limit_protobuf_topic_default_envelope_dropped(
+        self, monkeypatch
+    ):
         monkeypatch.setattr(mqtt_capture, "MAX_MQTT_PAYLOAD_BYTES", 4096)
         stored = []
         monkeypatch.setattr(
@@ -138,13 +140,12 @@ class TestPayloadSizeLimit:
             "log_packet_to_database",
             lambda *args, **kwargs: stored.append(args),
         )
-        # Empty-but-legal ServiceEnvelope: parses, then the missing packet is a
-        # parse error - but the raw bytes are still handed to the store (small
-        # malformed packets are kept for debugging).
+        # Empty-but-legal ServiceEnvelope: parses to a default mesh packet
+        # whose portnum is UNKNOWN_APP (protobuf default 0). Since the
+        # drop-all ingest filter, such malformed envelopes are dropped before
+        # the store instead of being kept for debugging.
         mqtt_capture.on_message(None, None, self._msg("msh/TW/2/e/LongFast/!abc", b""))
-        assert len(stored) == 1
-        # The raw (unsanitised) topic is what gets persisted.
-        assert stored[0][0] == "msh/TW/2/e/LongFast/!abc"
+        assert stored == []
 
 
 class TestNodeCacheEviction:
