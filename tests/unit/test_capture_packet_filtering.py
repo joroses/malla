@@ -2,8 +2,8 @@
 
 Pins the database-growth guards in ``mqtt_capture``:
 
-- undecryptable traffic (``UNKNOWN_APP`` / ``PRIVATE_APP``) that survives the
-  decryption attempt is dropped before persistence when
+- undecryptable traffic (``UNKNOWN_APP`` / ``PRIVATE_APP``) is dropped
+  before persistence — after a decryption attempt — when
   ``capture_drop_undecryptable`` is enabled;
 - ``MAP_REPORT_APP`` packets are throttled to one stored row per node per
   configured interval;
@@ -81,15 +81,15 @@ class TestUndecryptableFilter:
         assert len(stored) == 1
         assert mqtt_capture._dropped_undecryptable_count == 0
 
-    def test_empty_malformed_envelope_is_stored_for_debugging(self, stored):
+    def test_empty_malformed_envelope_is_dropped(self, stored):
         # An empty ServiceEnvelope parses to a default MeshPacket whose
-        # portnum is UNKNOWN_APP (protobuf default 0); these carry no
-        # traffic at all and must remain stored for debugging.
+        # portnum is UNKNOWN_APP (protobuf default 0); all UNKNOWN_APP
+        # traffic is dropped, including empty/malformed envelopes.
         mqtt_capture.on_message(
             None, None, SimpleNamespace(topic="msh/TW/2/e/LongFast/!abc", payload=b"")
         )
-        assert len(stored) == 1
-        assert mqtt_capture._dropped_undecryptable_count == 0
+        assert stored == []
+        assert mqtt_capture._dropped_undecryptable_count == 1
 
 
 class TestMapReportThrottle:

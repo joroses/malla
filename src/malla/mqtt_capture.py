@@ -32,8 +32,8 @@ Data Cleanup:
 
 Ingest Filtering:
     Low-information traffic is filtered before it reaches the database:
-    ``capture_drop_undecryptable`` (default true) skips UNKNOWN_APP /
-    PRIVATE_APP packets whose decryption failed, and
+    ``capture_drop_undecryptable`` (default true) drops all UNKNOWN_APP /
+    PRIVATE_APP packets (decrypted ones are rewritten first and kept), and
     ``map_report_min_interval_minutes`` (default 60) stores at most one
     MAP_REPORT packet per node per interval. Set the interval to 0 to store
     every map report.
@@ -182,10 +182,10 @@ def _should_store_packet(mesh_packet: Any | None) -> bool:
 
     Filters low-information traffic configured away from storage:
 
-    - ``UNKNOWN_APP`` / ``PRIVATE_APP`` packets that survived the decryption
-      attempt carry no decodable payload. On the public broker they are the
-      single largest source of row bloat. Packets decrypted successfully get
-      their real portnum rewritten before this check and always pass.
+    - ``UNKNOWN_APP`` / ``PRIVATE_APP`` packets are dropped outright,
+      including empty/malformed envelopes that parse to the protobuf
+      default portnum. Packets decrypted successfully get their real
+      portnum rewritten before this check and always pass.
     - ``MAP_REPORT_APP`` packets are highly repetitive per-node
       advertisements; at most one per node is stored per configured
       interval.
@@ -201,15 +201,8 @@ def _should_store_packet(mesh_packet: Any | None) -> bool:
         portnums_pb2.PortNum.UNKNOWN_APP,
         portnums_pb2.PortNum.PRIVATE_APP,
     ):
-        # An empty/undersized envelope also parses to portnum UNKNOWN_APP
-        # (protobuf default 0); keep genuinely malformed packets for
-        # debugging and only drop traffic that actually carries encrypted
-        # bytes or a payload we cannot decode.
-        has_encrypted = bool(getattr(mesh_packet, "encrypted", b""))
-        has_payload = bool(getattr(mesh_packet.decoded, "payload", b""))
-        if has_encrypted or has_payload:
-            _dropped_undecryptable_count += 1
-            return False
+        _dropped_undecryptable_count += 1
+        return False
 
     if (
         MAP_REPORT_MIN_INTERVAL_SECONDS > 0
