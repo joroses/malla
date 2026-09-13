@@ -434,6 +434,92 @@ class PacketRepository:
             return None
 
     @staticmethod
+    def _build_packet_filter_conditions(
+        filters: dict | None, search: str | None
+    ) -> tuple[list[str], list[Any]]:
+        """WHERE fragments shared by the raw and projected packet readers.
+
+        Column names are identical in packet_history and packet_observations,
+        so the same conditions apply with full fidelity to raw receptions or
+        to their projected observation rows.
+        """
+        if filters is None:
+            filters = {}
+
+        conditions: list[str] = []
+        params: list[Any] = []
+
+        if filters.get("start_time"):
+            conditions.append("timestamp >= ?")
+            params.append(filters["start_time"])
+
+        if filters.get("end_time"):
+            conditions.append("timestamp <= ?")
+            params.append(filters["end_time"])
+
+        if filters.get("from_node"):
+            conditions.append("from_node_id = ?")
+            params.append(filters["from_node"])
+
+        if filters.get("to_node"):
+            conditions.append("to_node_id = ?")
+            params.append(filters["to_node"])
+
+        if filters.get("portnum"):
+            conditions.append("portnum_name = ?")
+            params.append(filters["portnum"])
+
+        if filters.get("min_rssi"):
+            conditions.append("rssi >= ?")
+            params.append(filters["min_rssi"])
+
+        if filters.get("max_rssi"):
+            conditions.append("rssi <= ?")
+            params.append(filters["max_rssi"])
+
+        if filters.get("gateway_id"):
+            conditions.append("gateway_id = ?")
+            params.append(filters["gateway_id"])
+
+        # Filter by primary_channel when provided (matches ServiceEnvelope channel_id)
+        if filters.get("primary_channel"):
+            conditions.append("channel_id = ?")
+            params.append(filters["primary_channel"])
+
+        if filters.get("hop_count") is not None:
+            conditions.append("(hop_start - hop_limit) = ?")
+            params.append(filters["hop_count"])
+
+        # Generic exclusion filters for from/to node IDs
+        if filters.get("exclude_from") is not None:
+            # Exclude packets whose sender matches the specified node ID
+            # Optimized: Use simple != condition to allow index usage
+            conditions.append("from_node_id != ?")
+            params.append(filters["exclude_from"])
+
+        if filters.get("exclude_to") is not None:
+            # Exclude packets whose destination matches the specified node ID
+            # Optimized: Use simple != condition to allow index usage
+            conditions.append("to_node_id != ?")
+            params.append(filters["exclude_to"])
+
+        # Search functionality
+        if search:
+            # Search in multiple text fields
+            search_condition = """(
+                portnum_name LIKE ? OR
+                gateway_id LIKE ? OR
+                channel_id LIKE ? OR
+                CAST(from_node_id AS TEXT) LIKE ? OR
+                CAST(to_node_id AS TEXT) LIKE ?
+            )"""
+            conditions.append(search_condition)
+            search_param = f"%{search}%"
+            params.extend([search_param] * 5)
+
+        return conditions, params
+
+    @staticmethod
     def get_packets(
         limit: int = 100,
         offset: int = 0,
@@ -452,82 +538,38 @@ class PacketRepository:
             cursor = conn.cursor()
 
             # Build WHERE clause
-            where_conditions = []
-            params = []
-
-            if filters.get("start_time"):
-                where_conditions.append("timestamp >= ?")
-                params.append(filters["start_time"])
-
-            if filters.get("end_time"):
-                where_conditions.append("timestamp <= ?")
-                params.append(filters["end_time"])
-
-            if filters.get("from_node"):
-                where_conditions.append("from_node_id = ?")
-                params.append(filters["from_node"])
-
-            if filters.get("to_node"):
-                where_conditions.append("to_node_id = ?")
-                params.append(filters["to_node"])
-
-            if filters.get("portnum"):
-                where_conditions.append("portnum_name = ?")
-                params.append(filters["portnum"])
-
-            if filters.get("min_rssi"):
-                where_conditions.append("rssi >= ?")
-                params.append(filters["min_rssi"])
-
-            if filters.get("max_rssi"):
-                where_conditions.append("rssi <= ?")
-                params.append(filters["max_rssi"])
-
-            if filters.get("gateway_id"):
-                where_conditions.append("gateway_id = ?")
-                params.append(filters["gateway_id"])
-
-            # New: filter by primary_channel when provided (matches ServiceEnvelope channel_id)
-            if filters.get("primary_channel"):
-                where_conditions.append("channel_id = ?")
-                params.append(filters["primary_channel"])
-
-            if filters.get("hop_count") is not None:
-                where_conditions.append("(hop_start - hop_limit) = ?")
-                params.append(filters["hop_count"])
-
-            # Generic exclusion filters for from/to node IDs
-            if filters.get("exclude_from") is not None:
-                # Exclude packets whose sender matches the specified node ID
-                # Optimized: Use simple != condition to allow index usage
-                where_conditions.append("from_node_id != ?")
-                params.append(filters["exclude_from"])
-
-            if filters.get("exclude_to") is not None:
-                # Exclude packets whose destination matches the specified node ID
-                # Optimized: Use simple != condition to allow index usage
-                where_conditions.append("to_node_id != ?")
-                params.append(filters["exclude_to"])
-
-            # Search functionality
-            if search:
-                # Search in multiple text fields
-                search_condition = """(
-                    portnum_name LIKE ? OR
-                    gateway_id LIKE ? OR
-                    channel_id LIKE ? OR
-                    CAST(from_node_id AS TEXT) LIKE ? OR
-                    CAST(to_node_id AS TEXT) LIKE ?
-                )"""
-                where_conditions.append(search_condition)
-                search_param = f"%{search}%"
-                params.extend([search_param] * 5)
+            where_conditions, params = (
+                PacketRepository._build_packet_filter_conditions(filters, search)
+            )
 
             where_clause = (
                 "WHERE " + " AND ".join(where_conditions) if where_conditions else ""
             )
 
             if group_packets:
+                # Grouped reads aggregate receptions per transmission. When
+                # the packet_observations projection exists, SQL does the
+                # grouping (GROUP BY tx_id) and the exact
+                # COUNT(DISTINCT tx_id) over the whole filtered window --
+                # unlike the in-memory fallback below, which can only group
+                # the receptions inside its fetch cap and estimates the total
+                # from that sample. Projection coverage of packet_history is
+                # deliberately not checked: any gap is pre-projection
+                # history, and gating on coverage would keep the fetch-cap
+                # pagination bug alive until the gap ages out of retention.
+                if derived_table_populated(cursor, "packet_observations"):
+                    grouped = PacketRepository._get_grouped_packets_from_observations(
+                        cursor,
+                        limit=limit,
+                        offset=offset,
+                        filters=filters,
+                        search=search,
+                        order_by=order_by,
+                        order_dir=order_dir,
+                    )
+                    conn.close()
+                    return grouped
+
                 # OPTIMIZED GROUPED APPROACH
                 # Since grouped packets are usually within ~10 min of each other,
                 # we use a time-windowed approach instead of expensive GROUP BY + ORDER BY
@@ -698,62 +740,10 @@ class PacketRepository:
                         ),
                     }
 
-                    # Format hop range
-                    if (
-                        packet["min_hops"] is not None
-                        and packet["max_hops"] is not None
-                    ):
-                        if packet["min_hops"] == packet["max_hops"]:
-                            packet["hop_range"] = str(packet["min_hops"])
-                        else:
-                            packet["hop_range"] = (
-                                f"{packet['min_hops']}-{packet['max_hops']}"
-                            )
-                    else:
-                        packet["hop_range"] = None
-
-                    # Format RSSI range
-                    if (
-                        packet["min_rssi"] is not None
-                        and packet["max_rssi"] is not None
-                    ):
-                        if packet["min_rssi"] == packet["max_rssi"]:
-                            packet["rssi_range"] = f"{packet['min_rssi']:.1f} dBm"
-                        else:
-                            packet["rssi_range"] = (
-                                f"{packet['min_rssi']:.1f} to {packet['max_rssi']:.1f} dBm"
-                            )
-                    else:
-                        packet["rssi_range"] = None
-
-                    # Format SNR range
-                    if packet["min_snr"] is not None and packet["max_snr"] is not None:
-                        if packet["min_snr"] == packet["max_snr"]:
-                            packet["snr_range"] = f"{packet['min_snr']:.2f} dB"
-                        else:
-                            packet["snr_range"] = (
-                                f"{packet['min_snr']:.2f} to {packet['max_snr']:.2f} dB"
-                            )
-                    else:
-                        packet["snr_range"] = None
-
-                    # Format relay_node as grouped string (e.g., "0x12, 0x34*2, 0x56*3")
-                    if relay_node_counts:
-                        # Sort by count (descending) then by relay_node value
-                        sorted_relay = sorted(
-                            relay_node_counts.items(), key=lambda x: (-x[1], x[0])
-                        )
-                        relay_parts = []
-                        for relay_node_val, count in sorted_relay:
-                            # Format as last byte in hex
-                            relay_hex = f"{relay_node_val & 0xFF:02x}"
-                            if count > 1:
-                                relay_parts.append(f"{relay_hex}*{count}")
-                            else:
-                                relay_parts.append(relay_hex)
-                        packet["relay_node_grouped"] = ", ".join(relay_parts)
-                    else:
-                        packet["relay_node_grouped"] = None
+                    PacketRepository._apply_grouped_ranges(packet)
+                    packet["relay_node_grouped"] = (
+                        PacketRepository._format_relay_grouped(relay_node_counts)
+                    )
 
                     packets.append(packet)
 
@@ -920,6 +910,239 @@ class PacketRepository:
         except Exception as e:
             logger.error(f"Error getting packets: {e}")
             raise
+
+    @staticmethod
+    def _apply_grouped_ranges(packet: dict[str, Any]) -> None:
+        """Attach the display range strings shared by both grouped readers."""
+        # Format hop range
+        if packet["min_hops"] is not None and packet["max_hops"] is not None:
+            if packet["min_hops"] == packet["max_hops"]:
+                packet["hop_range"] = str(packet["min_hops"])
+            else:
+                packet["hop_range"] = f"{packet['min_hops']}-{packet['max_hops']}"
+        else:
+            packet["hop_range"] = None
+
+        # Format RSSI range
+        if packet["min_rssi"] is not None and packet["max_rssi"] is not None:
+            if packet["min_rssi"] == packet["max_rssi"]:
+                packet["rssi_range"] = f"{packet['min_rssi']:.1f} dBm"
+            else:
+                packet["rssi_range"] = (
+                    f"{packet['min_rssi']:.1f} to {packet['max_rssi']:.1f} dBm"
+                )
+        else:
+            packet["rssi_range"] = None
+
+        # Format SNR range
+        if packet["min_snr"] is not None and packet["max_snr"] is not None:
+            if packet["min_snr"] == packet["max_snr"]:
+                packet["snr_range"] = f"{packet['min_snr']:.2f} dB"
+            else:
+                packet["snr_range"] = (
+                    f"{packet['min_snr']:.2f} to {packet['max_snr']:.2f} dB"
+                )
+        else:
+            packet["snr_range"] = None
+
+    @staticmethod
+    def _format_relay_grouped(relay_node_counts: dict[int, int]) -> str | None:
+        """Render relay counts as a grouped string (e.g. "0x12, 0x34*2")."""
+        if not relay_node_counts:
+            return None
+        # Sort by count (descending) then by relay_node value
+        sorted_relay = sorted(relay_node_counts.items(), key=lambda x: (-x[1], x[0]))
+        relay_parts = []
+        for relay_node_val, count in sorted_relay:
+            # Format as last byte in hex
+            relay_hex = f"{relay_node_val & 0xFF:02x}"
+            if count > 1:
+                relay_parts.append(f"{relay_hex}*{count}")
+            else:
+                relay_parts.append(relay_hex)
+        return ", ".join(relay_parts)
+
+    @staticmethod
+    def _get_grouped_packets_from_observations(
+        cursor: sqlite3.Cursor,
+        limit: int,
+        offset: int,
+        filters: dict | None,
+        search: str | None,
+        order_by: str,
+        order_dir: str,
+    ) -> dict[str, Any]:
+        """Serve grouped packets by aggregating packet_observations in SQL.
+
+        One query counts every transmission (COUNT(DISTINCT tx_id)) in the
+        filtered window and one paginates them, so all groups are visible no
+        matter how many duplicate receptions each one has. Aggregates mirror
+        the in-memory fallback exactly: plausible-signal guards on RSSI/SNR
+        ranges, the earliest reception as the representative row, and relay
+        occurrences counted per group.
+        """
+        conditions, params = PacketRepository._build_packet_filter_conditions(
+            filters, search
+        )
+        # Positive tx_id marks receptions with a resolvable mesh packet id
+        # (the writer falls back to -packet_id for unidentifiable ones, which
+        # never form multi-reception groups and stay out of the grouped view,
+        # matching the raw path's mesh_packet_id IS NOT NULL AND != 0 filter).
+        conditions = ["tx_id > 0", *conditions]
+        params = list(params)
+        if not filters.get("start_time") and not filters.get("end_time"):
+            # Same default 7-day window as the raw grouped path
+            conditions.append("timestamp >= ?")
+            params.append(time.time() - (7 * 24 * 3600))
+        where_clause = "WHERE " + " AND ".join(conditions)
+
+        if order_by == "gateway_id":
+            order_expr = "COUNT(DISTINCT CASE WHEN gateway_id != '' THEN gateway_id END)"
+        elif order_by == "payload_length":
+            order_expr = "AVG(payload_length)"
+        elif order_by == "rssi":
+            order_expr = f"MIN(CASE WHEN {rssi_valid_sql('rssi')} THEN rssi END)"
+        elif order_by == "snr":
+            order_expr = f"MIN(CASE WHEN {snr_valid_sql('snr')} THEN snr END)"
+        elif order_by == "hop_count":
+            order_expr = "MIN(hop_start - hop_limit)"
+        else:
+            order_expr = "MIN(timestamp)"
+        order_dir_sql = "DESC" if order_dir.lower() == "desc" else "ASC"
+
+        total_count = cursor.execute(
+            f"SELECT COUNT(DISTINCT tx_id) FROM packet_observations {where_clause}",
+            params,
+        ).fetchone()[0]
+
+        cursor.execute(
+            f"""
+            SELECT tx_id
+            FROM packet_observations
+            {where_clause}
+            GROUP BY tx_id
+            ORDER BY {order_expr} {order_dir_sql}, tx_id {order_dir_sql}
+            LIMIT ? OFFSET ?
+            """,
+            params + [limit, offset],
+        )
+        tx_ids = [row[0] for row in cursor.fetchall()]
+
+        result = {
+            "packets": [],
+            "total_count": total_count,
+            "has_more": total_count > (offset + limit),
+            "is_grouped": True,
+        }
+        if not tx_ids:
+            return result
+
+        tx_placeholders = ", ".join("?" for _ in tx_ids)
+        detail_conditions = " AND ".join(conditions)
+        cursor.execute(
+            f"""
+            SELECT
+                o.tx_id AS tx_id,
+                MIN(o.timestamp) AS timestamp,
+                COUNT(*) AS reception_count,
+                COUNT(DISTINCT CASE WHEN o.gateway_id != '' THEN o.gateway_id END)
+                    AS gateway_count,
+                GROUP_CONCAT(DISTINCT CASE WHEN o.gateway_id != '' THEN o.gateway_id END)
+                    AS gateway_list,
+                MIN(CASE WHEN {rssi_valid_sql('o.rssi')} THEN o.rssi END) AS min_rssi,
+                MAX(CASE WHEN {rssi_valid_sql('o.rssi')} THEN o.rssi END) AS max_rssi,
+                MIN(CASE WHEN {snr_valid_sql('o.snr')} THEN o.snr END) AS min_snr,
+                MAX(CASE WHEN {snr_valid_sql('o.snr')} THEN o.snr END) AS max_snr,
+                MIN(o.hop_start - o.hop_limit) AS min_hops,
+                MAX(o.hop_start - o.hop_limit) AS max_hops,
+                AVG(o.payload_length) AS avg_payload_length,
+                MIN(o.processed_successfully) AS processed_successfully,
+                MAX(o.from_node_id) AS from_node_id,
+                MAX(o.to_node_id) AS to_node_id,
+                MAX(o.mesh_packet_id) AS mesh_packet_id,
+                MAX(o.portnum) AS portnum,
+                MAX(o.portnum_name) AS portnum_name,
+                (SELECT r.packet_id FROM packet_observations r
+                 WHERE r.tx_id = o.tx_id
+                 ORDER BY r.timestamp ASC, r.packet_id ASC LIMIT 1) AS rep_packet_id
+            FROM packet_observations o
+            WHERE o.tx_id IN ({tx_placeholders}) AND {detail_conditions}
+            GROUP BY o.tx_id
+            ORDER BY {order_expr} {order_dir_sql}, o.tx_id {order_dir_sql}
+            """,
+            tx_ids + params,
+        )
+        rows = cursor.fetchall()
+
+        cursor.execute(
+            f"""
+            SELECT o.tx_id AS tx_id, o.relay_node AS relay_node, COUNT(*) AS relay_count
+            FROM packet_observations o
+            WHERE o.tx_id IN ({tx_placeholders}) AND {detail_conditions}
+              AND o.relay_node IS NOT NULL AND o.relay_node != 0
+            GROUP BY o.tx_id, o.relay_node
+            """,
+            tx_ids + params,
+        )
+        relay_counts: dict[int, dict[int, int]] = {}
+        for row in cursor.fetchall():
+            relay_counts.setdefault(row["tx_id"], {})[row["relay_node"]] = row[
+                "relay_count"
+            ]
+
+        rep_ids = [row["rep_packet_id"] for row in rows]
+        rep_placeholders = ", ".join("?" for _ in rep_ids)
+        cursor.execute(
+            f"""
+            SELECT id, channel_id, raw_payload, portnum_name
+            FROM packet_history
+            WHERE id IN ({rep_placeholders})
+            """,
+            rep_ids,
+        )
+        rep_rows = {row["id"]: dict(row) for row in cursor.fetchall()}
+
+        packets = []
+        for row in rows:
+            rep = rep_rows.get(row["rep_packet_id"])
+            packet = {
+                "id": row["rep_packet_id"],
+                "timestamp": row["timestamp"],
+                "from_node_id": row["from_node_id"],
+                "to_node_id": row["to_node_id"],
+                "portnum": row["portnum"],
+                "portnum_name": row["portnum_name"],
+                "mesh_packet_id": row["mesh_packet_id"],
+                "channel_id": rep.get("channel_id") if rep else None,
+                "gateway_count": row["gateway_count"],
+                "gateway_list": row["gateway_list"] or "",
+                "min_rssi": row["min_rssi"],
+                "max_rssi": row["max_rssi"],
+                "min_snr": row["min_snr"],
+                "max_snr": row["max_snr"],
+                "min_hops": row["min_hops"],
+                "max_hops": row["max_hops"],
+                "avg_payload_length": row["avg_payload_length"],
+                "processed_successfully": row["processed_successfully"],
+                "timestamp_str": datetime.fromtimestamp(
+                    row["timestamp"], UTC
+                ).strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "reception_count": row["reception_count"],
+                "is_grouped": True,
+                "success": row["processed_successfully"],
+                # Decode text content from the representative reception
+                "text_content": (
+                    PacketRepository._decode_text_content(rep) if rep else None
+                ),
+            }
+            PacketRepository._apply_grouped_ranges(packet)
+            packet["relay_node_grouped"] = PacketRepository._format_relay_grouped(
+                relay_counts.get(row["tx_id"], {})
+            )
+            packets.append(packet)
+
+        result["packets"] = packets
+        return result
 
     @staticmethod
     def get_signal_data(filters: dict | None = None) -> list[dict[str, Any]]:
@@ -3386,6 +3609,23 @@ class TracerouteRepository:
         except Exception as e:
             logger.error(f"Error getting traceroute details: {e}")
             raise
+
+
+def derived_table_populated(cursor: sqlite3.Cursor, table: str) -> bool:
+    """True when a materialized table exists and already holds rows.
+
+    Web instances never create the derived tables (their single writer is
+    the capture process, the import container, or the backfill tool), so
+    readers fall back to the legacy packet_history queries whenever the
+    projection is absent or still empty (fresh schema, un-backfilled
+    database, or in-memory test databases).
+    """
+    exists = cursor.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+    ).fetchone()
+    if not exists:
+        return False
+    return cursor.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
 
 
 class LocationRepository:

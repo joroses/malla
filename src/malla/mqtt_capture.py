@@ -59,8 +59,13 @@ from paho.mqtt.enums import CallbackAPIVersion
 from malla.config import get_config  # Import here to avoid circular import issues
 
 from .database.connection import seed_query_planner_stats_async
+from .database.materialization_schema import ensure_materialization_schema
+from .database.materializations import (
+    clear_materialization_cache,
+    materialization_tx_scope,
+    materialize_packet,
+)
 from .database.schema import ensure_startup_schema
-from .database.traceroutes import write_traceroute
 from .utils.geo_utils import is_valid_position
 
 # Load the singleton configuration once at module import time.  This ensures the
@@ -132,6 +137,9 @@ def _sanitize_for_log(value: object, limit: int = 200) -> str:
 
 # --- Global Variables ---
 db_lock = threading.Lock()  # Thread lock for database access
+# Path whose materialization tables are known to exist, so per-packet writes
+# skip idempotent DDL after the first check per database.
+_materialization_schema_ready_for: str | None = None
 node_cache: dict[
     int, dict[str, Any]
 ] = {}  # In-memory cache: {node_id_numeric: {'hex_id': '!abc123', 'long_name': 'Name', 'short_name': 'Short', 'last_updated': timestamp}}
@@ -413,6 +421,12 @@ def init_database() -> None:
     """)
 
     ensure_startup_schema(cursor, drop_legacy_indexes=True)
+
+    # Materialization tables belong to the capture path only (live MQTT
+    # database); web instances never create them in databases they just read.
+    ensure_materialization_schema(cursor)
+    global _materialization_schema_ready_for
+    _materialization_schema_ready_for = DATABASE_FILE
 
     # Backfill primary_channel only when there are actually missing values.
     try:
@@ -849,7 +863,15 @@ def log_packet_to_database(
     relay_node = getattr(mesh_packet, "relay_node", None) if mesh_packet else None
     tx_after = getattr(mesh_packet, "tx_after", None) if mesh_packet else None
 
-    with db_lock, closing(sqlite3.connect(DATABASE_FILE, timeout=30.0)) as conn, conn:
+    # The tx scope sits between the connection and the transaction so the SQL
+    # commit/rollback runs first and staged transmission identities are only
+    # published to the shared cache after a successful commit.
+    with (
+        db_lock,
+        closing(sqlite3.connect(DATABASE_FILE, timeout=30.0)) as conn,
+        materialization_tx_scope(),
+        conn,
+    ):
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
         cursor.execute("PRAGMA foreign_keys=ON")
@@ -897,20 +919,42 @@ def log_packet_to_database(
             ),
         )
 
-        if portnum == portnums_pb2.PortNum.TRACEROUTE_APP:
-            write_traceroute(
-                cursor,
-                {
-                    "id": cursor.lastrowid,
-                    "timestamp": current_time,
-                    "mesh_packet_id": mesh_packet_id,
-                    "from_node_id": from_node_id,
-                    "to_node_id": to_node_id,
-                    "hop_start": hop_start,
-                    "hop_limit": hop_limit,
-                    "raw_payload": raw_payload,
-                },
-            )
+        # Capture the packet_history row id before any derived-table inserts
+        # overwrite cursor.lastrowid.
+        packet_history_id = cursor.lastrowid
+
+        # Ensure the materialization tables exist even when this writer runs
+        # against a database that init_database() never prepared (tests,
+        # legacy setups); the DDL is idempotent and only paid once per file.
+        global _materialization_schema_ready_for
+        if _materialization_schema_ready_for != DATABASE_FILE:
+            ensure_materialization_schema(cursor)
+            _materialization_schema_ready_for = DATABASE_FILE
+
+        # One derived write set per reception (observation aggregates,
+        # position fixes, and traceroute paths/hops).
+        materialize_packet(
+            cursor,
+            {
+                "id": packet_history_id,
+                "timestamp": current_time,
+                "mesh_packet_id": mesh_packet_id,
+                "from_node_id": from_node_id,
+                "to_node_id": to_node_id,
+                "portnum": portnum,
+                "portnum_name": portnum_name,
+                "gateway_id": gateway_id,
+                "channel_id": channel_id,
+                "rssi": rssi,
+                "snr": snr,
+                "hop_limit": hop_limit,
+                "hop_start": hop_start,
+                "payload_length": payload_length,
+                "raw_payload": raw_payload,
+                "processed_successfully": processed_successfully,
+                "relay_node": relay_node,
+            },
+        )
 
 
 def get_packet_history(
@@ -968,6 +1012,21 @@ def cleanup_old_data() -> None:
                 "DELETE FROM packet_history WHERE timestamp < ?", (cutoff_time,)
             )
             packets_deleted = cursor.rowcount
+
+            # Ensure derived materialization tables are clean
+            cursor.execute(
+                "DELETE FROM packet_observations WHERE timestamp < ?", (cutoff_time,)
+            )
+            cursor.execute(
+                "DELETE FROM node_positions WHERE timestamp < ?", (cutoff_time,)
+            )
+            cursor.execute(
+                "DELETE FROM traceroute_hops WHERE timestamp < ?", (cutoff_time,)
+            )
+            cursor.execute(
+                "DELETE FROM traceroute_routes WHERE timestamp < ?", (cutoff_time,)
+            )
+            clear_materialization_cache()
 
             # Delete node_info records for nodes that haven't been seen recently
             # and have no packets in the packet_history table

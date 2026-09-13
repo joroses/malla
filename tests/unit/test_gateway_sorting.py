@@ -147,8 +147,17 @@ class TestGatewaySortingAPI:
             },
         ]
 
-        with patch(
-            "src.malla.database.repositories.get_db_connection", return_value=mock_conn
+        with (
+            patch(
+                "src.malla.database.repositories.get_db_connection",
+                return_value=mock_conn,
+            ),
+            # These tests stub raw packet_history rows, so pin the reader to
+            # the in-memory legacy path.
+            patch(
+                "src.malla.database.repositories.packet_observations_ready",
+                return_value=False,
+            ),
         ):
             result = PacketRepository.get_packets(
                 limit=10,
@@ -311,8 +320,17 @@ class TestGatewaySortingAPI:
             },
         ]
 
-        with patch(
-            "src.malla.database.repositories.get_db_connection", return_value=mock_conn
+        with (
+            patch(
+                "src.malla.database.repositories.get_db_connection",
+                return_value=mock_conn,
+            ),
+            # These tests stub raw packet_history rows, so pin the reader to
+            # the in-memory legacy path.
+            patch(
+                "src.malla.database.repositories.packet_observations_ready",
+                return_value=False,
+            ),
         ):
             result = PacketRepository.get_packets(
                 limit=10,

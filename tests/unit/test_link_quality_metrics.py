@@ -639,6 +639,33 @@ class TestPacketLinksMetrics:
         assert link["total_hops_seen"] == link["observation_count"] == 5
         assert link["last_packet_id"] == 5
 
+    def test_representative_pair_survives_out_of_order_ids(self):
+        conn = self._database()
+        # One transmission (mesh_packet_id 55) received twice, where the LATER
+        # reception carries the SMALLER raw id. The link's (last_seen,
+        # last_packet_id, channel_id) must all describe that same reception:
+        # independently maximizing timestamp and id would point last_packet_id
+        # at reception 900 while last_seen describes reception 400.
+        for row_id, ts, channel in (
+            (900, 1000.0, "LongFast"),
+            (400, 1042.0, "SFNarrow"),
+        ):
+            conn.execute(
+                """
+                INSERT INTO packet_history (
+                    id, timestamp, from_node_id, gateway_id, channel_id,
+                    mesh_packet_id, hop_start, hop_limit, rssi, snr
+                ) VALUES (?, ?, 100, '!000000c8', ?, 55, 3, 3, -60.0, -12.0)
+                """,
+                (row_id, ts, channel),
+            )
+        conn.commit()
+
+        link = self._packet_links(conn)[0]
+        assert link["last_packet_id"] == 400
+        assert link["last_seen_str"] == "1970-01-01 00:17:22 UTC"
+        assert link["channel_id"] == "SFNarrow"
+
     def test_gateway_alias_rows_resolve_link_channel_by_recency(self):
         conn = self._database()
         # Two gateway aliases for the same direction, different channels and

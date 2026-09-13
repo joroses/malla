@@ -1014,23 +1014,55 @@ class LocationService:
                 else "-id"
             )
 
+            # Representative metadata (last_seen, latest_packet_id, channel_id)
+            # must describe one and the same reception. Bare columns next to
+            # aggregates are only pinned to the min/max row by SQLite when the
+            # query has exactly one min()/max() aggregate, so the representative
+            # is selected explicitly with ROW_NUMBER: latest reception per
+            # transmission by (timestamp DESC, id DESC), then latest
+            # transmission per gateway by (last_seen DESC, latest_packet_id
+            # DESC). Every projected column is an aggregate.
             query = f"""
-                WITH transmissions AS (
+                WITH receptions AS (
                     SELECT
                         from_node_id,
                         gateway_id,
-                        {tx_id_expr}                              AS tx_id,
-                        COUNT(*)                                  AS reception_count,
+                        {tx_id_expr} AS tx_id,
+                        id,
+                        timestamp,
+                        channel_id,
+                        snr,
+                        rssi,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY from_node_id, gateway_id, {tx_id_expr}
+                            ORDER BY timestamp DESC, id DESC
+                        ) AS tx_rn
+                    FROM packet_history
+                    {where_sql}
+                ),
+                transmissions AS (
+                    SELECT
+                        from_node_id,
+                        gateway_id,
+                        COUNT(*) AS reception_count,
                         AVG(CASE WHEN {snr_valid_sql()} THEN snr END) AS snr,
                         MAX(CASE WHEN {snr_valid_sql()} THEN 1 ELSE 0 END) AS has_valid_snr,
                         AVG(CASE WHEN {rssi_valid_sql()} THEN rssi END) AS rssi,
                         MAX(CASE WHEN {rssi_valid_sql()} THEN 1 ELSE 0 END) AS has_valid_rssi,
-                        id                                        AS latest_packet_id,
-                        MAX(timestamp)                            AS last_seen,
-                        channel_id
-                    FROM packet_history
-                    {where_sql}
-                    GROUP BY from_node_id, gateway_id, {tx_id_expr}
+                        MAX(CASE WHEN tx_rn = 1 THEN id END) AS latest_packet_id,
+                        MAX(CASE WHEN tx_rn = 1 THEN timestamp END) AS last_seen,
+                        MAX(CASE WHEN tx_rn = 1 THEN channel_id END) AS channel_id
+                    FROM receptions
+                    GROUP BY from_node_id, gateway_id, tx_id
+                ),
+                gateway_transmissions AS (
+                    SELECT
+                        transmissions.*,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY from_node_id, gateway_id
+                            ORDER BY last_seen DESC, latest_packet_id DESC
+                        ) AS gateway_rn
+                    FROM transmissions
                 )
                 SELECT
                     from_node_id,
@@ -1041,10 +1073,10 @@ class LocationService:
                     SUM(has_valid_rssi)                             AS rssi_count,
                     SUM(CASE WHEN has_valid_snr = 1 THEN snr END)   AS snr_sum,
                     SUM(has_valid_snr)                              AS snr_count,
-                    channel_id,
-                    latest_packet_id,
+                    MAX(CASE WHEN gateway_rn = 1 THEN channel_id END) AS channel_id,
+                    MAX(CASE WHEN gateway_rn = 1 THEN latest_packet_id END) AS latest_packet_id,
                     MAX(last_seen)                                  AS last_seen
-                FROM transmissions
+                FROM gateway_transmissions
                 GROUP BY from_node_id, gateway_id
             """
             cursor.execute(query, params)
