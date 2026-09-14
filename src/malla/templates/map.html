@@ -448,6 +448,7 @@ let currentHopDepth = 1; // max hop depth to display around selected node
 let currentOverlay = null;
 let locationsAbortController = null; // cancels superseded /api/locations fetches
 let lastLoadedTimeKey = null; // time window the currently loaded data covers
+let locationsInflightRequest = null; // { key, promise } shared single-flight /api/locations request
 
 // Update map theme based on current theme setting
 function updateMapTheme() {
@@ -767,51 +768,69 @@ function buildFilterParams() {
 
 // Load node locations from API
 async function loadNodeLocations() {
-    try {
-        showLoading();
+    const params = buildFilterParams();
+    const requestKey = params.toString();
 
-        // Cancel any in-flight request so a stale response can never
-        // overwrite the results of a newer time window.
-        if (locationsAbortController) {
-            locationsAbortController.abort();
-        }
-        locationsAbortController = new AbortController();
-
-        const params = buildFilterParams();
-        lastLoadedTimeKey = timeFilterKey(getTimeFilterParams());
-
-        const response = await fetch(`/api/locations?${params.toString()}`, {
-            signal: locationsAbortController.signal
-        });
-        const data = await response.json();
-
-        if (data.error) {
-            showError(data.error);
-            return;
-        }
-
-        // Store all data for client-side filtering
-        allNodeData = data.locations || [];
-
-        // Combine traceroute and packet links but tag with type for filtering
-        const tracerouteLinksFetched = (data.traceroute_links || []).map(l => ({ ...l, link_type: 'traceroute' }));
-        const packetLinksFetched = (data.packet_links || []).map(l => ({ ...l, link_type: 'packet' }));
-
-        allLinkData = [...tracerouteLinksFetched, ...packetLinksFetched];
-
-        // Apply client-side filters
-        applyClientSideFilters();
-
-        hideLoading();
-
-    } catch (error) {
-        if (error.name === 'AbortError') {
-            // Superseded by a newer request – keep the loading state for it
-            return;
-        }
-        console.error('Error loading node locations:', error);
-        showError('Failed to load node locations');
+    // Single-flight dedup: if an identical request is already in flight,
+    // share it instead of aborting and re-issuing (the server would still
+    // execute both jobs, doubling the position SQL load).
+    if (locationsInflightRequest && locationsInflightRequest.key === requestKey) {
+        return locationsInflightRequest.promise;
     }
+
+    // Cancel any in-flight request so a stale response can never
+    // overwrite the results of a newer time window.
+    if (locationsAbortController) {
+        locationsAbortController.abort();
+    }
+    const controller = new AbortController();
+    locationsAbortController = controller;
+
+    showLoading();
+    lastLoadedTimeKey = timeFilterKey(getTimeFilterParams());
+
+    const request = (async () => {
+        try {
+            const response = await fetch(`/api/locations?${requestKey}`, {
+                signal: controller.signal
+            });
+            const data = await response.json();
+
+            if (data.error) {
+                showError(data.error);
+                return;
+            }
+
+            // Store all data for client-side filtering
+            allNodeData = data.locations || [];
+
+            // Combine traceroute and packet links but tag with type for filtering
+            const tracerouteLinksFetched = (data.traceroute_links || []).map(l => ({ ...l, link_type: 'traceroute' }));
+            const packetLinksFetched = (data.packet_links || []).map(l => ({ ...l, link_type: 'packet' }));
+
+            allLinkData = [...tracerouteLinksFetched, ...packetLinksFetched];
+
+            // Apply client-side filters
+            applyClientSideFilters();
+
+            hideLoading();
+
+        } catch (error) {
+            if (error.name === 'AbortError') {
+                // Superseded by a newer request – keep the loading state for it
+                return;
+            }
+            console.error('Error loading node locations:', error);
+            showError('Failed to load node locations');
+        } finally {
+            if (locationsInflightRequest && locationsInflightRequest.promise === request) {
+                locationsInflightRequest = null;
+            }
+        }
+    })();
+
+    locationsInflightRequest = { key: requestKey, promise: request };
+    return request;
 }
 
 // Apply client-side filters to the data
