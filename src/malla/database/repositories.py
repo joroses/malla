@@ -1557,6 +1557,74 @@ class NodeRepository:
                         else ""
                     )
 
+                # The 24h aggregates read the lean packet_observations
+                # projection when it is populated (written at capture time
+                # or by the backfill tool) instead of scanning the wide
+                # packet_history rows with their protobuf BLOB payloads.
+                # Row identity is 1:1 with packet_history (one observation
+                # per reception), so counts and MAX(timestamp) are exact;
+                # is_direct is the pre-resolved hop_start = hop_limit flag
+                # the raw path re-derives in its CASE guards.
+                if derived_table_populated(cursor, "packet_observations"):
+                    # from_node_id IS NOT NULL repeats the partial-index
+                    # predicate of idx_pobs_node_stats verbatim so the
+                    # aggregation runs entirely inside that covering index.
+                    stats_subquery = f"""
+                        SELECT
+                            from_node_id as node_id,
+                            COUNT(*) as packet_count_24h,
+                            MAX(timestamp) as last_packet_time,
+                            AVG(CASE WHEN is_direct = 1
+                                      AND {rssi_valid_sql()}
+                                      THEN CAST(rssi AS FLOAT) END) as avg_rssi,
+                            AVG(CASE WHEN is_direct = 1
+                                      AND {snr_valid_sql()}
+                                      THEN CAST(snr AS FLOAT) END) as avg_snr
+                        FROM packet_observations
+                        WHERE timestamp > (strftime('%s', 'now') - 86400)
+                          AND from_node_id IS NOT NULL
+                        GROUP BY from_node_id
+                    """
+                    gstats_subquery = """
+                        SELECT
+                            gateway_id,
+                            COUNT(*) as gateway_packet_count_24h
+                        FROM packet_observations
+                        WHERE timestamp > (strftime('%s', 'now') - 86400)
+                          AND gateway_id != ''
+                        GROUP BY gateway_id
+                    """
+                else:
+                    stats_subquery = f"""
+                        SELECT
+                            from_node_id as node_id,
+                            COUNT(*) as packet_count_24h,
+                            MAX(timestamp) as last_packet_time,
+                            -- RSSI/SNR only mean something on direct (0-hop)
+                            -- receptions; relayed packets carry the last
+                            -- relay's signal, not this node's.
+                            AVG(CASE WHEN hop_start BETWEEN 0 AND 7
+                                      AND hop_start = hop_limit
+                                      AND {rssi_valid_sql()}
+                                      THEN CAST(rssi AS FLOAT) END) as avg_rssi,
+                            AVG(CASE WHEN hop_start BETWEEN 0 AND 7
+                                      AND hop_start = hop_limit
+                                      AND {snr_valid_sql()}
+                                      THEN CAST(snr AS FLOAT) END) as avg_snr
+                        FROM packet_history
+                        WHERE timestamp > (strftime('%s', 'now') - 86400)
+                        GROUP BY from_node_id
+                    """
+                    gstats_subquery = """
+                        SELECT
+                            gateway_id,
+                            COUNT(*) as gateway_packet_count_24h
+                        FROM packet_history
+                        WHERE timestamp > (strftime('%s', 'now') - 86400)
+                          AND gateway_id IS NOT NULL AND gateway_id != ''
+                        GROUP BY gateway_id
+                    """
+
                 query = f"""
                     SELECT
                         ni.node_id,
@@ -1574,35 +1642,8 @@ class NodeRepository:
                         stats.avg_rssi,
                         stats.avg_snr
                     FROM node_info ni
-                    LEFT JOIN (
-                        SELECT
-                            from_node_id as node_id,
-                            COUNT(*) as packet_count_24h,
-                            MAX(timestamp) as last_packet_time,
-                            -- RSSI/SNR only mean anything on direct (0-hop)
-                            -- receptions; relayed packets carry the last
-                            -- relay's signal, not this node's.
-                            AVG(CASE WHEN hop_start BETWEEN 0 AND 7
-                                      AND hop_start = hop_limit
-                                      AND {rssi_valid_sql()}
-                                     THEN CAST(rssi AS FLOAT) END) as avg_rssi,
-                            AVG(CASE WHEN hop_start BETWEEN 0 AND 7
-                                      AND hop_start = hop_limit
-                                      AND {snr_valid_sql()}
-                                     THEN CAST(snr AS FLOAT) END) as avg_snr
-                        FROM packet_history
-                        WHERE timestamp > (strftime('%s', 'now') - 86400)
-                        GROUP BY from_node_id
-                    ) stats ON ni.node_id = stats.node_id
-                    LEFT JOIN (
-                        SELECT
-                            gateway_id,
-                            COUNT(*) as gateway_packet_count_24h
-                        FROM packet_history
-                        WHERE timestamp > (strftime('%s', 'now') - 86400)
-                          AND gateway_id IS NOT NULL AND gateway_id != ''
-                        GROUP BY gateway_id
-                    ) gstats ON gstats.gateway_id = printf('!%08x', ni.node_id)
+                    LEFT JOIN ({stats_subquery}) stats ON ni.node_id = stats.node_id
+                    LEFT JOIN ({gstats_subquery}) gstats ON gstats.gateway_id = printf('!%08x', ni.node_id)
                     {where_clause}
                     ORDER BY {order_column} {order_dir}
                     LIMIT ? OFFSET ?
