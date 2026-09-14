@@ -32,6 +32,7 @@ classifiers = [
 requires-python = ">=3.13"
 dependencies = [
     "flask>=3.0.0",
+    "flask-compress>=1.15",
     "gunicorn>=22.0.0",
     "paho-mqtt>=2.1.0",
     "meshtastic>=2.7.8",

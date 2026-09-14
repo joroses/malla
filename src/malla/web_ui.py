@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 from flask import Flask
+from flask_compress import Compress
 
 # Import application configuration loader
 from .config import AppConfig, get_config
@@ -110,6 +111,10 @@ def create_app(cfg: AppConfig | None = None):  # noqa: D401
         template_folder=str(package_dir / "templates"),
         static_folder=str(package_dir / "static"),
     )
+
+    # Gzip/Brotli compression for large JSON API payloads (/api/nodes alone is
+    # multiple MB uncompressed and compresses ~10x).
+    Compress(app)
 
     # ---------------------------------------------------------------------
     # Load application configuration (YAML + environment overrides)
