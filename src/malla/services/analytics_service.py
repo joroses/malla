@@ -3,45 +3,129 @@ Analytics service for Meshtastic Mesh Health Web UI
 """
 
 import logging
+import sqlite3
+import threading
 import time
 from collections import defaultdict
 from datetime import UTC, datetime
 from typing import Any
 
-from ..database.repositories import NodeRepository
+from ..database.repositories import NodeRepository, derived_table_populated
 from ..utils.signal_quality import rssi_valid_sql, snr_valid_sql
 
 logger = logging.getLogger(__name__)
 
-# NOTE: Lightweight, in-process cache so that repeated calls in a short period
+# NOTE: Lightweight, in-process caches so that repeated calls in a short period
 # do not hit the database multiple times. This is intentionally simple to keep
 # dependencies minimal; for a multi-process deployment a proper cache (e.g.
 # Redis) should be used instead.
 
 
+# Deciding the packet source costs a probe whose answer only changes when
+# the backfill tool runs, so the decision is cached and rechecked at a slow
+# interval.
+_SOURCE_CHECK_INTERVAL_SEC: float = 60.0
+_source_decision: tuple[float, str] | None = None
+
+
+def _packet_source(cursor: sqlite3.Cursor) -> str:
+    """Packet table serving analytics reads: lean projection when available.
+
+    ``packet_observations`` is 1:1 with packet_history (one row per
+    reception, same timestamps and filter columns) but carries no protobuf
+    BLOB payloads, so window scans over it are several times cheaper. Web
+    instances never populate it themselves — capture, the import container
+    or the backfill tool writes it — so readers fall back to packet_history
+    whenever the projection is absent or still empty. Coverage of
+    packet_history is deliberately not checked: any gap is pre-projection
+    history, and gating on coverage would pin analytics to the slow raw
+    scans until the gap ages out of retention.
+    """
+    global _source_decision
+
+    now_ts = time.time()
+    decision = _source_decision
+    if decision is not None and now_ts - decision[0] < _SOURCE_CHECK_INTERVAL_SEC:
+        return decision[1]
+
+    table = (
+        "packet_observations"
+        if derived_table_populated(cursor, "packet_observations")
+        else "packet_history"
+    )
+
+    _source_decision = (now_ts, table)
+    return table
+
+
+def _gateway_present_sql(source: str) -> str:
+    """Predicate matching rows that carry a gateway id on *source*.
+
+    packet_history keeps missing gateways as SQL NULL, while the
+    packet_observations projection normalizes them to '' (NOT NULL column).
+    """
+    if source == "packet_observations":
+        return "gateway_id != ''"
+    return "gateway_id IS NOT NULL"
+
+
 class AnalyticsService:
     """Service for analytics and statistical calculations."""
 
-    # (gateway_id, from_node, hop_count) → (timestamp, data)
+    # (gateway_id, from_node, hop_count) → (computed_at, data)
     _CACHE: dict[
         tuple[str | None, int | None, int | None], tuple[float, dict[str, Any]]
     ] = {}
-    _CACHE_TTL_SEC: int = 60  # one minute cache window
+    _CACHE_TTL_SEC: int = 60  # serve-freshness window (activity-timeline cache)
 
-    @staticmethod
+    # The dashboard analytics payload is expensive to compute (a full pass
+    # over every 24h/7d window). Instead of recomputing inside a request
+    # whenever the 60s TTL lapses — every visitor arriving more than a
+    # minute after the previous one paid the whole compute — a background
+    # refresher thread keeps cached entries warm. Requests are served from
+    # the cache whenever an entry exists and is younger than _MAX_STALE_SEC;
+    # a request only ever computes inline for a never-seen filter
+    # combination or when the refresher has demonstrably died.
+    _REFRESH_INTERVAL_SEC: float = 60.0
+    _MAX_STALE_SEC: float = 300.0
+
+    # Filter combinations are refreshed only while they are being served;
+    # idle ones are evicted so refresher work tracks actual usage.
+    _KEY_IDLE_SEC: float = 900.0
+    _LAST_ACCESS: dict[tuple[str | None, int | None, int | None], float] = {}
+
+    _DEFAULT_CACHE_KEY: tuple[None, None, None] = (None, None, None)
+
+    _refresher_thread: threading.Thread | None = None
+    _refresher_lock = threading.Lock()
+    _refresher_stop = threading.Event()
+
+    @classmethod
     def get_analytics_data(
+        cls,
         gateway_id: str | None = None,
         from_node: int | None = None,
         hop_count: int | None = None,
     ) -> dict[str, Any]:
-        """Get comprehensive analytics data for the dashboard with simple in-memory caching."""
+        """Get comprehensive analytics data for the dashboard.
+
+        Served from the in-process cache whenever an entry exists and is
+        fresher than ``_MAX_STALE_SEC``; the background refresher keeps
+        entries warm so requests never sit inside a compute window. Only a
+        never-cached filter combination (or a dead refresher) computes
+        inline.
+        """
+        # Fork safety: after gunicorn preload forks workers, the inherited
+        # thread object is dead but the flag still says "started" — the
+        # aliveness check below recovers by starting a fresh thread.
+        cls._ensure_background_refresh()
 
         cache_key = (gateway_id, from_node, hop_count)
         now_ts = time.time()
 
-        # Return cached value if still valid
-        cached = AnalyticsService._CACHE.get(cache_key)
-        if cached and (now_ts - cached[0] < AnalyticsService._CACHE_TTL_SEC):
+        cached = cls._CACHE.get(cache_key)
+        if cached and (now_ts - cached[0] < cls._MAX_STALE_SEC):
+            cls._LAST_ACCESS[cache_key] = now_ts
             return cached[1]
 
         logger.info(
@@ -52,61 +136,158 @@ class AnalyticsService:
         )
 
         try:
-            # Build filters object
-            filters: dict[str, Any] = {}
-            if gateway_id:
-                filters["gateway_id"] = gateway_id
-            if from_node:
-                filters["from_node"] = from_node
-            if hop_count is not None:
-                filters["hop_count"] = hop_count
-
-            twenty_four_hours_ago = now_ts - 24 * 3600
-            seven_days_ago = now_ts - 7 * 24 * 3600
-
-            packet_stats = AnalyticsService._get_packet_statistics(
-                filters, twenty_four_hours_ago
-            )
-            node_stats = AnalyticsService._get_node_activity_statistics(
-                filters, twenty_four_hours_ago, seven_days_ago
-            )
-            signal_stats = AnalyticsService._get_signal_quality_statistics(
-                filters, twenty_four_hours_ago
-            )
-            temporal_stats = AnalyticsService._get_temporal_patterns(
-                filters, twenty_four_hours_ago
-            )
-            top_nodes = AnalyticsService._get_top_active_nodes(filters, seven_days_ago)
-            packet_types = AnalyticsService._get_packet_type_distribution(
-                filters, twenty_four_hours_ago
-            )
-            gateway_stats = AnalyticsService._get_gateway_distribution(
-                filters, twenty_four_hours_ago
-            )
-            hop_distribution = AnalyticsService._get_hop_distribution(
-                filters, twenty_four_hours_ago
-            )
-
-            result = {
-                "packet_statistics": packet_stats,
-                "node_statistics": node_stats,
-                "signal_quality": signal_stats,
-                "temporal_patterns": temporal_stats,
-                "top_nodes": top_nodes,
-                "packet_types": packet_types,
-                "gateway_distribution": gateway_stats,
-                "hop_distribution": hop_distribution,
-            }
-
-            # Save to cache
-            AnalyticsService._CACHE[cache_key] = (now_ts, result)
-
-            logger.info("Analytics data computed successfully (cached)")
+            result = cls._compute_analytics_data(gateway_id, from_node, hop_count)
+            cls._CACHE[cache_key] = (time.time(), result)
+            cls._LAST_ACCESS[cache_key] = time.time()
             return result
-
         except Exception as e:
             logger.error(f"Error getting analytics data: {e}")
             raise
+
+    @staticmethod
+    def _compute_analytics_data(
+        gateway_id: str | None = None,
+        from_node: int | None = None,
+        hop_count: int | None = None,
+    ) -> dict[str, Any]:
+        """Compute the full analytics payload from the database (no caching)."""
+        now_ts = time.time()
+
+        # Build filters object
+        filters: dict[str, Any] = {}
+        if gateway_id:
+            filters["gateway_id"] = gateway_id
+        if from_node:
+            filters["from_node"] = from_node
+        if hop_count is not None:
+            filters["hop_count"] = hop_count
+
+        twenty_four_hours_ago = now_ts - 24 * 3600
+        seven_days_ago = now_ts - 7 * 24 * 3600
+
+        packet_stats = AnalyticsService._get_packet_statistics(
+            filters, twenty_four_hours_ago
+        )
+        node_stats = AnalyticsService._get_node_activity_statistics(
+            filters, twenty_four_hours_ago, seven_days_ago
+        )
+        signal_stats = AnalyticsService._get_signal_quality_statistics(
+            filters, twenty_four_hours_ago
+        )
+        temporal_stats = AnalyticsService._get_temporal_patterns(
+            filters, twenty_four_hours_ago
+        )
+        top_nodes = AnalyticsService._get_top_active_nodes(filters, seven_days_ago)
+        packet_types = AnalyticsService._get_packet_type_distribution(
+            filters, twenty_four_hours_ago
+        )
+        gateway_stats = AnalyticsService._get_gateway_distribution(
+            filters, twenty_four_hours_ago
+        )
+        hop_distribution = AnalyticsService._get_hop_distribution(
+            filters, twenty_four_hours_ago
+        )
+
+        return {
+            "packet_statistics": packet_stats,
+            "node_statistics": node_stats,
+            "signal_quality": signal_stats,
+            "temporal_patterns": temporal_stats,
+            "top_nodes": top_nodes,
+            "packet_types": packet_types,
+            "gateway_distribution": gateway_stats,
+            "hop_distribution": hop_distribution,
+        }
+
+    # ------------------------------------------------------------------
+    # Background cache refresher
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def _ensure_background_refresh(cls) -> None:
+        """Start the refresher thread exactly once per process.
+
+        Idempotent and fork-safe: a stale (dead) thread handle — e.g.
+        inherited from a gunicorn preload master — is replaced with a fresh
+        thread and a fresh stop event (the old event's internal lock may be
+        stranded by a fork and must not be reused).
+        """
+        thread = cls._refresher_thread
+        if thread is not None and thread.is_alive():
+            return
+        with cls._refresher_lock:
+            thread = cls._refresher_thread
+            if thread is not None and thread.is_alive():
+                return
+            cls._refresher_stop = threading.Event()
+            cls._refresher_thread = threading.Thread(
+                target=cls._refresh_worker,
+                name="analytics-cache-refresher",
+                daemon=True,
+            )
+            cls._refresher_thread.start()
+
+    @classmethod
+    def start_background_refresh(cls) -> None:
+        """Warm the default cache entry now and keep entries fresh.
+
+        The first refresher cycle runs immediately, so calling this at
+        process startup means the unfiltered dashboard payload is ready
+        before the first visitor arrives.
+        """
+        cls._ensure_background_refresh()
+
+    @classmethod
+    def stop_background_refresh(cls) -> None:
+        """Stop the refresher thread (tests, graceful shutdown)."""
+        cls._refresher_stop.set()
+        thread = cls._refresher_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=2.0)
+
+    @classmethod
+    def _refresh_worker(cls) -> None:
+        """Warm immediately, then recompute active keys once per interval."""
+        while True:
+            try:
+                cls._refresh_active_keys()
+            except Exception:
+                logger.exception("Analytics cache refresh cycle failed")
+            if cls._refresher_stop.wait(cls._REFRESH_INTERVAL_SEC):
+                return
+
+    @classmethod
+    def _refresh_active_keys(cls) -> None:
+        """Recompute recently served cache entries; evict idle ones.
+
+        The default (unfiltered) key is always refreshed so the next
+        visitor finds it warm even after a long idle period.
+        """
+        now_ts = time.time()
+        keys = {cls._DEFAULT_CACHE_KEY}
+        for key, last_hit in list(cls._LAST_ACCESS.items()):
+            if now_ts - last_hit <= cls._KEY_IDLE_SEC:
+                keys.add(key)
+            else:
+                # Idle filter combination: stop refreshing and evict.
+                cls._CACHE.pop(key, None)
+                cls._LAST_ACCESS.pop(key, None)
+
+        for gateway_id, from_node, hop_count in keys:
+            try:
+                result = cls._compute_analytics_data(
+                    gateway_id, from_node, hop_count
+                )
+            except Exception:
+                logger.exception(
+                    "Analytics cache refresh failed for gateway_id=%s, "
+                    "from_node=%s, hop_count=%s",
+                    gateway_id,
+                    from_node,
+                    hop_count,
+                )
+                continue
+            cls._CACHE[(gateway_id, from_node, hop_count)] = (time.time(), result)
 
     @staticmethod
     def _get_packet_statistics(filters: dict, since_timestamp: float) -> dict[str, Any]:
@@ -131,17 +312,17 @@ class AnalyticsService:
 
         where_clause = " AND ".join(where_conditions)
 
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        source = _packet_source(cursor)
         query = f"""
             SELECT
                 COUNT(*) as total_packets,
                 SUM(CASE WHEN processed_successfully = 1 THEN 1 ELSE 0 END) as successful_packets,
                 AVG(CASE WHEN payload_length IS NOT NULL AND payload_length > 0 THEN payload_length END) as avg_payload_size
-            FROM packet_history
+            FROM {source}
             WHERE {where_clause}
         """
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
         cursor.execute(query, params)
         row = cursor.fetchone()
         conn.close()
@@ -181,13 +362,14 @@ class AnalyticsService:
         where_clause = " AND ".join(where_conditions)
 
         # Get node activity distribution using SQL aggregation
+        source = _packet_source(cursor)
         cursor.execute(
             f"""
             WITH node_activity AS (
                 SELECT
                     from_node_id,
                     COUNT(*) as packet_count
-                FROM packet_history
+                FROM {source}
                 WHERE from_node_id IS NOT NULL AND {where_clause}
                 GROUP BY from_node_id
             )
@@ -215,7 +397,7 @@ class AnalyticsService:
         cursor.execute(
             f"""
             SELECT COUNT(DISTINCT from_node_id) as nodes_seen_7d
-            FROM packet_history
+            FROM {source}
             WHERE timestamp >= ? AND from_node_id IS NOT NULL{seen_filter}
         """,
             seen_params,
@@ -268,6 +450,7 @@ class AnalyticsService:
 
         conn = get_db_connection()
         cursor = conn.cursor()
+        source = _packet_source(cursor)
 
         # Get signal statistics using SQL aggregation. Every branch restricts
         # itself to plausible values: without the guard a single garbage row
@@ -295,7 +478,7 @@ class AnalyticsService:
                 -- otherwise pile a fake spike at 0 in the histogram panel.
                 AVG(CASE WHEN {snr_valid_sql()} AND {rssi_valid_sql()}
                     THEN snr END) as rf_avg_snr
-            FROM packet_history
+            FROM {source}
             WHERE {where_clause}
         """,
             params,
@@ -323,7 +506,7 @@ class AnalyticsService:
             f"""
             SELECT MIN(MAX(CAST((rssi + 150) / 5 AS INTEGER), ?), ?) AS bin,
                    COUNT(*) AS count
-            FROM packet_history
+            FROM {source}
             WHERE {where_clause} AND {rssi_valid_sql()}
             GROUP BY bin
             """,
@@ -336,7 +519,7 @@ class AnalyticsService:
         cursor.execute(
             f"""
             SELECT CAST((snr + 30.0) / 2 AS INTEGER) AS bin, COUNT(*) AS count
-            FROM packet_history
+            FROM {source}
             WHERE {where_clause} AND {snr_valid_sql()} AND {rssi_valid_sql()}
             GROUP BY bin
             """,
@@ -442,18 +625,18 @@ class AnalyticsService:
 
         where_clause = " AND ".join(where_conditions)
 
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        source = _packet_source(cursor)
         query = f"""
             SELECT
                 strftime('%H', datetime(timestamp, 'unixepoch')) AS hour,
                 COUNT(*) AS total_packets,
                 SUM(CASE WHEN processed_successfully = 1 THEN 1 ELSE 0 END) AS successful_packets
-            FROM packet_history
+            FROM {source}
             WHERE {where_clause}
             GROUP BY hour
         """
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
         cursor.execute(query, params)
 
         rows = cursor.fetchall()
@@ -594,13 +777,14 @@ class AnalyticsService:
         conn = get_db_connection()
         try:
             cursor = conn.cursor()
+            source = _packet_source(cursor)
             cursor.execute(
-                """
+                f"""
                 SELECT
                     strftime('%Y-%m-%d %H:00', timestamp + ?, 'unixepoch') AS bucket,
                     COUNT(*) AS total_packets,
                     COUNT(DISTINCT from_node_id) AS active_nodes
-                FROM packet_history
+                FROM {source}
                 WHERE timestamp >= ?
                 GROUP BY bucket
             """,
@@ -613,12 +797,12 @@ class AnalyticsService:
                     entry["active_nodes"] = row["active_nodes"]
 
             cursor.execute(
-                """
+                f"""
                 SELECT
                     strftime('%Y-%m-%d %H:00', timestamp + ?, 'unixepoch') AS bucket,
                     COUNT(DISTINCT gateway_id) AS gateway_count
-                FROM packet_history
-                WHERE gateway_id IS NOT NULL AND timestamp >= ?
+                FROM {source}
+                WHERE {_gateway_present_sql(source)} AND timestamp >= ?
                 GROUP BY bucket
             """,
                 (offset_sec, start_utc),
@@ -678,7 +862,9 @@ class AnalyticsService:
             elif range_key == "30d":
                 start_local = today_local - 30 * 86400
             else:  # all: from the local day of the first recorded packet
-                cursor.execute("SELECT MIN(timestamp) AS mn FROM packet_history")
+                cursor.execute(
+                    f"SELECT MIN(timestamp) AS mn FROM {_packet_source(cursor)}"
+                )
                 row = cursor.fetchone()
                 mn = row["mn"] if row else None
                 start_local = (
@@ -819,17 +1005,18 @@ class AnalyticsService:
         end_utc = span_end_local - offset_sec
 
         stats: dict[str, dict[str, Any]] = {}
+        source = _packet_source(cursor)
 
         def entry(day: str) -> dict[str, Any]:
             return stats.setdefault(day, {})
 
         cursor.execute(
-            """
+            f"""
             SELECT
                 date(timestamp + ?, 'unixepoch') AS day,
                 COUNT(*) AS total_packets,
                 COUNT(DISTINCT from_node_id) AS active_nodes
-            FROM packet_history
+            FROM {source}
             WHERE timestamp >= ? AND timestamp < ?
             GROUP BY day
         """,
@@ -841,12 +1028,12 @@ class AnalyticsService:
             )
 
         cursor.execute(
-            """
+            f"""
             SELECT
                 date(timestamp + ?, 'unixepoch') AS day,
                 COUNT(DISTINCT gateway_id) AS gateway_count
-            FROM packet_history
-            WHERE gateway_id IS NOT NULL AND timestamp >= ? AND timestamp < ?
+            FROM {source}
+            WHERE {_gateway_present_sql(source)} AND timestamp >= ? AND timestamp < ?
             GROUP BY day
         """,
             (offset_sec, start_utc, end_utc),
@@ -899,12 +1086,13 @@ class AnalyticsService:
 
         conn = get_db_connection()
         cursor = conn.cursor()
+        source = _packet_source(cursor)
         cursor.execute(
             f"""
             SELECT
                 (hop_start - hop_limit) AS hops,
                 COUNT(*) AS count
-            FROM packet_history
+            FROM {source}
             WHERE {where_clause}
             GROUP BY hops
             ORDER BY hops
@@ -969,6 +1157,7 @@ class AnalyticsService:
 
         conn = get_db_connection()
         cursor = conn.cursor()
+        source = _packet_source(cursor)
 
         # Get packet type distribution with percentages
         cursor.execute(
@@ -977,7 +1166,7 @@ class AnalyticsService:
                 SELECT
                     portnum_name,
                     COUNT(*) as count
-                FROM packet_history
+                FROM {source}
                 WHERE {where_clause}
                 GROUP BY portnum_name
             ),
@@ -1019,16 +1208,19 @@ class AnalyticsService:
 
         conn = get_db_connection()
         cursor = conn.cursor()
+        source = _packet_source(cursor)
 
-        # Get gateway distribution with percentages
+        # Get gateway distribution with percentages. NULLIF folds the empty
+        # gateway ('' in packet_observations) in with SQL NULL so both
+        # representations of "no gateway" group under 'Unknown'.
         cursor.execute(
             f"""
             WITH gateway_stats AS (
                 SELECT
-                    COALESCE(gateway_id, 'Unknown') as gateway_id,
+                    COALESCE(NULLIF(gateway_id, ''), 'Unknown') as gateway_id,
                     COUNT(*) as total_packets,
                     SUM(CASE WHEN processed_successfully = 1 THEN 1 ELSE 0 END) as successful_packets
-                FROM packet_history
+                FROM {source}
                 WHERE {where_clause}
                 GROUP BY gateway_id
             ),
