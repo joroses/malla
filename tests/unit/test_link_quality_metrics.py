@@ -18,6 +18,12 @@ import pytest
 from flask import Flask
 
 from malla.config import _clear_config_cache
+from malla.database.materialization_schema import ensure_materialization_schema
+from malla.database.materializations import (
+    clear_materialization_cache,
+    materialization_tx_scope,
+    materialize_packet,
+)
 from malla.database.traceroute_read_repository import (
     get_traceroute_hops_for_graph,
     get_traceroute_link,
@@ -51,8 +57,10 @@ def _isolated_config(monkeypatch, tmp_path):
     for var in ("MALLA_LORA_PRESET", "MALLA_LORA_SPREADING_FACTOR"):
         monkeypatch.delenv(var, raising=False)
     _clear_config_cache()
+    clear_materialization_cache()
     yield
     _clear_config_cache()
+    clear_materialization_cache()
 
 
 class _NonClosingConnection:
@@ -562,7 +570,12 @@ class TestTracerouteLinksPassThrough:
 
 
 class TestPacketLinksMetrics:
-    """Packet-based RF links expose the same metrics with channel resolution."""
+    """Packet-based RF links expose the same metrics with channel resolution.
+
+    Receptions are projected into packet_observations at insert time (the
+    same writer live capture uses), so these tests exercise the
+    materialized read path.
+    """
 
     def _database(self):
         conn = sqlite3.connect(":memory:")
@@ -573,6 +586,9 @@ class TestPacketLinksMetrics:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp REAL NOT NULL,
                 from_node_id INTEGER,
+                to_node_id INTEGER,
+                portnum INTEGER,
+                portnum_name TEXT,
                 gateway_id TEXT,
                 channel_id TEXT,
                 mesh_packet_id INTEGER,
@@ -583,13 +599,25 @@ class TestPacketLinksMetrics:
             )
             """
         )
+        ensure_materialization_schema(conn.cursor())
+        conn.commit()
         return conn
 
     @staticmethod
+    def _materialize(conn, packet_id):
+        packet = dict(
+            conn.execute(
+                "SELECT * FROM packet_history WHERE id = ?", (packet_id,)
+            ).fetchone()
+        )
+        with materialization_tx_scope(), conn:
+            materialize_packet(conn.cursor(), packet)
+
+    @classmethod
     def _insert(
-        conn, timestamp, from_node, gateway_hex, rssi, snr, channel=None, mesh_packet_id=None
+        cls, conn, timestamp, from_node, gateway_hex, rssi, snr, channel=None, mesh_packet_id=None
     ):
-        conn.execute(
+        cur = conn.execute(
             """
             INSERT INTO packet_history (
                 timestamp, from_node_id, gateway_id, channel_id, mesh_packet_id,
@@ -598,6 +626,7 @@ class TestPacketLinksMetrics:
             """,
             (timestamp, from_node, gateway_hex, channel, mesh_packet_id, rssi, snr),
         )
+        cls._materialize(conn, cur.lastrowid)
 
     def _packet_links(self, conn):
         _PACKET_LINKS_CACHE.clear()
@@ -659,7 +688,7 @@ class TestPacketLinksMetrics:
                 """,
                 (row_id, ts, channel),
             )
-        conn.commit()
+            self._materialize(conn, row_id)
 
         link = self._packet_links(conn)[0]
         assert link["last_packet_id"] == 400
@@ -677,6 +706,32 @@ class TestPacketLinksMetrics:
         link = self._packet_links(conn)[0]
         assert link["channel_id"] == "SFNarrow"
         assert link["forward_count"] == 2
+
+    def test_self_receptions_excluded_before_aggregation(self):
+        conn = self._database()
+        # The gateway's own transmissions (node 200 -> !000000c8, including
+        # an uppercase alias) dominate the receptions but must never form a
+        # self-link nor leak into the directional statistics of 100 -> 200.
+        self._insert(conn, 1000.0, 200, "!000000c8", -40.0, 20.0, "LongFast")
+        self._insert(conn, 1001.0, 200, "!000000C8", -40.0, 20.0, "LongFast")
+        self._insert(conn, 1002.0, 100, "!000000c8", -60.0, -8.0, "SFNarrow")
+        self._insert(conn, 1003.0, 100, "!000000c8", -60.0, -12.0, "SFNarrow")
+        conn.commit()
+
+        links = self._packet_links(conn)
+
+        assert len(links) == 1
+        link = links[0]
+        assert (link["from_node_id"], link["to_node_id"]) == (100, 200)
+        assert link["forward_count"] == 2
+        assert link["return_count"] == 0
+        assert link["forward_avg_snr"] == -10.0  # (-8 + -12) / 2
+        assert link["forward_avg_rssi"] == -60.0
+        assert link["observation_count"] == 2
+        # The newest surviving reception (1003.0, packet id 4) represents
+        # the link: self-receptions must not win by recency either.
+        assert link["last_packet_id"] == 4
+        assert link["channel_id"] == "SFNarrow"
 
     def test_width_scales_with_observations_not_snr(self):
         conn = self._database()
@@ -753,6 +808,47 @@ class TestPacketLinksMetrics:
         # SNR average: (-7.4 + -15.2) / 2 = -11.3 dB (not raw -10.0 dB).
         assert link["forward_avg_snr"] == -11.3
         assert link["avg_snr"] == -11.3
+
+    def test_legacy_fallback_matches_materialized_result(self):
+        conn = self._database()
+        # Canonical forward 100 -> 200 and return 200 -> 100, plus a relayed
+        # (non-direct) reception that both paths must exclude.
+        self._insert(conn, 1000.0, 100, "!000000c8", -60.0, -8.0, "LongFast")
+        self._insert(conn, 1001.0, 100, "!000000c8", -60.0, -12.0, "LongFast", mesh_packet_id=77)
+        self._insert(conn, 1002.0, 100, "!000000c8", -60.0, -10.0, "LongFast", mesh_packet_id=77)
+        self._insert(conn, 1003.0, 200, "!00000064", -90.0, -5.0, "SFNarrow")
+        conn.execute(
+            """
+            INSERT INTO packet_history (
+                timestamp, from_node_id, gateway_id, channel_id,
+                hop_start, hop_limit, rssi, snr
+            ) VALUES (1004.0, 300, '!00000190', 'LongFast', 3, 1, -70.0, -6.0)
+            """
+        )
+        conn.commit()
+
+        materialized = self._packet_links(conn)
+
+        # Drop the projection so the reader falls back to the legacy
+        # packet_history scan over the identical raw rows.
+        conn.execute("DROP TABLE packet_observations")
+        conn.commit()
+        legacy = self._packet_links(conn)
+
+        assert len(materialized) == 1  # relayed reception excluded
+        assert legacy, "legacy fallback produced no links"
+
+        def comparable(links):
+            return {
+                (link["from_node_id"], link["to_node_id"]): {
+                    key: value
+                    for key, value in link.items()
+                    if key != "age_hours"
+                }
+                for link in links
+            }
+
+        assert comparable(materialized) == comparable(legacy)
 
 
 class TestHopQueryChannelSelection:
@@ -1079,19 +1175,22 @@ class TestConsumerParity:
             _NETWORK_GRAPH_CACHE.clear()
         graph_link = graph["links"][0]
 
-        # Packet links with the same aggregates.
+        # Packet links with the same aggregates (materialized path).
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
         conn.execute(
             """
             CREATE TABLE packet_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL NOT NULL, from_node_id INTEGER, gateway_id TEXT,
-                channel_id TEXT, hop_start INTEGER, hop_limit INTEGER,
-                rssi REAL, snr REAL
+                timestamp REAL NOT NULL, from_node_id INTEGER, to_node_id INTEGER,
+                portnum INTEGER, portnum_name TEXT, gateway_id TEXT,
+                channel_id TEXT, mesh_packet_id INTEGER, hop_start INTEGER,
+                hop_limit INTEGER, rssi REAL, snr REAL
             )
             """
         )
+        ensure_materialization_schema(conn.cursor())
+        conn.commit()
         packet_rows = [
             (1000.0, 100, "!000000c8", channel, -60.0, -8.0),
             (1001.0, 100, "!000000c8", channel, -60.0, -10.0),
@@ -1099,15 +1198,23 @@ class TestConsumerParity:
             (1003.0, 200, "!00000064", channel, -90.0, -5.0),
             (1004.0, 200, "!00000064", channel, -90.0, -7.0),
         ]
-        conn.executemany(
-            """
-            INSERT INTO packet_history (
-                timestamp, from_node_id, gateway_id, channel_id,
-                hop_start, hop_limit, rssi, snr
-            ) VALUES (?, ?, ?, ?, 3, 3, ?, ?)
-            """,
-            packet_rows,
-        )
+        for timestamp, from_node, gateway, chan, rssi, snr in packet_rows:
+            cur = conn.execute(
+                """
+                INSERT INTO packet_history (
+                    timestamp, from_node_id, gateway_id, channel_id,
+                    hop_start, hop_limit, rssi, snr
+                ) VALUES (?, ?, ?, ?, 3, 3, ?, ?)
+                """,
+                (timestamp, from_node, gateway, chan, rssi, snr),
+            )
+            packet = dict(
+                conn.execute(
+                    "SELECT * FROM packet_history WHERE id = ?", (cur.lastrowid,)
+                ).fetchone()
+            )
+            with materialization_tx_scope(), conn:
+                materialize_packet(conn.cursor(), packet)
         conn.commit()
         _PACKET_LINKS_CACHE.clear()
         try:

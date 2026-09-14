@@ -933,6 +933,11 @@ class LocationService:
         real RF coverage between neighbouring radios – the same definition that is
         used for the "Direct Receptions" feature on the node detail page.
 
+        Reads the pre-aggregated ``packet_observations`` projection when it is
+        populated (written at capture time / by the backfill tool), falling back
+        to the raw ``packet_history`` scan otherwise; both sources produce the
+        same row shape and merge semantics.
+
         The returned schema matches that of ``get_traceroute_links`` so that the
         front-end can consume both interchangeably.
 
@@ -967,18 +972,16 @@ class LocationService:
             from datetime import datetime
 
             from ..database.connection import get_db_connection
+            from ..database.repositories import derived_table_populated
 
             conn = get_db_connection()
             cursor = conn.cursor()
 
             # ------------------------------------------------------------------
-            # Build WHERE clause based on provided filters.
+            # Build the shared WHERE additions (time range, optional gateway
+            # filter) applied to whichever source table serves the query.
             # ------------------------------------------------------------------
-            where_clauses: list[str] = [
-                "from_node_id IS NOT NULL",
-                "gateway_id IS NOT NULL",
-                "hop_start = hop_limit",  # 0-hop packets only (index-friendly)
-            ]
+            where_clauses: list[str] = []
             params: list[Any] = []
 
             # Time range – same handling as get_node_locations / get_traceroute_links
@@ -1002,24 +1005,81 @@ class LocationService:
                 where_clauses.append("gateway_id = ?")
                 params.append(gw_hex)
 
-            where_sql = "WHERE " + " AND ".join(where_clauses)
+            filter_sql = ("AND " + " AND ".join(where_clauses)) if where_clauses else ""
 
-            # Check if mesh_packet_id column is present in packet_history to
-            # safely support in-memory test databases or older schemas.
-            cursor.execute("PRAGMA table_info(packet_history)")
-            ph_columns = {r[1] for r in cursor.fetchall()}
-            tx_id_expr = (
-                "COALESCE(NULLIF(mesh_packet_id, 0), -id)"
-                if "mesh_packet_id" in ph_columns
-                else "-id"
-            )
+            # Pre-materialized receptions keep every filter column (timestamp,
+            # rssi, snr, channel, direct flag) with exact fidelity while
+            # skipping the wide raw-payload scan of packet_history.
+            #
+            # Self-receptions (gateway hearing its own transmissions) are the
+            # dominant share of direct receptions and are dropped in Python
+            # after the aggregation; excluding them here keeps them out of the
+            # window sorts entirely.  ``gateway_id`` is '!<8-hex>'; compare
+            # case-insensitively against the canonical rendering of the
+            # transmitter id.  The Python-side guard below still catches
+            # non-canonical spellings (unpadded hex etc.).
+            #
+            # The always-true ``timestamp > 0`` gives the planner a range on
+            # the time-leading covering index idx_pobs_link_time, so it is
+            # chosen even for unbounded windows where its first real filter
+            # column would otherwise carry no constraint.
+            if derived_table_populated(cursor, "packet_observations"):
+                logger.debug(
+                    "get_packet_links: reading materialized packet_observations"
+                )
+                source_sql = f"""
+                    SELECT
+                        from_node_id,
+                        gateway_id,
+                        tx_id,
+                        packet_id,
+                        timestamp,
+                        channel_id,
+                        snr,
+                        rssi
+                    FROM packet_observations
+                    WHERE is_direct = 1
+                      AND from_node_id IS NOT NULL
+                      AND gateway_id != ''
+                      AND lower(gateway_id) != printf('!%08x', from_node_id)
+                      AND timestamp > 0
+                      {filter_sql}
+                """
+            else:
+                # Legacy fallback over raw receptions. Check if
+                # mesh_packet_id column is present in packet_history to
+                # safely support in-memory test databases or older schemas.
+                cursor.execute("PRAGMA table_info(packet_history)")
+                ph_columns = {r[1] for r in cursor.fetchall()}
+                tx_id_expr = (
+                    "COALESCE(NULLIF(mesh_packet_id, 0), -id)"
+                    if "mesh_packet_id" in ph_columns
+                    else "-id"
+                )
+                source_sql = f"""
+                    SELECT
+                        from_node_id,
+                        gateway_id,
+                        {tx_id_expr} AS tx_id,
+                        id AS packet_id,
+                        timestamp,
+                        channel_id,
+                        snr,
+                        rssi
+                    FROM packet_history
+                    WHERE from_node_id IS NOT NULL
+                      AND gateway_id IS NOT NULL
+                      AND hop_start = hop_limit  -- 0-hop packets only
+                      AND lower(gateway_id) != printf('!%08x', from_node_id)
+                      {filter_sql}
+                """
 
             # Representative metadata (last_seen, latest_packet_id, channel_id)
             # must describe one and the same reception. Bare columns next to
             # aggregates are only pinned to the min/max row by SQLite when the
             # query has exactly one min()/max() aggregate, so the representative
             # is selected explicitly with ROW_NUMBER: latest reception per
-            # transmission by (timestamp DESC, id DESC), then latest
+            # transmission by (timestamp DESC, packet_id DESC), then latest
             # transmission per gateway by (last_seen DESC, latest_packet_id
             # DESC). Every projected column is an aggregate.
             query = f"""
@@ -1027,18 +1087,17 @@ class LocationService:
                     SELECT
                         from_node_id,
                         gateway_id,
-                        {tx_id_expr} AS tx_id,
-                        id,
+                        tx_id,
+                        packet_id,
                         timestamp,
                         channel_id,
                         snr,
                         rssi,
                         ROW_NUMBER() OVER (
-                            PARTITION BY from_node_id, gateway_id, {tx_id_expr}
-                            ORDER BY timestamp DESC, id DESC
+                            PARTITION BY from_node_id, gateway_id, tx_id
+                            ORDER BY timestamp DESC, packet_id DESC
                         ) AS tx_rn
-                    FROM packet_history
-                    {where_sql}
+                    FROM ({source_sql})
                 ),
                 transmissions AS (
                     SELECT
@@ -1049,7 +1108,7 @@ class LocationService:
                         MAX(CASE WHEN {snr_valid_sql()} THEN 1 ELSE 0 END) AS has_valid_snr,
                         AVG(CASE WHEN {rssi_valid_sql()} THEN rssi END) AS rssi,
                         MAX(CASE WHEN {rssi_valid_sql()} THEN 1 ELSE 0 END) AS has_valid_rssi,
-                        MAX(CASE WHEN tx_rn = 1 THEN id END) AS latest_packet_id,
+                        MAX(CASE WHEN tx_rn = 1 THEN packet_id END) AS latest_packet_id,
                         MAX(CASE WHEN tx_rn = 1 THEN timestamp END) AS last_seen,
                         MAX(CASE WHEN tx_rn = 1 THEN channel_id END) AS channel_id
                     FROM receptions

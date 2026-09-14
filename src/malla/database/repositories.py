@@ -5,6 +5,8 @@ This module provides data access layer with business logic for different entitie
 """
 
 import logging
+import math
+import sqlite3
 import time
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -3628,6 +3630,48 @@ def derived_table_populated(cursor: sqlite3.Cursor, table: str) -> bool:
     return cursor.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone() is not None
 
 
+# Mapping from Meshtastic position precision_bits to meters, from
+# https://meshtastic.org/docs/configuration/radio/channels/#position-precision
+_PRECISION_BITS_METERS = {
+    10: 23300,  # 23.3 km
+    11: 11700,  # 11.7 km
+    12: 5800,  # 5.8 km
+    13: 2900,  # 2.9 km
+    14: 1500,  # 1.5 km
+    15: 729,  # 729 m
+    16: 364,  # 364 m
+    17: 182,  # 182 m
+    18: 91,  # 91 m
+    19: 45,  # 45 m
+}
+
+
+def precision_meters_from_bits(precision_bits: int | None) -> float | None:
+    """Approximate horizontal precision in meters for precision_bits."""
+    if precision_bits is None or precision_bits <= 0:
+        return None
+
+    if precision_bits >= 32:
+        return 1.0  # Full precision
+    if precision_bits in _PRECISION_BITS_METERS:
+        return float(_PRECISION_BITS_METERS[precision_bits])
+    if precision_bits < 10:
+        return 50000.0  # Very low precision
+    if precision_bits > 19:
+        # Extrapolate for high precision (better than 45m): each additional
+        # bit roughly halves the precision.
+        return 45.0 / (2 ** (precision_bits - 19))
+
+    # Interpolate between known values in log space (precision roughly
+    # halves per bit).
+    lower_bits = max(b for b in _PRECISION_BITS_METERS if b < precision_bits)
+    upper_bits = min(b for b in _PRECISION_BITS_METERS if b > precision_bits)
+    log_lower = math.log(_PRECISION_BITS_METERS[lower_bits])
+    log_upper = math.log(_PRECISION_BITS_METERS[upper_bits])
+    ratio = (precision_bits - lower_bits) / (upper_bits - lower_bits)
+    return math.exp(log_lower + ratio * (log_upper - log_lower))
+
+
 class LocationRepository:
     """Repository for location operations."""
 
@@ -3659,9 +3703,9 @@ class LocationRepository:
             node_ids_filter = filters.get("node_ids") if filters else None
             node_ids_clause = ""
             node_ids_params: list[Any] = []
+            node_ids_int: list[int] = []
             if node_ids_filter:
                 # Ensure all IDs are ints
-                node_ids_int: list[int] = []
                 for nid in node_ids_filter:
                     if isinstance(nid, str):
                         if nid.startswith("!"):
@@ -3699,155 +3743,76 @@ class LocationRepository:
             if extra_conditions:
                 extra_where = "AND " + " AND ".join(extra_conditions)
 
-            # Optimized query using window function instead of correlated subquery.
-            # Ranks each node's recent position packets so the decode loop can
-            # skip invalid ones (null-island garbage) and fall back to the
-            # previous valid fix.
-            query = f"""
-                WITH ranked AS (
-                    SELECT
-                        ph.from_node_id,
-                        ph.timestamp,
-                        ph.raw_payload,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY ph.from_node_id
-                            ORDER BY ph.timestamp DESC
-                        ) AS rank
-                    FROM packet_history ph
-                    WHERE ph.portnum = 3  -- POSITION_APP
-                    AND ph.raw_payload IS NOT NULL
-                    AND ph.from_node_id IS NOT NULL
-                    {node_ids_clause}
-                    {extra_where}
-                )
-                SELECT
-                    r.from_node_id as node_id,
-                    r.timestamp,
-                    r.raw_payload,
-                    ni.long_name,
-                    ni.short_name,
-                    ni.hw_model,
-                    ni.role,
-                    ni.primary_channel,
-                    printf('!%08x', r.from_node_id) as hex_id
-                FROM ranked r
-                LEFT JOIN node_info ni ON r.from_node_id = ni.node_id
-                WHERE r.rank <= ?
-                ORDER BY r.timestamp DESC
-            """
-
             query_start = time.time()
-            cursor.execute(
-                query, [*node_ids_params, *extra_params, LocationRepository.POSITION_LOOKUP_DEPTH]
-            )
-            raw_rows = cursor.fetchall()
-            timing_breakdown["sql_query"] = time.time() - query_start
-
-            # Decode position data
-            decode_start = time.time()
-            locations = []
             decode_count = 0
             skip_count = 0
-            seen_nodes: set[int] = set()
 
-            for row in raw_rows:
-                try:
-                    # A newer row for this node was already accepted
-                    if row["node_id"] in seen_nodes:
-                        continue
+            if derived_table_populated(cursor, "node_positions"):
+                # Fixes are decoded and validated once at write time, so the
+                # latest valid fix per node is an indexed lookup — no
+                # protobuf decoding and no null-island fallback walk needed.
+                # ROW_NUMBER() would rank the entire fix history before the
+                # rank = 1 filter; probing each node separately with an
+                # indexed ORDER BY ... LIMIT 1 (idx_np_node_time) stops at
+                # that node's newest row instead of ranking every fix.
+                if node_ids_int:
+                    candidate_ids = node_ids_int
+                else:
+                    candidate_ids = [
+                        row[0]
+                        for row in cursor.execute(
+                            "SELECT DISTINCT node_id FROM node_positions"
+                        )
+                    ]
+                per_node_query = f"""
+                    SELECT
+                        np.node_id as node_id,
+                        np.timestamp,
+                        np.latitude,
+                        np.longitude,
+                        np.altitude,
+                        np.precision_bits,
+                        np.sats_in_view,
+                        ni.long_name,
+                        ni.short_name,
+                        ni.hw_model,
+                        ni.role,
+                        ni.primary_channel,
+                        printf('!%08x', np.node_id) as hex_id
+                    FROM node_positions np
+                    LEFT JOIN node_info ni ON np.node_id = ni.node_id
+                    WHERE np.node_id = ?
+                        {extra_where}
+                    ORDER BY np.timestamp DESC, np.packet_id DESC
+                    LIMIT 1
+                """
+                raw_rows = []
+                for node_id in candidate_ids:
+                    row = cursor.execute(
+                        per_node_query, [node_id, *extra_params]
+                    ).fetchone()
+                    if row is not None:
+                        raw_rows.append(row)
+                raw_rows.sort(key=lambda r: r["timestamp"], reverse=True)
+                timing_breakdown["sql_query"] = time.time() - query_start
+                processing_start = time.time()
 
-                    if not row["raw_payload"]:
-                        skip_count += 1
-                        continue
-
-                    # Decode position from raw protobuf payload
-                    position = mesh_pb2.Position()
-                    position.ParseFromString(row["raw_payload"])
-                    decode_count += 1
-
-                    # Extract coordinates (stored as integers, need to divide by 1e7)
-                    latitude = (
-                        position.latitude_i / 1e7 if position.latitude_i else None
-                    )
-                    longitude = (
-                        position.longitude_i / 1e7 if position.longitude_i else None
-                    )
-                    altitude = position.altitude if position.altitude else None
-
-                    # Extract precision and satellite information
-                    precision_bits = getattr(position, "precision_bits", None)
-                    sats_in_view = getattr(position, "sats_in_view", None)
-
-                    # Calculate precision in meters from precision_bits
-                    # Based on Meshtastic documentation: https://meshtastic.org/docs/configuration/radio/channels/#position-precision
-                    precision_meters = None
-                    if precision_bits is not None and precision_bits > 0:
-                        # Mapping from Meshtastic documentation
-                        precision_map = {
-                            10: 23300,  # 23.3 km
-                            11: 11700,  # 11.7 km
-                            12: 5800,  # 5.8 km
-                            13: 2900,  # 2.9 km
-                            14: 1500,  # 1.5 km
-                            15: 729,  # 729 m
-                            16: 364,  # 364 m
-                            17: 182,  # 182 m
-                            18: 91,  # 91 m
-                            19: 45,  # 45 m
-                        }
-
-                        if precision_bits >= 32:
-                            precision_meters = 1.0  # Full precision
-                        elif precision_bits in precision_map:
-                            precision_meters = float(precision_map[precision_bits])
-                        elif precision_bits < 10:
-                            precision_meters = 50000.0  # Very low precision
-                        elif precision_bits > 19:
-                            # Extrapolate for high precision (better than 45m)
-                            # Each additional bit roughly halves the precision
-                            base_precision = 45.0  # 19 bits = 45m
-                            additional_bits = precision_bits - 19
-                            precision_meters = base_precision / (2**additional_bits)
-                        else:
-                            # Interpolate between known values for bits between 10-19
-                            import math
-
-                            lower_bits = max(
-                                [b for b in precision_map.keys() if b < precision_bits]
-                            )
-                            upper_bits = min(
-                                [b for b in precision_map.keys() if b > precision_bits]
-                            )
-
-                            lower_precision = precision_map[lower_bits]
-                            upper_precision = precision_map[upper_bits]
-
-                            # Interpolate in log space (since precision roughly halves per bit)
-                            log_lower = math.log(lower_precision)
-                            log_upper = math.log(upper_precision)
-
-                            ratio = (precision_bits - lower_bits) / (
-                                upper_bits - lower_bits
-                            )
-                            log_result = log_lower + ratio * (log_upper - log_lower)
-
-                            precision_meters = math.exp(log_result)
-
-                    if not is_valid_position(latitude, longitude):
-                        skip_count += 1
+                locations = []
+                seen_nodes: set[int] = set()
+                for row in raw_rows:
+                    node_id = row["node_id"]
+                    if node_id in seen_nodes:
                         continue
 
                     display_name = (
                         row["long_name"]
                         or row["short_name"]
-                        or f"Node {row['node_id']:08x}"
+                        or f"Node {node_id:08x}"
                     )
-
-                    seen_nodes.add(row["node_id"])
-
+                    seen_nodes.add(node_id)
                     locations.append(
                         {
-                            "node_id": row["node_id"],
+                            "node_id": node_id,
                             "hex_id": row["hex_id"],
                             "display_name": display_name,
                             "long_name": row["long_name"],
@@ -3857,23 +3822,143 @@ class LocationRepository:
                             "primary_channel": row["primary_channel"]
                             if "primary_channel" in row.keys()
                             else None,
-                            "latitude": latitude,
-                            "longitude": longitude,
-                            "altitude": altitude,
+                            "latitude": row["latitude"],
+                            "longitude": row["longitude"],
+                            "altitude": row["altitude"],
                             "timestamp": row["timestamp"],
-                            "precision_bits": precision_bits,
-                            "precision_meters": precision_meters,
-                            "sats_in_view": sats_in_view,
+                            "precision_bits": row["precision_bits"],
+                            "precision_meters": precision_meters_from_bits(
+                                row["precision_bits"]
+                            ),
+                            "sats_in_view": row["sats_in_view"],
                         }
                     )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to parse location for node {row['node_id']}: {e}"
+            else:
+                # Legacy path: rank each node's recent position packets so the
+                # decode loop can skip invalid ones (null-island garbage) and
+                # fall back to the previous valid fix.
+                query = f"""
+                    WITH ranked AS (
+                        SELECT
+                            ph.from_node_id,
+                            ph.timestamp,
+                            ph.raw_payload,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY ph.from_node_id
+                                ORDER BY ph.timestamp DESC
+                            ) AS rank
+                        FROM packet_history ph
+                        WHERE ph.portnum = 3  -- POSITION_APP
+                        AND ph.raw_payload IS NOT NULL
+                        AND ph.from_node_id IS NOT NULL
+                        {node_ids_clause}
+                        {extra_where}
                     )
-                    skip_count += 1
-                    continue
+                    SELECT
+                        r.from_node_id as node_id,
+                        r.timestamp,
+                        r.raw_payload,
+                        ni.long_name,
+                        ni.short_name,
+                        ni.hw_model,
+                        ni.role,
+                        ni.primary_channel,
+                        printf('!%08x', r.from_node_id) as hex_id
+                    FROM ranked r
+                    LEFT JOIN node_info ni ON r.from_node_id = ni.node_id
+                    WHERE r.rank <= ?
+                    ORDER BY r.timestamp DESC
+                """
 
-            timing_breakdown["decode_and_process"] = time.time() - decode_start
+                cursor.execute(
+                    query,
+                    [
+                        *node_ids_params,
+                        *extra_params,
+                        LocationRepository.POSITION_LOOKUP_DEPTH,
+                    ],
+                )
+                raw_rows = cursor.fetchall()
+                timing_breakdown["sql_query"] = time.time() - query_start
+                processing_start = time.time()
+
+                # Decode position data
+                locations = []
+                seen_nodes = set()
+
+                for row in raw_rows:
+                    try:
+                        # A newer row for this node was already accepted
+                        if row["node_id"] in seen_nodes:
+                            continue
+
+                        if not row["raw_payload"]:
+                            skip_count += 1
+                            continue
+
+                        # Decode position from raw protobuf payload
+                        position = mesh_pb2.Position()
+                        position.ParseFromString(row["raw_payload"])
+                        decode_count += 1
+
+                        # Extract coordinates (stored as integers, need to divide by 1e7)
+                        latitude = (
+                            position.latitude_i / 1e7 if position.latitude_i else None
+                        )
+                        longitude = (
+                            position.longitude_i / 1e7
+                            if position.longitude_i
+                            else None
+                        )
+                        altitude = position.altitude if position.altitude else None
+
+                        # Extract precision and satellite information
+                        precision_bits = getattr(position, "precision_bits", None)
+                        sats_in_view = getattr(position, "sats_in_view", None)
+
+                        precision_meters = precision_meters_from_bits(precision_bits)
+
+                        if not is_valid_position(latitude, longitude):
+                            skip_count += 1
+                            continue
+
+                        display_name = (
+                            row["long_name"]
+                            or row["short_name"]
+                            or f"Node {row['node_id']:08x}"
+                        )
+
+                        seen_nodes.add(row["node_id"])
+
+                        locations.append(
+                            {
+                                "node_id": row["node_id"],
+                                "hex_id": row["hex_id"],
+                                "display_name": display_name,
+                                "long_name": row["long_name"],
+                                "short_name": row["short_name"],
+                                "hw_model": row["hw_model"],
+                                "role": row["role"],
+                                "primary_channel": row["primary_channel"]
+                                if "primary_channel" in row.keys()
+                                else None,
+                                "latitude": latitude,
+                                "longitude": longitude,
+                                "altitude": altitude,
+                                "timestamp": row["timestamp"],
+                                "precision_bits": precision_bits,
+                                "precision_meters": precision_meters,
+                                "sats_in_view": sats_in_view,
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to parse location for node {row['node_id']}: {e}"
+                        )
+                        skip_count += 1
+                        continue
+
+            timing_breakdown["decode_and_process"] = time.time() - processing_start
             timing_breakdown["new_decodes"] = decode_count
 
             conn.close()
@@ -3921,6 +4006,37 @@ class LocationRepository:
                     node_id = (
                         int(node_id, 16) if not node_id.isdigit() else int(node_id)
                     )
+
+            if derived_table_populated(cursor, "node_positions"):
+                # Pre-decoded fixes: invalid coordinates were discarded at
+                # write time, so no protobuf decoding or filtering is needed.
+                cursor.execute(
+                    """
+                    SELECT
+                        timestamp,
+                        latitude,
+                        longitude,
+                        altitude,
+                        datetime(timestamp, 'unixepoch') as timestamp_str
+                    FROM node_positions
+                    WHERE node_id = ?
+                    ORDER BY timestamp DESC, packet_id DESC
+                    LIMIT ?
+                    """,
+                    (node_id, limit),
+                )
+                locations = [
+                    {
+                        "latitude": row["latitude"],
+                        "longitude": row["longitude"],
+                        "altitude": row["altitude"],
+                        "timestamp": row["timestamp"],
+                        "timestamp_str": row["timestamp_str"],
+                    }
+                    for row in cursor.fetchall()
+                ]
+                conn.close()
+                return locations
 
             query = """
                 SELECT
@@ -3999,9 +4115,45 @@ class LocationRepository:
             cursor = conn.cursor()
 
             chunk_size = 500
+            use_positions = derived_table_populated(cursor, "node_positions")
             for i in range(0, len(clean_node_ids), chunk_size):
                 chunk = clean_node_ids[i : i + chunk_size]
                 placeholders = ",".join("?" * len(chunk))
+                if use_positions:
+                    query = f"""
+                        WITH ranked AS (
+                            SELECT
+                                node_id,
+                                timestamp,
+                                latitude,
+                                longitude,
+                                altitude,
+                                datetime(timestamp, 'unixepoch') AS timestamp_str,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY node_id
+                                    ORDER BY timestamp DESC, packet_id DESC
+                                ) AS rank
+                            FROM node_positions
+                            WHERE node_id IN ({placeholders})
+                        )
+                        SELECT node_id, timestamp, latitude, longitude, altitude, timestamp_str
+                        FROM ranked
+                        WHERE rank <= ?
+                        ORDER BY node_id, timestamp DESC
+                    """
+                    cursor.execute(query, [*chunk, limit_per_node])
+                    for row in cursor.fetchall():
+                        results[row["node_id"]].append(
+                            {
+                                "latitude": row["latitude"],
+                                "longitude": row["longitude"],
+                                "altitude": row["altitude"],
+                                "timestamp": row["timestamp"],
+                                "timestamp_str": row["timestamp_str"],
+                            }
+                        )
+                    continue
+
                 query = f"""
                     WITH ranked AS (
                         SELECT
@@ -4085,6 +4237,33 @@ class LocationRepository:
             else:
                 node_id = int(node_id)
 
+            if derived_table_populated(cursor, "node_positions"):
+                # Only valid fixes are stored, so the newest row is the
+                # answer — no fallback walk over garbage packets needed.
+                cursor.execute(
+                    """
+                    SELECT timestamp, latitude, longitude, altitude
+                    FROM node_positions
+                    WHERE node_id = ?
+                    ORDER BY timestamp DESC, packet_id DESC
+                    LIMIT 1
+                    """,
+                    (node_id,),
+                )
+                row = cursor.fetchone()
+                result = (
+                    {
+                        "latitude": row["latitude"],
+                        "longitude": row["longitude"],
+                        "altitude": row["altitude"],
+                        "timestamp": row["timestamp"],
+                    }
+                    if row
+                    else None
+                )
+                conn.close()
+                return result
+
             # Fetch the node's most recent POSITION_APP packets so a garbage
             # newest fix (null-island coordinates) can fall back to the last
             # valid one
@@ -4148,6 +4327,78 @@ class LocationRepository:
             conn = get_db_connection()
             cursor = conn.cursor()
 
+            def _format_age_warning(row_timestamp: float, *, later: bool) -> str:
+                if later:
+                    age_seconds = row_timestamp - target_timestamp
+                else:
+                    age_seconds = target_timestamp - row_timestamp
+                age_hours = age_seconds / 3600
+                unit = "later" if later else "ago"
+
+                if age_hours <= 24:
+                    return f"from {age_hours:.1f}h {unit}"
+                if age_hours <= 168:  # 1 week
+                    return f"from {age_hours / 24:.1f}d {unit}"
+                return f"from {age_hours / 168:.1f}w {unit}"
+
+            if derived_table_populated(cursor, "node_positions"):
+                # Pre-decoded valid fixes: the nearest stored row around the
+                # target timestamp is the answer, with no validity walk.
+                cursor.execute(
+                    """
+                    SELECT timestamp, latitude, longitude, altitude
+                    FROM node_positions
+                    WHERE node_id = ?
+                      AND timestamp <= ?
+                    ORDER BY timestamp DESC, packet_id DESC
+                    LIMIT 1
+                    """,
+                    (node_id, target_timestamp),
+                )
+                row = cursor.fetchone()
+                if row:
+                    location = {
+                        "latitude": row["latitude"],
+                        "longitude": row["longitude"],
+                        "altitude": row["altitude"],
+                        "timestamp": row["timestamp"],
+                        "age_warning": _format_age_warning(
+                            row["timestamp"], later=False
+                        ),
+                    }
+                    conn.close()
+                    return location
+
+                # If no valid location before target, try the earliest
+                # location after it.
+                cursor.execute(
+                    """
+                    SELECT timestamp, latitude, longitude, altitude
+                    FROM node_positions
+                    WHERE node_id = ?
+                      AND timestamp > ?
+                    ORDER BY timestamp ASC, packet_id ASC
+                    LIMIT 1
+                    """,
+                    (node_id, target_timestamp),
+                )
+                row = cursor.fetchone()
+                if row:
+                    location = {
+                        "latitude": row["latitude"],
+                        "longitude": row["longitude"],
+                        "altitude": row["altitude"],
+                        "timestamp": row["timestamp"],
+                        "age_warning": _format_age_warning(
+                            row["timestamp"], later=True
+                        ),
+                    }
+                    conn.close()
+                    return location
+
+                conn.close()
+                return None
+
             def _first_valid_location(
                 rows: list[Any], *, later: bool
             ) -> dict[str, Any] | None:
@@ -4169,19 +4420,9 @@ class LocationRepository:
                         if not is_valid_position(latitude, longitude):
                             continue
 
-                        if later:
-                            age_seconds = location_row["timestamp"] - target_timestamp
-                        else:
-                            age_seconds = target_timestamp - location_row["timestamp"]
-                        age_hours = age_seconds / 3600
-                        unit = "later" if later else "ago"
-
-                        if age_hours <= 24:
-                            age_warning = f"from {age_hours:.1f}h {unit}"
-                        elif age_hours <= 168:  # 1 week
-                            age_warning = f"from {age_hours / 24:.1f}d {unit}"
-                        else:
-                            age_warning = f"from {age_hours / 168:.1f}w {unit}"
+                        age_warning = _format_age_warning(
+                            location_row["timestamp"], later=later
+                        )
 
                         return {
                             "latitude": latitude,

@@ -3,6 +3,10 @@
 Firmware sometimes emits near-zero (~0, ~0) coordinates instead of an exact
 (0, 0). Such fixes must never reach the map or the longest-link distance
 calculations: readers fall back to the previous valid position instead.
+
+The repository reads the pre-decoded ``node_positions`` table when it is
+populated and falls back to ranking/decoding raw packet_history otherwise,
+so every scenario runs against both reader paths.
 """
 
 import math
@@ -13,6 +17,12 @@ from unittest.mock import patch
 import pytest
 from meshtastic import mesh_pb2
 
+from malla.database.materialization_schema import ensure_materialization_schema
+from malla.database.materializations import (
+    clear_materialization_cache,
+    materialization_tx_scope,
+    materialize_packet,
+)
 from malla.database.repositories import LocationRepository
 from malla.utils.geo_utils import is_valid_position
 
@@ -22,9 +32,16 @@ VALID_LAT = 52.37
 VALID_LON = 4.89
 
 
-@pytest.fixture
-def database(tmp_path):
-    path = tmp_path / "positions.db"
+@pytest.fixture(autouse=True)
+def _clear_materialization_cache():
+    clear_materialization_cache()
+    yield
+    clear_materialization_cache()
+
+
+@pytest.fixture(params=["legacy", "materialized"])
+def database(tmp_path, request):
+    path = tmp_path / f"positions-{request.param}.db"
     with closing(sqlite3.connect(path)) as conn:
         conn.row_factory = sqlite3.Row
         conn.execute("""
@@ -34,6 +51,9 @@ def database(tmp_path):
                 portnum INTEGER,
                 portnum_name TEXT,
                 from_node_id INTEGER,
+                to_node_id INTEGER,
+                mesh_packet_id INTEGER,
+                gateway_id TEXT,
                 raw_payload BLOB,
                 processed_successfully INTEGER DEFAULT 1
             )
@@ -48,6 +68,8 @@ def database(tmp_path):
                 primary_channel TEXT
             )
         """)
+        if request.param == "materialized":
+            ensure_materialization_schema(conn.cursor())
         conn.commit()
     return path
 
@@ -65,7 +87,10 @@ def _position_payload(lat, lon, altitude=42):
 
 
 def _insert_position(conn, node_id, timestamp, lat, lon):
-    conn.execute(
+    has_projection = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'node_positions'"
+    ).fetchone()
+    cur = conn.execute(
         """
         INSERT INTO packet_history
             (timestamp, portnum, portnum_name, from_node_id, raw_payload)
@@ -73,7 +98,18 @@ def _insert_position(conn, node_id, timestamp, lat, lon):
         """,
         (timestamp, node_id, _position_payload(lat, lon)),
     )
-    conn.commit()
+    if has_projection:
+        # Same writer the live capture path uses: raw + derived rows commit
+        # atomically, invalid fixes are simply never projected.
+        packet = dict(
+            conn.execute(
+                "SELECT * FROM packet_history WHERE id = ?", (cur.lastrowid,)
+            ).fetchone()
+        )
+        with materialization_tx_scope(), conn:
+            materialize_packet(conn.cursor(), packet)
+    else:
+        conn.commit()
 
 
 class TestIsValidPosition:

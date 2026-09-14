@@ -381,6 +381,32 @@ class TestPacketLinksDirectionalMerge:
         assert link["avg_rssi"] == -95.0
         assert link["is_bidirectional"] is True
 
+    def test_self_receptions_excluded_before_aggregation(self):
+        conn = self._database()
+        try:
+            # Gateway 0xc8 (= node 200) hearing its own transmissions, in
+            # canonical and uppercase spellings, dominates the raw receptions
+            # but must neither form a self-link nor pollute 100 -> 200.
+            self._insert(conn, 1000.0, 200, "!000000c8", -40.0, 20.0)
+            self._insert(conn, 1001.0, 200, "!000000C8", -40.0, 20.0)
+            self._insert(conn, 1002.0, 100, "!000000c8", -60.0, 10.0)
+            self._insert(conn, 1003.0, 100, "!000000c8", -80.0, 4.0)
+            conn.commit()
+
+            links = self._packet_links(conn)
+        finally:
+            conn.close()
+
+        assert len(links) == 1
+        link = links[0]
+        assert (link["from_node_id"], link["to_node_id"]) == (100, 200)
+        assert link["forward_count"] == 2
+        assert link["return_count"] == 0
+        assert link["forward_avg_snr"] == 7.0  # (10 + 4) / 2
+        assert link["forward_avg_rssi"] == -70.0
+        assert link["total_hops_seen"] == 2
+        assert link["is_bidirectional"] is False
+
 
 class TestTracerouteLinkRepositoryDirectionalStats:
     """get_traceroute_link computes directional averages over the full window."""
