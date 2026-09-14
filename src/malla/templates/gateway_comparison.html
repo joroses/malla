@@ -384,7 +384,9 @@
     <i class="bi bi-info-circle"></i> Select two gateways above to start the comparison.
 </div>
 {% endif %}
+{% endblock %}
 
+{% block extra_js %}
 <script>
 // Auto-submit form when gateways are selected
 document.getElementById('gateway1').addEventListener('change', function() {
@@ -408,6 +410,9 @@ document.getElementById('gateway2').addEventListener('change', function() {
 // Chart data from server
 const chartData = JSON.parse(document.getElementById('comparison-chart-data').textContent);
 
+// Plotly (~1.2 MB) is only needed on this page: load it lazily via the pinned
+// SRI loader while the trace data below is prepared, then draw the charts.
+window.MallaVendor.plotly().then(function () {
 // RSSI Scatter Plot
 const rssiScatterTrace = {
     x: chartData.rssi_scatter.x,
@@ -591,6 +596,10 @@ if (chartData.timeline_snr.timestamps.length > 0) {
         yaxis: { title: 'SNR (dB)' }
     });
 }
+
+}).catch(function (error) {
+    console.error('Failed to load Plotly:', error);
+});
 
 // Initialize DataTable for common packets
 document.addEventListener('DOMContentLoaded', function() {

@@ -185,6 +185,10 @@
 
     initialize() {
       if (!this.card) return;
+      // Fetch Chart.js + zoom plugin (pinned SRI loader) up front so the
+      // download overlaps with the telemetry API call; load() awaits it
+      // before the first chart is built.
+      this._chartLib = window.MallaVendor.chartJsZoom();
       if (this.rangeEl) {
         this.rangeEl.addEventListener("click", (e) => {
           const btn = e.target.closest("button[data-range]");
@@ -227,6 +231,7 @@
         const res = await fetch(`/api/node/${this.nodeId}/telemetry?range=${this.range}`);
         const data = await res.json();
         if (this.loadingEl) this.loadingEl.style.display = "none";
+        await this._chartLib;
         this.render((data && data.series) || {});
         this.rangeMin = this.fullMin;
         this.rangeMax = this.fullMax;
@@ -254,6 +259,7 @@
         const data = await res.json();
         const series = (data && data.series) || {};
         if (!Object.keys(series).length) return; // keep the current view
+        await this._chartLib;
         this.destroyCharts();
         this.render(series);
         this.loadedMin = this.fullMin;

@@ -5,7 +5,9 @@
 
 {% block extra_css %}
 <!-- Leaflet CSS -->
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+    integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H"
+    crossorigin="anonymous" />
 {% include 'components/openfreemap_css.html' %}
 <style>
     .card-metric {
@@ -759,7 +761,9 @@
 
 {% block extra_js %}
 <!-- Leaflet JS -->
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
+    integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH"
+    crossorigin="anonymous"></script>
 {% include 'components/openfreemap_js.html' %}
 <script src="{{ url_for('static', filename='js/openfreemap.js') }}?v={{ ASSET_VERSION }}"></script>
 
@@ -768,9 +772,6 @@
 
 <!-- Relay Node Analysis Component -->
 <script src="{{ url_for('static', filename='js/relay_node_analysis.js') }}"></script>
-
-<!-- Chart.js zoom plugin (drag / double-click / button zoom on telemetry charts) -->
-<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-zoom@2.2.0/dist/chartjs-plugin-zoom.min.js"></script>
 
 <!-- Telemetry History Charts -->
 <script src="{{ url_for('static', filename='js/node_telemetry.js') }}?v={{ ASSET_VERSION }}"></script>

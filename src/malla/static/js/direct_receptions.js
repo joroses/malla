@@ -23,6 +23,9 @@ class DirectReceptionsChart {
         this.currentMetric = 'rssi';
         this.chartTraces = [];
         this.nodeStats = [];
+        // Fetch Plotly (pinned SRI loader) up front so the download overlaps
+        // with the data request; loadChart() awaits it before rendering.
+        this._plotlyReady = window.MallaVendor.plotly();
 
         this.initializeEventListeners();
     }
@@ -109,6 +112,7 @@ class DirectReceptionsChart {
 
             // Process data and create chart
             this.processChartData(data);
+            await this._plotlyReady;
             this.createPlotlyChart(chartContainer);
             this.populateLegendTable();
 

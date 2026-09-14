@@ -288,12 +288,9 @@
     integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
     crossorigin=""></script>
 {% include 'components/openfreemap_js.html' %}
-<script src="https://unpkg.com/maplibre-contour@0.1.0/dist/index.min.js"></script>
+<script src="https://unpkg.com/maplibre-contour@0.1.0/dist/index.min.js" integrity="sha384-rKd9nNV3F43xwxeA6WNNsPH+cMYQl6SEM+/HDoU/sgeuK+faXwhqXYA0Pwp0COXT" crossorigin="anonymous"></script>
 <script src="{{ url_for('static', filename='js/openfreemap.js') }}?v={{ ASSET_VERSION }}"></script>
 <script src="{{ url_for('static', filename='js/terrain-elevation.js') }}?v={{ ASSET_VERSION }}"></script>
-
-<!-- Chart.js for elevation profiles -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 
 <!-- Node Picker and Location Cache -->
 <script src="{{ url_for('static', filename='js/location-cache.js') }}"></script>
@@ -307,6 +304,11 @@ let fromNodePicker = null;
 let toNodePicker = null;
 let chartHoverMarker = null;
 let chartLine = null;
+
+// Start fetching Chart.js now (pinned SRI loader); the elevation profile
+// chart awaits it before rendering so the library downloads in parallel
+// with the location/elevation data.
+const chartLibReady = window.MallaVendor.chartJs();
 
 // Haversine formula to calculate distance between two points
 function calculateDistance(lat1, lon1, lat2, lon2) {
@@ -641,7 +643,8 @@ async function performAnalysis() {
         // Store current data
         currentData = { fromNode, toNode, elevationData };
 
-        // Display results
+        // Display results (Chart.js loads in parallel; wait for it here)
+        await chartLibReady;
         displayResults(currentData);
 
         // Hide loading, show results

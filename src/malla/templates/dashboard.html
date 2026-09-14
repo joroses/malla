@@ -448,6 +448,10 @@
 let analyticsData = null;
 let chartInstances = {}; // Store chart instances for theme updates
 
+// Start fetching Chart.js now (from the pinned SRI loader); the data fetches
+// below run in parallel and charts await this before their first render.
+const chartLibReady = window.MallaVendor.chartJs();
+
 // Get theme-aware colors for charts
 function getChartColors() {
     const computedStyle = getComputedStyle(document.documentElement);
@@ -576,6 +580,7 @@ async function loadAnalyticsData() {
             throw new Error(`HTTP error! status: ${response.status}`);
         }
         analyticsData = await response.json();
+        await chartLibReady;
 
         // Render all charts and tables with loaded data
         createNodeActivityChart(analyticsData.node_statistics);
@@ -682,6 +687,7 @@ async function loadActivityTimeline(range) {
             return;
         }
         timelineData = data;
+        await chartLibReady;
         renderTimelinePanels();
     } catch (error) {
         console.error('Error loading activity timeline:', error);
@@ -1277,7 +1283,4 @@ function populateTopNodesTable(topNodes) {
     });
 }
 </script>
-
-<!-- Chart.js for analytics charts -->
-<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 {% endblock %}

@@ -202,6 +202,10 @@
     let snrChart = null;
     let directionChart = null;
 
+    // Start fetching Chart.js now (pinned SRI loader); charts await it before
+    // their first render so the library downloads in parallel with the data.
+    const chartLibReady = window.MallaVendor.chartJs();
+
     // Load available nodes on page load
     document.addEventListener('DOMContentLoaded', function() {
         loadAvailableNodes();
@@ -451,12 +455,12 @@
         // Fetch hop analysis data
         fetch(`/api/traceroute/link/${node1Id}/${node2Id}`)
             .then(response => response.json())
-            .then(data => {
+            .then(async data => {
                 document.getElementById('loading').style.display = 'none';
 
                 if (data.traceroutes && data.traceroutes.length > 0) {
                     try {
-                        displayResults(data);
+                        await displayResults(data);
                     } catch (error) {
                         console.error('Error displaying results:', error);
                         alert('Error displaying results: ' + error.message);
@@ -547,7 +551,7 @@
         return `${shortName} (${hexId})`;
     }
 
-    function displayResults(data) {
+    async function displayResults(data) {
         document.getElementById('results-section').style.display = 'block';
 
         // Update summary (null check: a real 0.0 dB average must display)
@@ -565,6 +569,7 @@
         displayDirectionInfo(data);
 
         // Update charts
+        await chartLibReady;
         updateSNRChart(data.traceroutes);
         updateDirectionChart(data.direction_counts);
 

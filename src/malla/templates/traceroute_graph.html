@@ -260,7 +260,9 @@
 
 {{ sidebar_styles() }}
 
-<script src="https://d3js.org/d3.v7.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"
+    integrity="sha384-CjloA8y00+1SDAUkjs099PVfnY2KmDC2BZnws9kh8D/lX1s46w6EPhpXdqMfjK6i"
+    crossorigin="anonymous"></script>
 <script src="{{ url_for('static', filename='js/rf-link-ui.js') }}?v={{ ASSET_VERSION }}"></script>
 <script>
 // Quality palette from the backend single source (signal_quality.py),
