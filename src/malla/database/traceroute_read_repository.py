@@ -84,6 +84,31 @@ _SORT_EXPRESSIONS = {
 }
 
 
+def _routes_index_hint(filters: dict[str, Any]) -> str:
+    """Pin a traceroute_routes index matched to the active filters.
+
+    The planner estimates parser_version = ? as highly selective, but that
+    value matches every materialized row, so it prefers
+    idx_traceroute_routes_version and applies time/node constraints only via
+    per-row table fetches. Forcing the (node, timestamp) indexes keeps cost
+    proportional to the filter window and lets the unfiltered default view
+    stream the newest routes through the timestamp index instead of sorting
+    the whole table.
+
+    A selective gateway equality on packet_history is the exception: driving
+    from idx_packet_history_gateway_time_desc fetches only the matching
+    receptions, which is orders of magnitude cheaper than any window scan of
+    traceroute_routes. No index is pinned there so the planner stays free.
+    """
+    if filters.get("gateway_id"):
+        return ""
+    if filters.get("from_node"):
+        return " INDEXED BY idx_traceroute_routes_source_time"
+    if filters.get("to_node"):
+        return " INDEXED BY idx_traceroute_routes_target_time"
+    return " INDEXED BY idx_traceroute_routes_time"
+
+
 def get_traceroute_packets(
     *,
     limit: int = 100,
@@ -104,6 +129,7 @@ def get_traceroute_packets(
         where, params = _where_clause(filters, search)
         direction = "ASC" if order_dir.lower() == "asc" else "DESC"
         sort_expression = _SORT_EXPRESSIONS.get(order_by, "timestamp")
+        routes_index = _routes_index_hint(filters)
 
         if group_packets:
             group_conditions = ["r.mesh_packet_id IS NOT NULL", "r.mesh_packet_id != 0"]
@@ -113,7 +139,7 @@ def get_traceroute_packets(
                 f"""
                 SELECT COUNT(*) FROM (
                     SELECT 1
-                    FROM traceroute_routes r
+                    FROM traceroute_routes r{routes_index}
                     JOIN packet_history p ON p.id = r.packet_id
                     WHERE {grouped_where}
                     GROUP BY r.mesh_packet_id, r.from_node_id, r.to_node_id
@@ -134,7 +160,7 @@ def get_traceroute_packets(
                             PARTITION BY r.mesh_packet_id, r.from_node_id, r.to_node_id
                             ORDER BY p.payload_length DESC, r.timestamp DESC, p.id DESC
                         ) AS representative_rank
-                    FROM traceroute_routes r
+                    FROM traceroute_routes r{routes_index}
                     JOIN packet_history p ON p.id = r.packet_id
                     WHERE {grouped_where}
                 ), grouped AS (
@@ -173,7 +199,7 @@ def get_traceroute_packets(
             total_count = cursor.execute(
                 f"""
                 SELECT COUNT(*)
-                FROM traceroute_routes r
+                FROM traceroute_routes r{routes_index}
                 JOIN packet_history p ON p.id = r.packet_id
                 WHERE {where}
                 """,
@@ -197,7 +223,7 @@ def get_traceroute_packets(
                     r.route_nodes_json AS route,
                     (p.hop_start - p.hop_limit) AS hop_count,
                     datetime(r.timestamp, 'unixepoch') AS timestamp_str
-                FROM traceroute_routes r
+                FROM traceroute_routes r{routes_index}
                 JOIN packet_history p ON p.id = r.packet_id
                 WHERE {where}
                 ORDER BY {ungrouped_sort} {direction}, p.id {direction}
@@ -428,6 +454,14 @@ def get_traceroute_hops_for_graph(
     packet_history is always joined so each hop carries the MQTT channel_id it
     was received on; consumers resolve the modem preset (spreading factor) from
     that channel hint, falling back to the configured preset.
+
+    Without a gateway filter the joins use CROSS JOIN to pin hops as the outer
+    loop: the planner otherwise drives from idx_traceroute_routes_version
+    (parser_version=?), which matches every route, making cost independent of
+    the time window. A selective gateway equality on packet_history overrides
+    that pin with plain JOINs so the planner can drive from
+    idx_packet_history_gateway_time_desc and fetch only the matching
+    receptions' hops instead of scanning every hop in the window.
     """
     filters = dict(filters or {})
     conn = get_db_connection()
@@ -455,6 +489,7 @@ def get_traceroute_hops_for_graph(
             params.append(filters["primary_channel"])
 
         where_clause = " AND ".join(conditions)
+        join_type = "JOIN" if filters.get("gateway_id") else "CROSS JOIN"
 
         query = f"""
             SELECT
@@ -467,8 +502,8 @@ def get_traceroute_hops_for_graph(
                 h.snr,
                 p.channel_id
             FROM traceroute_hops h
-            JOIN traceroute_routes r ON r.packet_id = h.packet_id
-            JOIN packet_history p ON p.id = h.packet_id
+            {join_type} traceroute_routes r ON r.packet_id = h.packet_id
+            {join_type} packet_history p ON p.id = h.packet_id
             WHERE {where_clause}
             ORDER BY h.timestamp DESC, h.packet_id, h.direction, h.hop_index
         """
@@ -493,14 +528,19 @@ def get_route_patterns_data(
     end_time: float,
     limit: int = 50,
 ) -> dict[str, Any]:
-    """Aggregate route patterns directly in SQL from traceroute_routes."""
+    """Aggregate route patterns directly in SQL from traceroute_routes.
+
+    The routes table is accessed via idx_traceroute_routes_time so the scan
+    covers the requested window only; the planner would otherwise drive from
+    idx_traceroute_routes_version (parser_version=?), which matches every row.
+    """
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
         total_analyzed = cursor.execute(
             """
             SELECT COUNT(*)
-            FROM traceroute_routes
+            FROM traceroute_routes INDEXED BY idx_traceroute_routes_time
             WHERE parser_version = ? AND parse_status = 'parsed'
               AND timestamp >= ? AND timestamp <= ?
             """,
@@ -522,7 +562,7 @@ def get_route_patterns_data(
                     COUNT(*) OVER (
                         PARTITION BY r.from_node_id, r.to_node_id, r.route_nodes_json
                     ) AS pattern_count
-                FROM traceroute_routes r
+                FROM traceroute_routes r INDEXED BY idx_traceroute_routes_time
                 JOIN packet_history p ON p.id = r.packet_id
                 WHERE r.parser_version = ? AND r.parse_status = 'parsed'
                   AND r.route_nodes_json != '[]'
@@ -638,10 +678,12 @@ def get_node_traceroute_statistics(
         dest_total = int(row["dest_total"] or 0)
         dest_successful = int(row["dest_successful"] or 0)
 
-        # Query 2: Intermediate participation
+        # Query 2: Intermediate participation. INDEXED BY keeps the scan on
+        # the timestamp index (window-bounded) instead of the version index,
+        # which matches every row and decouples cost from the time window.
         intermediate_query = f"""
             SELECT COUNT(*)
-            FROM traceroute_routes
+            FROM traceroute_routes INDEXED BY idx_traceroute_routes_time
             WHERE parser_version = ?
               AND parse_status IN ('parsed', 'valid_empty')
               {time_sql}
