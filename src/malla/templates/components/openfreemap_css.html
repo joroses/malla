@@ -1,2 +1,6 @@
 <!-- MapLibre GL CSS (OpenFreeMap vector-tile overlay, self-hosted) -->
 <link rel="stylesheet" href="{{ url_for('static', filename='vendor/maplibre-gl/5.24.0/maplibre-gl.css') }}" />
+<!-- Warm DNS + TLS to the tile/style host in parallel with page parsing
+     (saves ~150-300ms on the first tile request) -->
+<link rel="preconnect" href="https://tiles.openfreemap.org" crossorigin>
+<link rel="dns-prefetch" href="https://tiles.openfreemap.org">

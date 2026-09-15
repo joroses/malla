@@ -264,11 +264,14 @@
 
         // Fetch node information from cache first, fall back to API if necessary
         async function fetchNodeInfo(nodeId) {
-            // Try NodeCache (populated by node-picker or preloaded)
-            if (window.NodeCache) {
-                const cachedNode = await window.NodeCache.getNode(nodeId);
-                if (cachedNode) {
-                    return cachedNode;
+            // Tooltips show activity details ("Last seen", "24h pkts") that
+            // the lightweight identity cache lacks, so request the full
+            // record — NodeCache hydrates it from /api/node/<id>/info on
+            // demand and caches the merge.
+            if (window.NodeCache && typeof window.NodeCache.getFullNode === 'function') {
+                const fullNode = await window.NodeCache.getFullNode(nodeId);
+                if (fullNode) {
+                    return fullNode;
                 }
             }
 

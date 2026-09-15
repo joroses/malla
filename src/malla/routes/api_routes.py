@@ -17,6 +17,7 @@ from ..database import (
     TracerouteRepository,
     get_db_connection,
 )
+from ..database.repositories import derived_table_populated
 from ..database.traceroute_read_repository import (
     get_traceroute_link,
     route_data_from_row,
@@ -499,21 +500,39 @@ def api_gateways_search():
 
         # If no query, return most popular gateways (by packet count)
         if not query:
-            # Get gateway packet counts to find most popular ones
+            # Rank by the trailing 24-hour window — the same window and
+            # tables as the gateway_packet_count_24h column the node list
+            # sorts on — so a historically loud but currently silent gateway
+            # cannot outrank an active one.
             conn = get_db_connection()
             cursor = conn.cursor()
 
-            cursor.execute(
-                """
-                SELECT gateway_id, COUNT(*) as packet_count
-                FROM packet_history
-                WHERE gateway_id IS NOT NULL AND gateway_id != ''
-                GROUP BY gateway_id
-                ORDER BY packet_count DESC
-                LIMIT ?
-            """,
-                (limit,),
-            )
+            if derived_table_populated(cursor, "packet_observations"):
+                cursor.execute(
+                    """
+                    SELECT gateway_id, COUNT(*) as packet_count
+                    FROM packet_observations
+                    WHERE gateway_id != ''
+                      AND timestamp > (strftime('%s', 'now') - 86400)
+                    GROUP BY gateway_id
+                    ORDER BY packet_count DESC
+                    LIMIT ?
+                """,
+                    (limit,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT gateway_id, COUNT(*) as packet_count
+                    FROM packet_history
+                    WHERE gateway_id IS NOT NULL AND gateway_id != ''
+                      AND timestamp > (strftime('%s', 'now') - 86400)
+                    GROUP BY gateway_id
+                    ORDER BY packet_count DESC
+                    LIMIT ?
+                """,
+                    (limit,),
+                )
 
             popular_gateways = cursor.fetchall()
             conn.close()

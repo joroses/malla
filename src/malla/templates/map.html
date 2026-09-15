@@ -449,10 +449,51 @@ let currentOverlay = null;
 let locationsAbortController = null; // cancels superseded /api/locations fetches
 let lastLoadedTimeKey = null; // time window the currently loaded data covers
 let locationsInflightRequest = null; // { key, promise } shared single-flight /api/locations request
+let basemapAdded = false; // basemap overlay attach is deferred until the real view is known
+const MAP_VIEW_STORAGE_KEY = 'malla_map_view';
+
+// Persist the current view so the next visit starts where the user left off:
+// basemap tiles for the right region load immediately, in parallel with the
+// /api/locations fetch, instead of loading the default view and re-fitting.
+function saveMapView() {
+    if (!map) return;
+    try {
+        const center = map.getCenter();
+        localStorage.setItem(MAP_VIEW_STORAGE_KEY, JSON.stringify({
+            lat: center.lat,
+            lng: center.lng,
+            zoom: map.getZoom()
+        }));
+    } catch (err) { /* storage unavailable — view just won't persist */ }
+}
+
+function loadSavedMapView() {
+    try {
+        const saved = JSON.parse(localStorage.getItem(MAP_VIEW_STORAGE_KEY) || 'null');
+        if (saved && Number.isFinite(saved.lat) && Number.isFinite(saved.lng) && Number.isFinite(saved.zoom)) {
+            return saved;
+        }
+    } catch (err) { /* corrupted entry — fall back to the default view */ }
+    return null;
+}
+
+// Attach the MapLibre basemap exactly once. On first visit this is deferred
+// until fitMapToNodes() has settled (see updateNodeMarkers) so the overlay's
+// first tile requests target the mesh bounds rather than the throwaway
+// default view around Kansas.
+function ensureBasemapAdded() {
+    if (basemapAdded || !map) return;
+    basemapAdded = true;
+    const overlay = createOpenFreeMapOverlay();
+    if (overlay) { overlay.addTo(map); currentOverlay = overlay; }
+}
 
 // Update map theme based on current theme setting
 function updateMapTheme() {
     if (!map) return;
+    // While the basemap is still deferred, createOpenFreeMapOverlay() picks
+    // up the current theme at attach time, so there is nothing to refresh.
+    if (!basemapAdded) return;
     if (currentOverlay) { map.removeLayer(currentOverlay); currentOverlay = null; }
     const overlay = createOpenFreeMapOverlay();
     if (overlay) { overlay.addTo(map); currentOverlay = overlay; }
@@ -679,11 +720,25 @@ function initializeInterface() {
 
 // Initialize the map
 function initMap() {
-    // Create map centered on a default location (will be updated when data loads)
-    map = L.map('map', {...window.openFreeMapLeafletMapOptions}).setView([40.0, -95.0], 4);
+    // Start from the persisted view when available so tiles for the right
+    // region load immediately; otherwise use a default that fitMapToNodes()
+    // replaces once /api/locations resolves.
+    const savedView = loadSavedMapView();
+    map = L.map('map', {...window.openFreeMapLeafletMapOptions}).setView(
+        savedView ? [savedView.lat, savedView.lng] : [40.0, -95.0],
+        savedView ? savedView.zoom : 4
+    );
 
-    // Add appropriate tile layer based on current theme
-    updateMapTheme();
+    if (savedView) {
+        // Returning visitor: keep their view, skip the auto-fit, and start
+        // basemap tiles now so they load in parallel with /api/locations.
+        firstDisplay = false;
+        ensureBasemapAdded();
+    }
+
+    // Persist the view whenever it settles (pan, zoom, fit). Attached after
+    // setView so the initial default view is never saved.
+    map.on('moveend', saveMapView);
 
     // Initialize marker cluster group
     markerClusterGroup = L.markerClusterGroup({
@@ -974,9 +1029,27 @@ function updateMapDisplay() {
     // Fit map only on first render
     if (firstDisplay && nodeMarkers.length > 0) {
         setTimeout(() => {
-            fitMapToNodes();
+            // The loading overlay still covers the map here, so jump to the
+            // final bounds without animation and attach the deferred basemap
+            // once the view settles — its first tile requests then land
+            // exactly on the mesh view instead of the discarded default one.
+            let attached = false;
+            const attachBasemap = () => {
+                if (!attached) { attached = true; ensureBasemapAdded(); }
+            };
+            map.once('moveend', attachBasemap);
+            fitMapToNodes({ animate: false });
+            // Degenerate bounds (e.g. a single located node) skip fitBounds
+            // entirely, so 'moveend' never fires — fall back to direct attach.
+            if (!attached) setTimeout(attachBasemap, 100);
         }, 500);
         firstDisplay = false;
+    } else if (firstDisplay) {
+        // Successful load with zero matching nodes: nothing to fit, so
+        // attach the deferred basemap at the default view instead of
+        // leaving the map blank behind the hidden loading overlay.
+        firstDisplay = false;
+        ensureBasemapAdded();
     }
 }
 
@@ -1402,7 +1475,7 @@ function formatRole(role) {
 }
 
 // Map control functions
-function fitMapToNodes() {
+function fitMapToNodes(options = {}) {
     if (nodeMarkers.length === 0) {
         return;
     }
@@ -1448,6 +1521,7 @@ function fitMapToNodes() {
         map.fitBounds(bounds, {
             paddingTopLeft: paddingTopLeft,
             paddingBottomRight: paddingBottomRight,
+            animate: options.animate !== false,
         });
     }
 }
@@ -1768,6 +1842,8 @@ function hideLoading() {
 }
 
 function showError(message) {
+    // Locations failed to load: still show the basemap behind the error notice.
+    ensureBasemapAdded();
     document.getElementById('mapLoading').style.display = 'none';
     document.getElementById('map').style.opacity = '0.5';
     const errorDiv = document.getElementById('mapError');

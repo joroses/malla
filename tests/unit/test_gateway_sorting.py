@@ -155,7 +155,7 @@ class TestGatewaySortingAPI:
             # These tests stub raw packet_history rows, so pin the reader to
             # the in-memory legacy path.
             patch(
-                "src.malla.database.repositories.packet_observations_ready",
+                "src.malla.database.repositories.derived_table_populated",
                 return_value=False,
             ),
         ):
@@ -328,7 +328,7 @@ class TestGatewaySortingAPI:
             # These tests stub raw packet_history rows, so pin the reader to
             # the in-memory legacy path.
             patch(
-                "src.malla.database.repositories.packet_observations_ready",
+                "src.malla.database.repositories.derived_table_populated",
                 return_value=False,
             ),
         ):

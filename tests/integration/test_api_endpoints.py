@@ -649,6 +649,66 @@ class TestUtilityEndpoints:
         assert isinstance(data["gateways"], list)
         assert len(data["gateways"]) <= 5
 
+    @pytest.mark.integration
+    @pytest.mark.api
+    def test_gateways_search_popular_uses_24h_window(self, client, app):
+        """Popular gateways rank by the last 24 hours, not all-time counts.
+
+        Regression guard: the GatewayPicker cache always falls back to this
+        endpoint, so without the time window a gateway that was loud days ago
+        outranks a currently active one.
+        """
+        import time as time_module
+
+        from src.malla.database.connection import get_db_connection
+
+        now = time_module.time()
+        three_days_ago = now - 3 * 24 * 3600
+
+        def insert_packets(cursor, gateway_id, count, timestamp):
+            for i in range(count):
+                cursor.execute(
+                    """
+                    INSERT INTO packet_history
+                    (mesh_packet_id, from_node_id, to_node_id, gateway_id, timestamp,
+                     portnum, portnum_name, topic, payload_length, processed_successfully)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                    (
+                        f"{gateway_id}_pk{i}",
+                        123456789,
+                        987654321,
+                        gateway_id,
+                        timestamp + i,
+                        1,
+                        "TEXT_MESSAGE_APP",
+                        f"msh/2/c/LongFast/{gateway_id}",
+                        10,
+                        True,
+                    ),
+                )
+
+        with app.app_context():
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            # Historically loud but currently silent...
+            insert_packets(cursor, "!deadbee1", 30, three_days_ago)
+            # ...versus quiet but active right now.
+            insert_packets(cursor, "!deadbee2", 3, now)
+
+            conn.commit()
+            conn.close()
+
+        response = client.get("/api/gateways/search?q=")
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data["is_popular"]
+
+        ranked_ids = [gw["id"] for gw in data["gateways"]]
+        assert "!deadbee2" in ranked_ids
+        assert "!deadbee1" not in ranked_ids
+
 
 class TestErrorHandling:
     """Test error handling in API endpoints."""

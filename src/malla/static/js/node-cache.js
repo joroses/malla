@@ -81,8 +81,33 @@
         },
 
         /**
+         * Fetch the complete record from /api/node/<id>/info and merge it
+         * into the cache. Returns the merged node, or null when the request
+         * fails or the API has no record of the node.
+         */
+        async _fetchFullNode(nodeId) {
+            try {
+                const resp = await fetch(`/api/node/${encodeURIComponent(nodeId)}/info`);
+                if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+                const data = await resp.json();
+                const node = data && data.node ? data.node : null;
+                if (node && node.node_id !== undefined) {
+                    this.addNode(node);
+                    const merged = _nodes
+                        ? _nodes.find((n) => n.node_id.toString() === node.node_id.toString())
+                        : null;
+                    return merged || node;
+                }
+            } catch (err) {
+                console.warn(`NodeCache: Failed to fetch node ${nodeId} from API:`, err);
+            }
+            return null;
+        },
+
+        /**
          * Return the node object with the given numeric ID (as number or string).
-         * Resolves to null if not found.
+         * Resolves to null if not found. Records from the lightweight identity
+         * list only — no activity details; use getFullNode() when those matter.
          */
         async getNode(nodeId) {
             if (nodeId === null || nodeId === undefined || nodeId === '') return null;
@@ -92,19 +117,23 @@
             if (found) return found;
 
             // Fallback: fetch from API directly
-            try {
-                const resp = await fetch(`/api/node/${encodeURIComponent(nodeId)}/info`);
-                if (resp.ok) {
-                    const data = await resp.json();
-                    if (data && data.node) {
-                        this.addNode(data.node);
-                        return data.node;
-                    }
-                }
-            } catch (err) {
-                console.warn(`NodeCache: Failed to fetch node ${nodeId} from API:`, err);
-            }
-            return null;
+            return this._fetchFullNode(nodeId);
+        },
+
+        /**
+         * Return the node record including activity details (last_packet_str,
+         * packet_count_24h, gateway_count_24h). The identity list from load()
+         * lacks those fields, so hydrate from /api/node/<id>/info on demand;
+         * the merged record lands in the cache and localStorage, so each node
+         * is fetched at most once per cache generation.
+         */
+        async getFullNode(nodeId) {
+            const found = await this.getNode(nodeId);
+            if (!found) return null;
+            if (typeof found.packet_count_24h !== 'undefined') return found;
+            // On hydration failure, degrade to the identity record rather
+            // than dropping the tooltip entirely.
+            return (await this._fetchFullNode(nodeId)) || found;
         },
 
         /**

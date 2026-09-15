@@ -4,6 +4,58 @@ const OFM_DARK_STYLE = 'https://tiles.openfreemap.org/styles/dark';
 const OFM_ATTRIBUTION = '© <a href="https://openfreemap.org" target="_blank" rel="noopener">OpenFreeMap</a> © <a href="https://www.openmaptiles.org/" target="_blank" rel="noopener">OpenMapTiles</a> © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors';
 const TERRAIN_DEM_URL = 'https://s3.amazonaws.com/elevation-tiles-prod/terrarium/{z}/{x}/{y}.png';
 
+// The hosted "liberty" style bundles a Natural Earth raster relief source
+// ("ne2_shaded") whose hillshade PNGs account for the majority of basemap
+// tile requests without adding road/label readability. The style is fetched
+// here as JSON, stripped of that source, and the filtered object is handed
+// to MapLibre, eliminating those tile requests entirely.
+const OFM_EMPTY_STYLE = { version: 8, sources: {}, layers: [] };
+const ofmStyleRequests = {}; // style URL -> Promise<filtered style object | null>
+const ofmStyleObjects = {};  // style URL -> resolved filtered style object
+
+function ofmStripHillshade(style) {
+    if (style && Array.isArray(style.layers)) {
+        style.layers = style.layers.filter(layer => layer && layer.source !== 'ne2_shaded');
+    }
+    if (style && style.sources) delete style.sources.ne2_shaded;
+    return style;
+}
+
+function ofmLoadFilteredStyle(url) {
+    if (!ofmStyleRequests[url]) {
+        ofmStyleRequests[url] = fetch(url)
+            .then(response => {
+                if (!response.ok) throw new Error('style fetch failed: HTTP ' + response.status);
+                return response.json();
+            })
+            .then(style => {
+                ofmStyleObjects[url] = ofmStripHillshade(style);
+                return ofmStyleObjects[url];
+            })
+            .catch(err => {
+                console.warn('OpenFreeMap style fetch failed; falling back to the hosted style.', err);
+                return null;
+            });
+    }
+    return ofmStyleRequests[url];
+}
+
+function ofmIsDarkTheme() {
+    const attr = document.documentElement.getAttribute('data-bs-theme');
+    if (attr) return attr === 'dark';
+    // The theme attribute is only applied at DOMContentLoaded; until then
+    // resolve it the same way DarkModeToggle does (localStorage, then system).
+    let preference = null;
+    try { preference = localStorage.getItem('malla-theme-preference'); } catch (err) { /* storage unavailable */ }
+    if (preference === 'dark') return true;
+    if (preference === 'light') return false;
+    return !!(window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+}
+
+// Warm the filtered style fetch at script parse time so it overlaps with
+// page/data loading instead of delaying the first basemap paint.
+ofmLoadFilteredStyle(ofmIsDarkTheme() ? OFM_DARK_STYLE : OFM_LIGHT_STYLE);
+
 // Recommended Leaflet map options for the GL adapter (see plugin README: maxBounds avoids
 // the latitude-sync issue, minZoom avoids zoom-0 sync issues).
 window.openFreeMapLeafletMapOptions = {
@@ -32,7 +84,7 @@ function addTerrainLayers(glMap, contourSource) {
 }
 
 window.createOpenFreeMapOverlay = function (options = {}) {
-    const isDark = document.documentElement.getAttribute('data-bs-theme') === 'dark';
+    const styleUrl = ofmIsDarkTheme() ? OFM_DARK_STYLE : OFM_LIGHT_STYLE;
 
     // maplibre-contour must register its tile protocol BEFORE the GL map is created.
     let contourSource = null;
@@ -45,17 +97,38 @@ window.createOpenFreeMapOverlay = function (options = {}) {
         console.warn('maplibre-gl-leaflet failed to load; map basemap disabled.');
         return null;
     }
+
+    const cached = ofmStyleObjects[styleUrl];
     const overlay = L.maplibreGL({
-        style: isDark ? OFM_DARK_STYLE : OFM_LIGHT_STYLE,
+        // Render the filtered style immediately when it is already fetched;
+        // otherwise bootstrap from an empty style (zero tile requests) and
+        // swap the real style in once the fetch resolves.
+        style: cached ? structuredClone(cached) : OFM_EMPTY_STYLE,
         attributionControl: { customAttribution: OFM_ATTRIBUTION },
     });
-    if (options.terrain) {
-        // Inner GL map is created in Leaflet's onAdd, i.e. only after overlay.addTo(map):
-        // attach the terrain 'load' listener once the layer is actually added to the map.
-        overlay.once('add', () => {
+
+    // The inner GL map is created in Leaflet's onAdd, i.e. only after
+    // overlay.addTo(map): hook style swap / terrain setup there.
+    overlay.once('add', () => {
+        if (cached) {
+            if (options.terrain) {
+                const glMap = overlay.getMaplibreMap();
+                if (glMap) glMap.once('style.load', () => addTerrainLayers(glMap, contourSource));
+            }
+            return;
+        }
+        ofmLoadFilteredStyle(styleUrl).then(filtered => {
+            // getMaplibreMap() returns null once the overlay has been
+            // removed (e.g. a theme switch), making the swap a safe no-op.
             const glMap = overlay.getMaplibreMap();
-            if (glMap) glMap.on('load', () => addTerrainLayers(glMap, contourSource));
+            if (!glMap) return;
+            glMap.setStyle(filtered ? structuredClone(filtered) : styleUrl, { diff: false });
+            if (options.terrain) {
+                // Terrain layers must attach to the final style, not the
+                // empty bootstrap style that setStyle is about to replace.
+                glMap.once('style.load', () => addTerrainLayers(glMap, contourSource));
+            }
         });
-    }
+    });
     return overlay;
 };
