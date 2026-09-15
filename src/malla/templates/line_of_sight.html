@@ -4,10 +4,8 @@
 {% block title %}Line of Sight Analysis - Malla{% endblock %}
 
 {% block extra_css %}
-<!-- Leaflet CSS -->
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-    integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
-    crossorigin=""/>
+<!-- Leaflet CSS (self-hosted) -->
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet/1.9.4/leaflet.css') }}" />
 {% include 'components/openfreemap_css.html' %}
 
 <link rel="stylesheet" href="{{ url_for('static', filename='css/node-picker.css') }}">
@@ -283,12 +281,10 @@
 {% endblock %}
 
 {% block extra_js %}
-<!-- Leaflet JS -->
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-    integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
-    crossorigin=""></script>
+<!-- Leaflet JS (self-hosted) -->
+<script src="{{ url_for('static', filename='vendor/leaflet/1.9.4/leaflet.js') }}"></script>
 {% include 'components/openfreemap_js.html' %}
-<script src="https://unpkg.com/maplibre-contour@0.1.0/dist/index.min.js" integrity="sha384-rKd9nNV3F43xwxeA6WNNsPH+cMYQl6SEM+/HDoU/sgeuK+faXwhqXYA0Pwp0COXT" crossorigin="anonymous"></script>
+<script src="{{ url_for('static', filename='vendor/maplibre-contour/0.1.0/index.min.js') }}"></script>
 <script src="{{ url_for('static', filename='js/openfreemap.js') }}?v={{ ASSET_VERSION }}"></script>
 <script src="{{ url_for('static', filename='js/terrain-elevation.js') }}?v={{ ASSET_VERSION }}"></script>
 

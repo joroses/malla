@@ -10,7 +10,7 @@ include .envrc
 # Include source code
 recursive-include src *.py
 recursive-include src/malla/templates *.html
-recursive-include src/malla/static *.css *.js *.png *.jpg *.gif *.ico
+recursive-include src/malla/static *.css *.js *.png *.jpg *.gif *.ico *.woff *.woff2
 
 # Include tests
 recursive-include tests *.py

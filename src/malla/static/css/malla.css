@@ -1,8 +1,7 @@
 /* Malla Bootstrap Theme */
 /* Leverages Bootstrap 5's CSS custom property system for maximum compatibility */
 
-/* Import Inter font */
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+/* Inter font is self-hosted and linked from templates/base.html */
 
 /* Bootstrap theme customization using native CSS custom properties */
 :root,

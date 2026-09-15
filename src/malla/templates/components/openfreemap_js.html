@@ -1,7 +1,3 @@
-<!-- MapLibre GL JS (OpenFreeMap vector-tile overlay) -->
-<script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"
-    integrity="sha384-5+cfbwT0iiub6VsQAdn6yz16nr6sDiQoHx6tm4O8OVYXHYOxcffFmCJBL0dgdvGp"
-    crossorigin="anonymous"></script>
-<script src="https://unpkg.com/@maplibre/maplibre-gl-leaflet@0.1.4/leaflet-maplibre-gl.js"
-    integrity="sha384-tXYNKOHx4T02jMP7YYCtBxPIv1B5gaA5mcVPBzqMp6d7VzWzxJgI2aWF/nJLrQdS"
-    crossorigin="anonymous"></script>
+<!-- MapLibre GL JS (OpenFreeMap vector-tile overlay, self-hosted) -->
+<script src="{{ url_for('static', filename='vendor/maplibre-gl/5.24.0/maplibre-gl.js') }}"></script>
+<script src="{{ url_for('static', filename='vendor/maplibre-gl-leaflet/0.1.4/leaflet-maplibre-gl.js') }}"></script>

@@ -5,15 +5,13 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>{% block title %}{{ APP_NAME }}{% endblock %}</title>
 
-    <!-- Bootstrap CSS -->
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN" crossorigin="anonymous">
-    <!-- Bootstrap Icons -->
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" integrity="sha384-4LISF5TTJX/fLmGSxO53rV4miRxdg84mZsxmO8Rx5jGtp/LbrixFETvWa5a6sESd" crossorigin="anonymous">
+    <!-- Bootstrap CSS (self-hosted) -->
+    <link href="{{ url_for('static', filename='vendor/bootstrap/5.3.2/bootstrap.min.css') }}" rel="stylesheet">
+    <!-- Bootstrap Icons (self-hosted) -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='vendor/bootstrap-icons/1.11.1/bootstrap-icons.css') }}">
 
-    <!-- Inter Font for modern typography -->
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <!-- Inter Font for modern typography (self-hosted) -->
+    <link href="{{ url_for('static', filename='vendor/fonts/inter/inter.css') }}" rel="stylesheet">
 
     <!-- Global 2025 theme overrides -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/malla.css') }}">
@@ -199,11 +197,11 @@
         </div>
     </footer>
 
-    <!-- Bootstrap JS -->
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js" integrity="sha384-C6RzsynM9kWDrMNeT87bh95OGNyZPhcTNXj1NW7RuBCsyN/o0jlpcV8Qyq46cDfL" crossorigin="anonymous"></script>
-    <!-- jQuery (still used by some components) -->
-    <script src="https://code.jquery.com/jquery-3.7.1.min.js" integrity="sha384-1H217gwSVyLSIfaLxHbE7dRb3v4mYCKbpQvzx0cegeju1MVsGrX5xXxAvs/HgeFs" crossorigin="anonymous"></script>
-    <!-- Lazy loader for Chart.js / Plotly (pinned + SRI-hashed CDN sources) -->
+    <!-- Bootstrap JS (self-hosted) -->
+    <script src="{{ url_for('static', filename='vendor/bootstrap/5.3.2/bootstrap.bundle.min.js') }}"></script>
+    <!-- jQuery (still used by some components, self-hosted) -->
+    <script src="{{ url_for('static', filename='vendor/jquery/3.7.1/jquery-3.7.1.min.js') }}"></script>
+    <!-- Lazy loader for Chart.js / Plotly (self-hosted sources) -->
     <script src="{{ url_for('static', filename='js/vendor-loader.js') }}?v={{ ASSET_VERSION }}"></script>
     <!-- URL Filter Manager (global utility) -->
     <script src="{{ url_for('static', filename='js/url-filter-manager.js') }}"></script>

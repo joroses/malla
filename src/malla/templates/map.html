@@ -5,17 +5,11 @@
 {% block title %}Node Map - Malla{% endblock %}
 
 {% block extra_css %}
-<!-- Leaflet CSS -->
-<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-    integrity="sha384-sHL9NAb7lN7rfvG5lfHpm643Xkcjzp4jFvuavGOndn6pjVqS6ny56CAt3nsEVT4H"
-    crossorigin="anonymous" />
-<!-- Leaflet MarkerCluster CSS -->
-<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.css"
-    integrity="sha384-lPzjPsFQL6te2x+VxmV6q1DpRxpRk0tmnl2cpwAO5y04ESyc752tnEWPKDfl1olr"
-    crossorigin="anonymous" />
-<link rel="stylesheet" href="https://unpkg.com/leaflet.markercluster@1.4.1/dist/MarkerCluster.Default.css"
-    integrity="sha384-5kMSQJ6S4Qj5i09mtMNrWpSi8iXw230pKU76xTmrpezGnNJQzj0NzXjQLLg+jE7k"
-    crossorigin="anonymous" />
+<!-- Leaflet CSS (self-hosted) -->
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet/1.9.4/leaflet.css') }}" />
+<!-- Leaflet MarkerCluster CSS (self-hosted) -->
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet.markercluster/1.4.1/MarkerCluster.css') }}" />
+<link rel="stylesheet" href="{{ url_for('static', filename='vendor/leaflet.markercluster/1.4.1/MarkerCluster.Default.css') }}" />
 {% include 'components/openfreemap_css.html' %}
 {% endblock %}
 
@@ -421,14 +415,10 @@
 {% endblock %}
 
 {% block extra_js %}
-<!-- Leaflet JS -->
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
-    integrity="sha384-cxOPjt7s7Iz04uaHJceBmS+qpjv2JkIHNVcuOrM+YHwZOmJGBXI00mdUXEq65HTH"
-    crossorigin="anonymous"></script>
-<!-- Leaflet MarkerCluster JS -->
-<script src="https://unpkg.com/leaflet.markercluster@1.4.1/dist/leaflet.markercluster.js"
-    integrity="sha384-RLIyj5q1b5XJTn0tqUhucRZe40nFTocRP91R/NkRJHwAe4XxnTV77FXy/vGLiec2"
-    crossorigin="anonymous"></script>
+<!-- Leaflet JS (self-hosted) -->
+<script src="{{ url_for('static', filename='vendor/leaflet/1.9.4/leaflet.js') }}"></script>
+<!-- Leaflet MarkerCluster JS (self-hosted) -->
+<script src="{{ url_for('static', filename='vendor/leaflet.markercluster/1.4.1/leaflet.markercluster.js') }}"></script>
 {% include 'components/openfreemap_js.html' %}
 <script src="{{ url_for('static', filename='js/openfreemap.js') }}?v={{ ASSET_VERSION }}"></script>
 <script src="{{ url_for('static', filename='js/rf-link-ui.js') }}?v={{ ASSET_VERSION }}"></script>
