@@ -362,6 +362,23 @@ def api_nodes():
         return jsonify({"error": str(e)}), 500
 
 
+@api_bp.route("/nodes/names")
+def api_nodes_names():
+    """Fast, lightweight API endpoint returning node identities for client-side caching.
+
+    Returns only (node_id, hex_id, long_name, short_name, hw_model) directly from node_info
+    without expensive 24h packet/signal aggregations.
+    """
+    logger.info("API nodes names endpoint accessed")
+    try:
+        limit = _clamp_limit(default=10000, maximum=10000)
+        nodes = NodeRepository.get_node_names(limit=limit)
+        return jsonify({"nodes": nodes, "total_count": len(nodes)})
+    except Exception as e:
+        logger.error(f"Error in API nodes names: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @api_bp.route("/nodes/search")
 def api_nodes_search():
     """API endpoint for searching nodes by name or ID."""

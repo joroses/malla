@@ -1,5 +1,5 @@
 (function () {
-    const CACHE_KEY = 'malla_nodes_cache_v2';
+    const CACHE_KEY = 'malla_nodes_cache_v3';
     const CACHE_TTL_MS = 15 * 60 * 1000; // 15 minutes
 
     // Internal state shared across the page
@@ -13,6 +13,8 @@
      */
     function _restoreFromLocalStorage() {
         try {
+            // Remove older bloated cache versions if present to free storage
+            try { localStorage.removeItem('malla_nodes_cache_v2'); } catch (_) {}
             const raw = localStorage.getItem(CACHE_KEY);
             if (!raw) return null;
 
@@ -59,9 +61,9 @@
                     return;
                 }
 
-                // 2. Fetch from API (request up to 10,000 nodes to cover all mesh nodes)
+                // 2. Fetch lightweight node identities from API
                 try {
-                    const resp = await fetch('/api/nodes?limit=10000');
+                    const resp = await fetch('/api/nodes/names?limit=10000');
                     if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
                     const data = await resp.json();
                     _nodes = data.nodes || [];
@@ -157,8 +159,22 @@
          */
         async topByPackets(limit = 20) {
             await this.load();
-            const sorted = [..._nodes].sort((a, b) => (b.packet_count_24h || 0) - (a.packet_count_24h || 0));
-            return sorted.slice(0, limit);
+            if (_nodes && _nodes.length > 0 && typeof _nodes[0].packet_count_24h !== 'undefined') {
+                const sorted = [..._nodes].sort((a, b) => (b.packet_count_24h || 0) - (a.packet_count_24h || 0));
+                return sorted.slice(0, limit);
+            }
+            try {
+                const resp = await fetch(`/api/nodes/search?limit=${limit}`);
+                if (resp.ok) {
+                    const data = await resp.json();
+                    if (Array.isArray(data.nodes) && data.nodes.length > 0) {
+                        return data.nodes;
+                    }
+                }
+            } catch (err) {
+                console.warn('NodeCache.topByPackets: API fallback failed', err);
+            }
+            return (_nodes || []).slice(0, limit);
         },
 
         /**
@@ -166,8 +182,12 @@
          */
         async topByGatewayPackets(limit = 20) {
             await this.load();
-            const sorted = [..._nodes].sort((a, b) => (b.gateway_packet_count_24h || 0) - (a.gateway_packet_count_24h || 0));
-            return sorted.slice(0, limit);
+            if (_nodes && _nodes.length > 0 && typeof _nodes[0].gateway_packet_count_24h !== 'undefined') {
+                const sorted = [..._nodes].sort((a, b) => (b.gateway_packet_count_24h || 0) - (a.gateway_packet_count_24h || 0));
+                return sorted.slice(0, limit);
+            }
+            // Trigger direct gateway API fallback in GatewayPicker
+            return [];
         },
 
         /**

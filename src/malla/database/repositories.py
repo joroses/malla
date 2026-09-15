@@ -3008,6 +3008,39 @@ class NodeRepository:
             raise
 
     @staticmethod
+    def get_node_names(limit: int = 10000) -> list[dict[str, Any]]:
+        """Get lightweight node identity data (names and IDs) for client-side caching.
+
+        Avoids expensive packet-table joins or 24h stats aggregations when the client
+        only needs node identities to resolve labels, popups, and search matches.
+        """
+        try:
+            conn = get_db_connection()
+            cursor = conn.cursor()
+
+            table_check = cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_info'"
+            ).fetchone()
+            if not table_check:
+                conn.close()
+                return []
+
+            query = """
+                SELECT node_id, long_name, short_name, hw_model, printf('!%08x', node_id) as hex_id
+                FROM node_info
+                ORDER BY last_updated DESC
+                LIMIT ?
+            """
+            cursor.execute(query, (limit,))
+            rows = cursor.fetchall()
+            nodes = [dict(r) for r in rows]
+            conn.close()
+            return nodes
+        except Exception as e:
+            logger.error(f"Error getting node names: {e}")
+            raise
+
+    @staticmethod
     def get_available_from_nodes() -> list[dict[str, Any]]:
         """Get list of nodes that have sent packets."""
         try:
