@@ -60,7 +60,11 @@ class TestApiLocationsTimeWindow:
 
         graph_filters = mocked_location_services["graph"].call_args.kwargs["filters"]
         assert graph_filters["start_time"] >= before - 3600
-        assert graph_filters["end_time"] <= after
+        # The derived end is ceiled onto the cache grid, so it may sit up to
+        # one grid step ahead of wall-clock time.
+        from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
+
+        assert graph_filters["end_time"] <= after + _LOCATIONS_NOW_GRID_SECONDS
 
         packet_filters = mocked_location_services["packet_links"].call_args.args[0]
         assert packet_filters["start_time"] == graph_filters["start_time"]
@@ -188,3 +192,48 @@ class TestApiLocationsTimeWindow:
     def test_invalid_gateway_id_returns_400(self, client, mocked_location_services):
         response = client.get("/api/locations?gateway_id=not-a-number")
         assert response.status_code == 400
+
+    @pytest.mark.unit
+    def test_derived_end_time_snapped_to_grid(self, client, mocked_location_services):
+        """Server-derived end_time is snapped onto the cache grid.
+
+        The map typically sends only start_time. Deriving end_time from raw
+        datetime.now() (microsecond floats) gave every request a unique
+        filter set, so the _NETWORK_GRAPH_CACHE/_PACKET_LINKS_CACHE TTL
+        caches in the service layer never hit.
+        """
+        from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
+
+        start = int(time_module.time()) - 24 * 3600
+        response = client.get(f"/api/locations?start_time={start}")
+
+        assert response.status_code == 200
+        graph_filters = mocked_location_services["graph"].call_args.kwargs["filters"]
+        # Client-supplied start is preserved exactly...
+        assert graph_filters["start_time"] == start
+        # ...while the derived end lands on the grid boundary.
+        assert graph_filters["end_time"] % _LOCATIONS_NOW_GRID_SECONDS == 0
+
+        packet_filters = mocked_location_services["packet_links"].call_args.args[0]
+        assert packet_filters["start_time"] == start
+        assert packet_filters["end_time"] == graph_filters["end_time"]
+
+    @pytest.mark.unit
+    def test_repeated_requests_resolve_identical_windows(
+        self, client, mocked_location_services
+    ):
+        """Back-to-back requests with the same start_time resolve the same
+        server-derived window (cache hit); without grid snapping every
+        request produced a fresh microsecond end_time (guaranteed miss)."""
+        from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
+
+        start = int(time_module.time()) - 24 * 3600
+        client.get(f"/api/locations?start_time={start}")
+        client.get(f"/api/locations?start_time={start}")
+
+        calls = mocked_location_services["graph"].call_args_list
+        first_end = calls[0].kwargs["filters"]["end_time"]
+        second_end = calls[1].kwargs["filters"]["end_time"]
+        # Identical within a bucket; one grid step apart at most if a bucket
+        # boundary happened to be crossed between the two requests.
+        assert second_end - first_end in (0, _LOCATIONS_NOW_GRID_SECONDS)

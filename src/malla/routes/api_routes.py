@@ -4,6 +4,7 @@ API routes for the Meshtastic Mesh Health Web UI
 
 import json
 import logging
+import math
 import time
 from typing import Any
 
@@ -46,6 +47,14 @@ CHAT_RELAY_CANDIDATE_LOOKUP_LIMIT = 256
 _chat_relay_candidate_cache: dict[
     tuple[int, int], tuple[float, list[dict[str, Any]]]
 ] = {}
+
+# /api/locations derives the link-window end from "now" whenever the client
+# sends only start_time (the map's default). Raw datetime.now() floats carry
+# microsecond precision, giving every request a unique filter set and turning
+# the _NETWORK_GRAPH_CACHE/_PACKET_LINKS_CACHE TTL caches into guaranteed
+# misses. Server-derived times are snapped onto this grid instead;
+# client-supplied start_time/end_time are never adjusted.
+_LOCATIONS_NOW_GRID_SECONDS = 30
 
 # TTL cache for the set of node ids involved in traceroute RF hops (including
 # intermediate route nodes). Refreshed by the /traceroute-hops/nodes endpoint;
@@ -799,13 +808,20 @@ def api_locations():
         if hours_arg is None:
             hours_arg = request.args.get("max_age_hours", type=float)
 
+        # Ceil (not floor) so the derived end can never precede a client
+        # start_time picked seconds ago within the current grid bucket.
+        server_now = (
+            math.ceil(now.timestamp() / _LOCATIONS_NOW_GRID_SECONDS)
+            * _LOCATIONS_NOW_GRID_SECONDS
+        )
+
         link_filters: dict[str, Any] = {}
         if start_arg is not None or end_arg is not None or hours_arg:
             if start_arg is None:
                 lookback = hours_arg * 3600 if hours_arg else max_window_seconds
-                start_arg = (end_arg or now.timestamp()) - lookback
+                start_arg = (end_arg if end_arg is not None else server_now) - lookback
             if end_arg is None:
-                end_arg = now.timestamp()
+                end_arg = server_now
             if start_arg >= end_arg:
                 return jsonify({"error": "start_time must be before end_time"}), 400
             # Cap the aggregation window for performance
