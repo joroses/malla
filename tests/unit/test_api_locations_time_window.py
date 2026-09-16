@@ -78,7 +78,14 @@ class TestApiLocationsTimeWindow:
     def test_start_end_params_scope_link_aggregation(
         self, client, mocked_location_services
     ):
-        """Explicit epoch start/end bound the link aggregation window."""
+        """Explicit epoch start/end bound the link aggregation window.
+
+        Bounds are snapped onto the cache grid (start floored, end ceiled),
+        so the resolved window contains the requested one and both edges
+        land on grid multiples.
+        """
+        from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
+
         end = time_module.time() - 7200
         start = end - 3600
 
@@ -87,18 +94,23 @@ class TestApiLocationsTimeWindow:
         assert response.status_code == 200
 
         graph_filters = mocked_location_services["graph"].call_args.kwargs["filters"]
-        assert graph_filters["start_time"] == start
-        assert graph_filters["end_time"] == end
+        # Snapped onto the grid, containing the requested window
+        assert graph_filters["start_time"] % _LOCATIONS_NOW_GRID_SECONDS == 0
+        assert graph_filters["end_time"] % _LOCATIONS_NOW_GRID_SECONDS == 0
+        assert graph_filters["start_time"] <= start
+        assert graph_filters["end_time"] >= end
+        assert start - graph_filters["start_time"] < _LOCATIONS_NOW_GRID_SECONDS
+        assert graph_filters["end_time"] - end < _LOCATIONS_NOW_GRID_SECONDS
 
         packet_filters = mocked_location_services["packet_links"].call_args.args[0]
-        assert packet_filters["start_time"] == start
-        assert packet_filters["end_time"] == end
+        assert packet_filters["start_time"] == graph_filters["start_time"]
+        assert packet_filters["end_time"] == graph_filters["end_time"]
 
         traceroute_filters = mocked_location_services[
             "traceroute_links"
         ].call_args.args[0]
-        assert traceroute_filters["start_time"] == start
-        assert traceroute_filters["end_time"] == end
+        assert traceroute_filters["start_time"] == graph_filters["start_time"]
+        assert traceroute_filters["end_time"] == graph_filters["end_time"]
 
     @pytest.mark.unit
     def test_max_age_hours_alias_supported(self, client, mocked_location_services):
@@ -134,6 +146,8 @@ class TestApiLocationsTimeWindow:
     @pytest.mark.unit
     def test_window_capped_at_14_days(self, client, mocked_location_services):
         """Windows larger than 14 days are clamped for performance."""
+        from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
+
         end = time_module.time()
         start = end - 20 * 24 * 3600
 
@@ -141,8 +155,12 @@ class TestApiLocationsTimeWindow:
 
         assert response.status_code == 200
         graph_filters = mocked_location_services["graph"].call_args.kwargs["filters"]
+        # The ceiled end can sit up to one grid step past the requested
+        # end, dragging the capped start with it.
         assert graph_filters["start_time"] >= end - 14 * 24 * 3600 - 5
-        assert graph_filters["start_time"] <= end - 14 * 24 * 3600 + 5
+        assert graph_filters["start_time"] <= (
+            end - 14 * 24 * 3600 + _LOCATIONS_NOW_GRID_SECONDS
+        )
 
     @pytest.mark.unit
     def test_invalid_time_range_returns_400(self, client, mocked_location_services):
@@ -214,14 +232,48 @@ class TestApiLocationsTimeWindow:
 
         assert response.status_code == 200
         graph_filters = mocked_location_services["graph"].call_args.kwargs["filters"]
-        # Client-supplied start is preserved exactly...
-        assert graph_filters["start_time"] == start
+        # Client-supplied start is floored onto the grid...
+        assert graph_filters["start_time"] % _LOCATIONS_NOW_GRID_SECONDS == 0
+        assert graph_filters["start_time"] <= start
+        assert start - graph_filters["start_time"] < _LOCATIONS_NOW_GRID_SECONDS
         # ...while the derived end lands on the grid boundary.
         assert graph_filters["end_time"] % _LOCATIONS_NOW_GRID_SECONDS == 0
 
         packet_filters = mocked_location_services["packet_links"].call_args.args[0]
-        assert packet_filters["start_time"] == start
+        assert packet_filters["start_time"] == graph_filters["start_time"]
         assert packet_filters["end_time"] == graph_filters["end_time"]
+
+    @pytest.mark.unit
+    def test_visits_seconds_apart_share_one_window(
+        self, client, mocked_location_services
+    ):
+        """Two map visits seconds apart resolve identical filter sets.
+
+        The map materializes its preset start_time from the client clock at
+        page-load time, so back-to-back visits send start_times a few
+        seconds apart. Un-snapped, each visit minted a unique
+        _NETWORK_GRAPH_CACHE key and re-ran the full multi-day graph build
+        (which can take minutes on large windows) instead of hitting the
+        TTL cache. Both starts inside one grid bucket must collapse onto
+        the same window.
+        """
+        from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
+
+        # Historic window: identical end for both requests isolates the
+        # start snapping from server-now drift.
+        end = int(time_module.time()) - 48 * 3600
+        bucket = (end // _LOCATIONS_NOW_GRID_SECONDS) * _LOCATIONS_NOW_GRID_SECONDS
+        start_a = bucket - 24 * 3600 + 5  # same grid bucket, seconds apart
+        start_b = bucket - 24 * 3600 + 20
+
+        client.get(f"/api/locations?start_time={start_a}&end_time={end}")
+        client.get(f"/api/locations?start_time={start_b}&end_time={end}")
+
+        calls = mocked_location_services["graph"].call_args_list
+        assert calls[0].kwargs["filters"] == calls[1].kwargs["filters"]
+
+        packet_calls = mocked_location_services["packet_links"].call_args_list
+        assert packet_calls[0].args[0] == packet_calls[1].args[0]
 
     @pytest.mark.unit
     def test_repeated_requests_resolve_identical_windows(

@@ -118,12 +118,15 @@ class TestMapFilters:
         page.wait_for_timeout(2000)
 
         # A new /api/locations request carrying the 1-hour window must have
-        # been made so link metrics are recomputed server-side
+        # been made so link metrics are recomputed server-side. Presets send
+        # `hours` (server derives the grid-snapped window so all visitors
+        # share one TTL-cache entry); custom ranges send explicit
+        # start_time/end_time.
         location_requests = [
-            req for req in requests if "/api/locations" in req and "start_time=" in req
+            req for req in requests if "/api/locations" in req and "hours=1" in req
         ]
         assert len(location_requests) >= 1, (
-            "Age filtering must reload /api/locations with a start_time parameter"
+            "Age filtering must reload /api/locations with a hours parameter"
         )
 
         # Verify filtering worked
