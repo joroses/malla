@@ -449,6 +449,7 @@ let currentOverlay = null;
 let locationsAbortController = null; // cancels superseded /api/locations fetches
 let lastLoadedTimeKey = null; // time window the currently loaded data covers
 let locationsInflightRequest = null; // { key, promise } shared single-flight /api/locations request
+let activePresetHours = null; // MaxAge preset driving the window; sends `hours` instead of a per-visit start_time
 let basemapAdded = false; // basemap overlay attach is deferred until the real view is known
 const MAP_VIEW_STORAGE_KEY = 'malla_map_view';
 
@@ -647,19 +648,24 @@ function initializeInterface() {
     }
 
     // Materialize the selected MaxAge preset into the start date-time
-    // input (the sole source for the request's start_time). Called on init
-    // so the first /api/locations request carries the displayed default
-    // window (24h) instead of going out parameterless and hitting the
-    // server's wide 14-day fallback, and whenever the preset changes.
+    // input (kept for display and client-side filtering) and remember it
+    // as the active preset. Called on init so the first /api/locations
+    // request carries the displayed default window (24h) instead of going
+    // out parameterless and hitting the server's wide 14-day fallback, and
+    // whenever the preset changes. While a preset is active the request
+    // sends `hours=<preset>` so the server derives the whole grid-snapped
+    // window and every visitor of the same preset shares one cache entry.
     function syncMaxAgeToDateTime() {
         const val = $('#maxAge').val();
         if (!val) {
-            // No Limit selected – clear date inputs
+            // No Limit selected – clear date inputs and preset state
+            activePresetHours = null;
             $('#startDateTime').val('');
             $('#endDateTime').val('');
         } else {
             const hours = parseInt(val,10);
             if (!isNaN(hours)) {
+                activePresetHours = hours;
                 const now = new Date();
                 const start = new Date(now.getTime() - hours*3600*1000);
                 $('#startDateTime').val(toLocalInputValue(start));
@@ -681,10 +687,19 @@ function initializeInterface() {
 
     // Clear dates button
     $('#clearDateRange').on('click', function() {
-        $('#startDateTime').val('');
-        $('#endDateTime').val('');
         $('#maxAge').val('');
+        syncMaxAgeToDateTime();
         refreshMapData();
+    });
+
+    // Manually editing either date input switches to a custom range: the
+    // preset stops driving the request, otherwise its `hours` parameter
+    // would override the edited dates on the server.
+    $('#startDateTime, #endDateTime').on('change', function() {
+        if (activePresetHours !== null) {
+            activePresetHours = null;
+            $('#maxAge').val('');
+        }
     });
 
     // Move hop depth section just below the selected details container
@@ -780,10 +795,15 @@ function initMap() {
     loadNodeLocations();
 }
 
-// Extract the selected time window (epoch seconds) from the date fields.
-// The #maxAge select syncs into #startDateTime, so these inputs are the
-// single source of truth for the server-side aggregation window.
+// Extract the selected time window from the form. While a MaxAge preset is
+// active it is sent as `hours` so the server derives the whole grid-snapped
+// window: a client-materialized start_time (Math.floor at page-load time)
+// differs on every visit, defeating the server's TTL caches. The date
+// inputs remain the source of truth for custom ranges.
 function getTimeFilterParams() {
+    if (activePresetHours !== null) {
+        return { hours: activePresetHours };
+    }
     const form = document.getElementById('locationFilterForm');
     const formData = new FormData(form);
     const params = {};
@@ -801,7 +821,7 @@ function getTimeFilterParams() {
 }
 
 function timeFilterKey(timeParams) {
-    return `${timeParams.start_time ?? ''}-${timeParams.end_time ?? ''}`;
+    return `${timeParams.hours ?? ''}-${timeParams.start_time ?? ''}-${timeParams.end_time ?? ''}`;
 }
 
 // Reload from the server whenever the selected time window changed, so link
@@ -823,6 +843,9 @@ function buildFilterParams() {
     // Server-side filters: the selected time window drives server-side link
     // aggregation so link metrics match the visible period.
     const timeParams = getTimeFilterParams();
+    if (timeParams.hours !== undefined) {
+        params.set('hours', timeParams.hours);
+    }
     if (timeParams.start_time !== undefined) {
         params.set('start_time', timeParams.start_time);
     }

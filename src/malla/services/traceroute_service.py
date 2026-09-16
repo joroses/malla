@@ -22,6 +22,7 @@ from ..database.repositories import (
 from ..database.traceroute_read_repository import (
     get_node_traceroute_statistics,
     get_route_patterns_data,
+    get_traceroute_graph_aggregates,
     get_traceroute_hops_for_graph,
     get_traceroute_hops_for_longest_links,
     route_data_from_row,
@@ -845,53 +846,208 @@ class TracerouteService:
             # The query returns complete hop sequences so path structure is
             # preserved; SNR filtering happens per hop below and continuity is
             # validated before any path-level aggregation.
-            hops = get_traceroute_hops_for_graph(filters=filters)
-
             # Track nodes and links
             nodes = {}  # node_id -> node_data
             direct_links = {}  # (node1, node2) -> link_data
             indirect_connections = {}  # (node1, node2) -> connection_data
 
-            # Statistics
-            stats = {
-                "packets_analyzed": len({h["packet_id"] for h in hops}),
-                "packets_with_rf_hops": len(
-                    {(h["packet_id"], h.get("direction", "forward")) for h in hops}
-                ),
-                "total_rf_hops": len(hops),
-                "links_found": 0,
-                "links_filtered_by_snr": 0,
-                "links_filtered_due_to_snr_0": 0,
-            }
+            if include_indirect:
+                # Indirect connections need the ordered per-path hop
+                # sequences for continuity validation, so this path still
+                # streams hops and aggregates in Python.
+                hops = get_traceroute_hops_for_graph(filters=filters)
 
-            # Group hops by (packet_id, direction) to preserve path context
-            hops_by_path: dict[tuple[int, str], list[dict[str, Any]]] = {}
-            for hop in hops:
-                path_key = (hop["packet_id"], hop.get("direction", "forward"))
-                if path_key not in hops_by_path:
-                    hops_by_path[path_key] = []
-                hops_by_path[path_key].append(hop)
+                # Statistics
+                stats = {
+                    "packets_analyzed": len({h["packet_id"] for h in hops}),
+                    "packets_with_rf_hops": len(
+                        {(h["packet_id"], h.get("direction", "forward")) for h in hops}
+                    ),
+                    "total_rf_hops": len(hops),
+                    "links_found": 0,
+                    "links_filtered_by_snr": 0,
+                    "links_filtered_due_to_snr_0": 0,
+                }
 
-            for (packet_id, _direction), rf_hops in hops_by_path.items():
-                ts = rf_hops[0]["timestamp"]
-                for hop in rf_hops:
-                    snr = hop["snr"]
-                    if not is_plausible_traceroute_snr(snr) or (
-                        min_snr != -200 and snr < min_snr
-                    ):
-                        stats["links_filtered_by_snr"] += 1
-                        continue
-                    if snr == 0:
-                        stats["links_filtered_due_to_snr_0"] += 1
-                        continue
-                    from_id = hop["from_node_id"]
-                    to_id = hop["to_node_id"]
-                    if 4294967295 in (from_id, to_id):
-                        continue
+                # Group hops by (packet_id, direction) to preserve path context
+                hops_by_path: dict[tuple[int, str], list[dict[str, Any]]] = {}
+                for hop in hops:
+                    path_key = (hop["packet_id"], hop.get("direction", "forward"))
+                    if path_key not in hops_by_path:
+                        hops_by_path[path_key] = []
+                    hops_by_path[path_key].append(hop)
 
-                    # Add nodes to the graph
-                    hop_channel = hop.get("channel_id")
-                    for node_id in (from_id, to_id):
+                for (packet_id, _direction), rf_hops in hops_by_path.items():
+                    ts = rf_hops[0]["timestamp"]
+                    for hop in rf_hops:
+                        snr = hop["snr"]
+                        if not is_plausible_traceroute_snr(snr) or (
+                            min_snr != -200 and snr < min_snr
+                        ):
+                            stats["links_filtered_by_snr"] += 1
+                            continue
+                        if snr == 0:
+                            stats["links_filtered_due_to_snr_0"] += 1
+                            continue
+                        from_id = hop["from_node_id"]
+                        to_id = hop["to_node_id"]
+                        if 4294967295 in (from_id, to_id):
+                            continue
+
+                        # Add nodes to the graph
+                        hop_channel = hop.get("channel_id")
+                        for node_id in (from_id, to_id):
+                            if node_id not in nodes:
+                                nodes[node_id] = {
+                                    "id": node_id,
+                                    "name": f"!{node_id:08x}",
+                                    "packet_count": 0,
+                                    "total_snr": 0.0,
+                                    "snr_count": 0,
+                                    "connections": set(),
+                                    "last_seen": ts,
+                                    "last_packet_id": packet_id,
+                                    "last_channel": hop_channel,
+                                }
+                            nodes[node_id]["packet_count"] += 1
+                            if (ts, packet_id) > (
+                                nodes[node_id]["last_seen"],
+                                nodes[node_id].get("last_packet_id", 0),
+                            ):
+                                nodes[node_id]["last_seen"] = ts
+                                nodes[node_id]["last_packet_id"] = packet_id
+                                nodes[node_id]["last_channel"] = hop_channel
+
+                        link_key = tuple(sorted([from_id, to_id]))
+                        # Direction is derived from the hop's own endpoints, not
+                        # from the traceroute path it belongs to: a return path
+                        # may still contain canonically forward hops.
+                        is_forward_hop = from_id == link_key[0]
+                        # The -32.0 sentinel is a real hop with unrecorded SNR:
+                        # it counts as an observation but contributes no SNR to
+                        # any average (directional or combined).
+                        directional_snr = None if snr == TRACEROUTE_UNKNOWN_SNR else snr
+                        link = direct_links.get(link_key)
+                        if link is None:
+                            link = {
+                                "source": link_key[0],
+                                "target": link_key[1],
+                                "forward_snr_sum": 0.0,
+                                "forward_snr_count": 0,
+                                "forward_observations": 0,
+                                "return_snr_sum": 0.0,
+                                "return_snr_count": 0,
+                                "return_observations": 0,
+                                "packet_count": 0,
+                                "last_seen": ts,
+                                "last_packet_id": packet_id,
+                                # Most recent channel hint (timestamp, then
+                                # packet id as tie-breaker) for preset resolution.
+                                "last_channel": hop.get("channel_id"),
+                            }
+                            direct_links[link_key] = link
+                            stats["links_found"] += 1
+                        if is_forward_hop:
+                            link["forward_observations"] += 1
+                            if directional_snr is not None:
+                                link["forward_snr_sum"] += directional_snr
+                                link["forward_snr_count"] += 1
+                        else:
+                            link["return_observations"] += 1
+                            if directional_snr is not None:
+                                link["return_snr_sum"] += directional_snr
+                                link["return_snr_count"] += 1
+                        link["packet_count"] += 1
+                        if (ts, packet_id) > (link["last_seen"], link["last_packet_id"]):
+                            link["last_seen"] = ts
+                            link["last_packet_id"] = packet_id
+                            link["last_channel"] = hop.get("channel_id")
+
+                        nodes[from_id]["connections"].add(to_id)
+                        nodes[to_id]["connections"].add(from_id)
+                        if directional_snr is not None:
+                            nodes[from_id]["total_snr"] += directional_snr
+                            nodes[from_id]["snr_count"] += 1
+
+                    # Process indirect connections if requested. Only contiguous
+                    # runs of qualifying hops count as a path: a route whose middle
+                    # hop failed the SNR filters is two disconnected segments, not
+                    # a shortcut between its endpoints.
+                    if include_indirect:
+                        for segment in _contiguous_path_segments(
+                            rf_hops, lambda hop: _rf_hop_qualifies(hop, min_snr)
+                        ):
+                            first_from = segment[0]["from_node_id"]
+                            last_to = segment[-1]["to_node_id"]
+                            if 4294967295 in (first_from, last_to):
+                                continue
+                            indirect_key = tuple(sorted([first_from, last_to]))
+                            if indirect_key in direct_links:
+                                continue
+                            path_snrs = [
+                                h["snr"]
+                                for h in segment
+                                if h["snr"] != TRACEROUTE_UNKNOWN_SNR
+                            ]
+                            if indirect_key not in indirect_connections:
+                                indirect_connections[indirect_key] = {
+                                    "source": indirect_key[0],
+                                    "target": indirect_key[1],
+                                    "hop_total": len(segment),
+                                    "path_count": 1,
+                                    "avg_snr": sum(path_snrs) / len(path_snrs)
+                                    if path_snrs
+                                    else None,
+                                    "last_seen": ts,
+                                    "last_packet_id": packet_id,
+                                }
+                            else:
+                                conn = indirect_connections[indirect_key]
+                                conn["path_count"] += 1
+                                # Paths between the same endpoints can vary in
+                                # length; accumulate the actual hops so the
+                                # observation volume reflects real observations.
+                                conn["hop_total"] += len(segment)
+                                if ts > conn["last_seen"]:
+                                    conn["last_seen"] = ts
+                                    conn["last_packet_id"] = packet_id
+            else:
+                # Direct-link graphs aggregate in SQL: bucketing millions of
+                # hops into Python dicts was the memory/timeout killer on
+                # multi-day windows, while SQLite streams the same window
+                # scan in C and returns one row per node pair.
+                aggregates = get_traceroute_graph_aggregates(
+                    filters=filters, min_snr=min_snr
+                )
+                stats = {
+                    **aggregates["stats"],
+                    "links_found": len(aggregates["links"]),
+                }
+
+                for link_row in aggregates["links"]:
+                    link_key = (link_row["link_source"], link_row["link_target"])
+                    direct_links[link_key] = {
+                        "source": link_key[0],
+                        "target": link_key[1],
+                        "forward_snr_sum": link_row["forward_snr_sum"],
+                        "forward_snr_count": link_row["forward_snr_count"],
+                        "forward_observations": link_row["forward_observations"],
+                        "return_snr_sum": link_row["return_snr_sum"],
+                        "return_snr_count": link_row["return_snr_count"],
+                        "return_observations": link_row["return_observations"],
+                        "packet_count": link_row["packet_count"],
+                        "last_seen": link_row["last_seen"],
+                        "last_packet_id": link_row["last_packet_id"],
+                        "last_channel": link_row["last_channel"],
+                    }
+
+                # Derive node aggregates from the per-pair rows: every
+                # eligible hop touches both endpoints of exactly one pair,
+                # and its SNR belongs to the transmitting node, so pair
+                # sums fully determine per-node counts and averages.
+                for link_key, link in direct_links.items():
+                    source, target = link_key
+                    for node_id in (source, target):
                         if node_id not in nodes:
                             nodes[node_id] = {
                                 "id": node_id,
@@ -900,112 +1056,29 @@ class TracerouteService:
                                 "total_snr": 0.0,
                                 "snr_count": 0,
                                 "connections": set(),
-                                "last_seen": ts,
-                                "last_packet_id": packet_id,
-                                "last_channel": hop_channel,
+                                "last_seen": 0.0,
+                                "last_packet_id": 0,
+                                "last_channel": None,
                             }
-                        nodes[node_id]["packet_count"] += 1
-                        if (ts, packet_id) > (
+                    nodes[source]["packet_count"] += link["packet_count"]
+                    nodes[target]["packet_count"] += link["packet_count"]
+                    nodes[source]["total_snr"] += link["forward_snr_sum"]
+                    nodes[source]["snr_count"] += link["forward_snr_count"]
+                    nodes[target]["total_snr"] += link["return_snr_sum"]
+                    nodes[target]["snr_count"] += link["return_snr_count"]
+                    # (timestamp, packet_id) argmax over adjacent pairs is
+                    # the node's own recency, since the node's most recent
+                    # hop is one of the pairs' most recent hops.
+                    for node_id in (source, target):
+                        if (link["last_seen"], link["last_packet_id"]) > (
                             nodes[node_id]["last_seen"],
-                            nodes[node_id].get("last_packet_id", 0),
+                            nodes[node_id]["last_packet_id"],
                         ):
-                            nodes[node_id]["last_seen"] = ts
-                            nodes[node_id]["last_packet_id"] = packet_id
-                            nodes[node_id]["last_channel"] = hop_channel
-
-                    link_key = tuple(sorted([from_id, to_id]))
-                    # Direction is derived from the hop's own endpoints, not
-                    # from the traceroute path it belongs to: a return path
-                    # may still contain canonically forward hops.
-                    is_forward_hop = from_id == link_key[0]
-                    # The -32.0 sentinel is a real hop with unrecorded SNR:
-                    # it counts as an observation but contributes no SNR to
-                    # any average (directional or combined).
-                    directional_snr = None if snr == TRACEROUTE_UNKNOWN_SNR else snr
-                    link = direct_links.get(link_key)
-                    if link is None:
-                        link = {
-                            "source": link_key[0],
-                            "target": link_key[1],
-                            "forward_snr_sum": 0.0,
-                            "forward_snr_count": 0,
-                            "forward_observations": 0,
-                            "return_snr_sum": 0.0,
-                            "return_snr_count": 0,
-                            "return_observations": 0,
-                            "packet_count": 0,
-                            "last_seen": ts,
-                            "last_packet_id": packet_id,
-                            # Most recent channel hint (timestamp, then
-                            # packet id as tie-breaker) for preset resolution.
-                            "last_channel": hop.get("channel_id"),
-                        }
-                        direct_links[link_key] = link
-                        stats["links_found"] += 1
-                    if is_forward_hop:
-                        link["forward_observations"] += 1
-                        if directional_snr is not None:
-                            link["forward_snr_sum"] += directional_snr
-                            link["forward_snr_count"] += 1
-                    else:
-                        link["return_observations"] += 1
-                        if directional_snr is not None:
-                            link["return_snr_sum"] += directional_snr
-                            link["return_snr_count"] += 1
-                    link["packet_count"] += 1
-                    if (ts, packet_id) > (link["last_seen"], link["last_packet_id"]):
-                        link["last_seen"] = ts
-                        link["last_packet_id"] = packet_id
-                        link["last_channel"] = hop.get("channel_id")
-
-                    nodes[from_id]["connections"].add(to_id)
-                    nodes[to_id]["connections"].add(from_id)
-                    if directional_snr is not None:
-                        nodes[from_id]["total_snr"] += directional_snr
-                        nodes[from_id]["snr_count"] += 1
-
-                # Process indirect connections if requested. Only contiguous
-                # runs of qualifying hops count as a path: a route whose middle
-                # hop failed the SNR filters is two disconnected segments, not
-                # a shortcut between its endpoints.
-                if include_indirect:
-                    for segment in _contiguous_path_segments(
-                        rf_hops, lambda hop: _rf_hop_qualifies(hop, min_snr)
-                    ):
-                        first_from = segment[0]["from_node_id"]
-                        last_to = segment[-1]["to_node_id"]
-                        if 4294967295 in (first_from, last_to):
-                            continue
-                        indirect_key = tuple(sorted([first_from, last_to]))
-                        if indirect_key in direct_links:
-                            continue
-                        path_snrs = [
-                            h["snr"]
-                            for h in segment
-                            if h["snr"] != TRACEROUTE_UNKNOWN_SNR
-                        ]
-                        if indirect_key not in indirect_connections:
-                            indirect_connections[indirect_key] = {
-                                "source": indirect_key[0],
-                                "target": indirect_key[1],
-                                "hop_total": len(segment),
-                                "path_count": 1,
-                                "avg_snr": sum(path_snrs) / len(path_snrs)
-                                if path_snrs
-                                else None,
-                                "last_seen": ts,
-                                "last_packet_id": packet_id,
-                            }
-                        else:
-                            conn = indirect_connections[indirect_key]
-                            conn["path_count"] += 1
-                            # Paths between the same endpoints can vary in
-                            # length; accumulate the actual hops so the
-                            # observation volume reflects real observations.
-                            conn["hop_total"] += len(segment)
-                            if ts > conn["last_seen"]:
-                                conn["last_seen"] = ts
-                                conn["last_packet_id"] = packet_id
+                            nodes[node_id]["last_seen"] = link["last_seen"]
+                            nodes[node_id]["last_packet_id"] = link["last_packet_id"]
+                            nodes[node_id]["last_channel"] = link["last_channel"]
+                    nodes[source]["connections"].add(target)
+                    nodes[target]["connections"].add(source)
 
             node_ids = list(nodes.keys())
             node_names = get_bulk_node_names(node_ids) if node_ids else {}

@@ -43,6 +43,7 @@ from malla.utils.signal_quality import (
     QUALITY_MARGINAL,
     QUALITY_UNKNOWN,
 )
+from tests.fixtures.graph_hops_db import build_graph_hops_database
 
 pytestmark = pytest.mark.unit
 
@@ -241,8 +242,8 @@ class TestGraphLinkMetrics:
         try:
             with (
                 patch(
-                    "malla.services.traceroute_service.get_traceroute_hops_for_graph",
-                    return_value=hops,
+                    "malla.database.traceroute_read_repository.get_db_connection",
+                    return_value=build_graph_hops_database(hops),
                 ),
                 patch(
                     "malla.services.traceroute_service.get_bulk_node_names",
@@ -471,8 +472,8 @@ class TestGraphLinkMetrics:
         def build():
             with (
                 patch(
-                    "malla.services.traceroute_service.get_traceroute_hops_for_graph",
-                    return_value=hops,
+                    "malla.database.traceroute_read_repository.get_db_connection",
+                    return_value=build_graph_hops_database(hops),
                 ),
                 patch(
                     "malla.services.traceroute_service.get_bulk_node_names",
@@ -1153,8 +1154,8 @@ class TestConsumerParity:
         try:
             with (
                 patch(
-                    "malla.services.traceroute_service.get_traceroute_hops_for_graph",
-                    return_value=hops,
+                    "malla.database.traceroute_read_repository.get_db_connection",
+                    return_value=build_graph_hops_database(hops),
                 ),
                 patch(
                     "malla.services.traceroute_service.get_bulk_node_names",
@@ -1273,8 +1274,8 @@ class TestConsumerParity:
         try:
             with (
                 patch(
-                    "malla.services.traceroute_service.get_traceroute_hops_for_graph",
-                    return_value=hops,
+                    "malla.database.traceroute_read_repository.get_db_connection",
+                    return_value=build_graph_hops_database(hops),
                 ),
                 patch(
                     "malla.services.traceroute_service.get_bulk_node_names",

@@ -48,13 +48,15 @@ _chat_relay_candidate_cache: dict[
     tuple[int, int], tuple[float, list[dict[str, Any]]]
 ] = {}
 
-# /api/locations derives the link-window end from "now" whenever the client
-# sends only start_time (the map's default) or no time parameters at all (the
-# wide 14-day default window). Raw datetime.now() floats carry microsecond
-# precision, giving every request a unique filter set and turning
-# the _NETWORK_GRAPH_CACHE/_PACKET_LINKS_CACHE TTL caches into guaranteed
-# misses. Server-derived times are snapped onto this grid instead;
-# client-supplied start_time/end_time are never adjusted.
+# /api/locations resolves every link window onto this grid. Server-derived
+# bounds (the end from "now", the start for hours-only requests) are snapped
+# here, and client-supplied start_time/end_time are floored/ceiled onto the
+# same grid: raw datetime.now() floats carry microsecond precision and the
+# map's per-visit start_time (Math.floor(now) - N*3600, recomputed at every
+# page load) changes by the second, so un-snapped bounds gave every request
+# a unique filter set and turned the _NETWORK_GRAPH_CACHE/_PACKET_LINKS_CACHE
+# TTL caches into guaranteed misses. Snapping widens a window by less than
+# one grid step per side.
 _LOCATIONS_NOW_GRID_SECONDS = 30
 
 # TTL cache for the set of node ids involved in traceroute RF hops (including
@@ -828,6 +830,18 @@ def api_locations():
                 end_arg = server_now
             if start_arg >= end_arg:
                 return jsonify({"error": "start_time must be before end_time"}), 400
+            # Snap every bound onto the cache grid (start down, end up;
+            # derived bounds are already grid multiples) so two map visits
+            # seconds apart resolve identical filters and hit the TTL
+            # caches. The window can only grow by < one grid step per side.
+            start_arg = (
+                math.floor(start_arg / _LOCATIONS_NOW_GRID_SECONDS)
+                * _LOCATIONS_NOW_GRID_SECONDS
+            )
+            end_arg = (
+                math.ceil(end_arg / _LOCATIONS_NOW_GRID_SECONDS)
+                * _LOCATIONS_NOW_GRID_SECONDS
+            )
             # Cap the aggregation window for performance
             if end_arg - start_arg > max_window_seconds:
                 start_arg = end_arg - max_window_seconds
