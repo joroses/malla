@@ -646,8 +646,13 @@ function initializeInterface() {
         return `${dateObj.getFullYear()}-${pad(dateObj.getMonth()+1)}-${pad(dateObj.getDate())}T${pad(dateObj.getHours())}:${pad(dateObj.getMinutes())}`;
     }
 
-    $('#maxAge').on('change', function() {
-        const val = this.value;
+    // Materialize the selected MaxAge preset into the start date-time
+    // input (the sole source for the request's start_time). Called on init
+    // so the first /api/locations request carries the displayed default
+    // window (24h) instead of going out parameterless and hitting the
+    // server's wide 14-day fallback, and whenever the preset changes.
+    function syncMaxAgeToDateTime() {
+        const val = $('#maxAge').val();
         if (!val) {
             // No Limit selected – clear date inputs
             $('#startDateTime').val('');
@@ -662,6 +667,13 @@ function initializeInterface() {
                 $('#endDateTime').val('');
             }
         }
+    }
+
+    // Apply the default preset before the first data load
+    syncMaxAgeToDateTime();
+
+    $('#maxAge').on('change', function() {
+        syncMaxAgeToDateTime();
         // Time window changed – reload so the server recomputes link
         // aggregates for the selected period
         refreshMapData();
