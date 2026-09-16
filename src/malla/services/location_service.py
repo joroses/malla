@@ -51,6 +51,42 @@ def _prune_packet_links_cache(now: float) -> None:
             _PACKET_LINKS_CACHE.pop(key, None)
 
 
+_NODE_LOCATIONS_CACHE: dict[
+    tuple[Any, Any, Any], tuple[float, list[dict[str, Any]]]
+] = {}
+_NODE_LOCATIONS_CACHE_TTL_SECONDS = 60
+_NODE_LOCATIONS_CACHE_MAX_ENTRIES = 64
+
+
+def _node_locations_cache_key(
+    filters: dict[str, Any] | None,
+) -> tuple[Any, Any, Any]:
+    filters = filters or {}
+    return (
+        filters.get("start_time"),
+        filters.get("end_time"),
+        filters.get("gateway_id"),
+    )
+
+
+def _prune_node_locations_cache(now: float) -> None:
+    expired_keys = [
+        key
+        for key, (cached_at, _) in _NODE_LOCATIONS_CACHE.items()
+        if now - cached_at > _NODE_LOCATIONS_CACHE_TTL_SECONDS
+    ]
+    for key in expired_keys:
+        _NODE_LOCATIONS_CACHE.pop(key, None)
+
+    overflow = len(_NODE_LOCATIONS_CACHE) - _NODE_LOCATIONS_CACHE_MAX_ENTRIES
+    if overflow > 0:
+        oldest_keys = sorted(
+            _NODE_LOCATIONS_CACHE.items(), key=lambda item: item[1][0]
+        )[:overflow]
+        for key, _ in oldest_keys:
+            _NODE_LOCATIONS_CACHE.pop(key, None)
+
+
 class LocationService:
     """Service for location-related operations and calculations."""
 
@@ -74,6 +110,19 @@ class LocationService:
         if filters is None:
             filters = {}
 
+        cache_key = (
+            _node_locations_cache_key(filters)
+            if network_data is None and packet_links is None
+            else None
+        )
+        if cache_key is not None:
+            now = time.time()
+            _prune_node_locations_cache(now)
+            cached = _NODE_LOCATIONS_CACHE.get(cache_key)
+            if cached and now - cached[0] < _NODE_LOCATIONS_CACHE_TTL_SECONDS:
+                logger.debug("Returning cached node locations for filters: %s", filters)
+                return [loc.copy() for loc in cached[1]]
+
         service_start = time.time()
         timing_breakdown = {}
 
@@ -85,6 +134,8 @@ class LocationService:
         timing_breakdown["repository_call"] = time.time() - repo_start
 
         if not locations:
+            if cache_key is not None:
+                _NODE_LOCATIONS_CACHE[cache_key] = (time.time(), [])
             return []
 
         # Apply age filtering if specified
@@ -109,6 +160,8 @@ class LocationService:
         timing_breakdown["age_filtering"] = time.time() - age_filter_start
 
         if not locations:
+            if cache_key is not None:
+                _NODE_LOCATIONS_CACHE[cache_key] = (time.time(), [])
             return []
 
         # Get network topology data from traceroute analysis
@@ -250,6 +303,9 @@ class LocationService:
             f"Network: {timing_breakdown['network_topology']:.3f}s, "
             f"Enhancement: {timing_breakdown['enhancement']:.3f}s)"
         )
+        if cache_key is not None:
+            _NODE_LOCATIONS_CACHE[cache_key] = (time.time(), enhanced_locations)
+            return [loc.copy() for loc in enhanced_locations]
         return enhanced_locations
 
     @staticmethod
@@ -346,9 +402,7 @@ class LocationService:
                 # verbatim so map consumers see exactly what the graph API
                 # reports, without recalculating anything here.
                 if link.get("quality") is not None:
-                    is_bidirectional = link.get(
-                        "is_bidirectional", is_bidirectional
-                    )
+                    is_bidirectional = link.get("is_bidirectional", is_bidirectional)
                     traceroute_link["is_bidirectional"] = is_bidirectional
                     for field in ENRICHMENT_FIELDS:
                         if field in link:
