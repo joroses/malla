@@ -326,3 +326,71 @@ class TestApiLocationsTimeWindow:
             0,
             _LOCATIONS_NOW_GRID_SECONDS,
         )
+
+    @pytest.mark.unit
+    def test_grid_step_exceeds_service_cache_ttls(self):
+        """The snapping grid must outlive the service TTL caches.
+
+        The resolved window (and therefore the _NETWORK_GRAPH_CACHE /
+        _PACKET_LINKS_CACHE keys) rolls with the clock every grid step. If
+        the step were shorter than a cache's TTL, entries would become
+        unreachable well before expiring and reloads tens of seconds apart
+        would always recompute -- the failure mode this grid exists to
+        prevent.
+        """
+        from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
+        from src.malla.services.location_service import (
+            _PACKET_LINKS_CACHE_TTL_SECONDS,
+        )
+        from src.malla.services.traceroute_service import (
+            _NETWORK_GRAPH_CACHE_TTL_SECONDS,
+        )
+
+        for ttl in (_NETWORK_GRAPH_CACHE_TTL_SECONDS, _PACKET_LINKS_CACHE_TTL_SECONDS):
+            assert _LOCATIONS_NOW_GRID_SECONDS >= 2 * ttl
+
+    @pytest.mark.unit
+    def test_reloads_a_minute_apart_share_one_window(
+        self, client, mocked_location_services
+    ):
+        """Reloads ~60 s apart resolve identical windows (TTL cache hits).
+
+        With a 30 s grid the derived bounds rolled every 30 s while the
+        service caches lived 60 s, so any two visits more than 30 s apart
+        minted different start_time/end_time, different cache keys, and a
+        full recompute. The grid now exceeds the TTL: the two simulated
+        visits below (60 s apart, pinned mid-bucket away from a grid edge)
+        must resolve identical filters and therefore share one cache entry.
+        """
+        import datetime as datetime_module
+        import sys
+        import types
+        from datetime import datetime as real_datetime_class
+
+        from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
+
+        grid = _LOCATIONS_NOW_GRID_SECONDS
+        clock = {"t": (int(time_module.time()) // grid + 1) * grid + grid // 2}
+
+        class FrozenDatetime(datetime_module.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return real_datetime_class.fromtimestamp(clock["t"], tz)
+
+        frozen_datetime_module = types.ModuleType("datetime")
+        frozen_datetime_module.__dict__.update(datetime_module.__dict__)
+        frozen_datetime_module.datetime = FrozenDatetime
+
+        with (
+            patch.dict(sys.modules, {"datetime": frozen_datetime_module}),
+            patch("time.time", side_effect=lambda: clock["t"]),
+        ):
+            client.get("/api/locations?hours=24")
+            clock["t"] += 60
+            client.get("/api/locations?hours=24")
+
+        graph_calls = mocked_location_services["graph"].call_args_list
+        assert graph_calls[0].kwargs["filters"] == graph_calls[1].kwargs["filters"]
+
+        packet_calls = mocked_location_services["packet_links"].call_args_list
+        assert packet_calls[0].args[0] == packet_calls[1].args[0]

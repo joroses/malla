@@ -57,7 +57,18 @@ _chat_relay_candidate_cache: dict[
 # a unique filter set and turned the _NETWORK_GRAPH_CACHE/_PACKET_LINKS_CACHE
 # TTL caches into guaranteed misses. Snapping widens a window by less than
 # one grid step per side.
-_LOCATIONS_NOW_GRID_SECONDS = 30
+#
+# The step must also comfortably exceed those caches' 60 s TTL. Snapped
+# bounds roll with the clock every grid step, and an entry minted under one
+# bucket's bounds becomes unreachable the moment the next bucket starts, so
+# a 30 s grid capped the effective hit window below the TTL: reloads more
+# than 30 s apart always minted fresh keys and recomputed in full. A 300 s
+# step (5x the TTL) lets a revisit inside the TTL resolve the same bounds
+# with probability 1 - gap/300 (~80 % for a 60 s gap), keeps the per-side
+# window widening under five minutes (0.35 % of the default 24 h preset,
+# 8 % of the smallest 1 h preset), and divides every hour preset and the
+# 14-day cap exactly, so derived starts stay grid-aligned.
+_LOCATIONS_NOW_GRID_SECONDS = 300
 
 # TTL cache for the set of node ids involved in traceroute RF hops (including
 # intermediate route nodes). Refreshed by the /traceroute-hops/nodes endpoint;
@@ -1481,17 +1492,15 @@ def api_traceroute_link(node1_id, node2_id):
         forward_avg_snr = (
             round(forward_avg_snr, 1) if forward_avg_snr is not None else None
         )
-        return_avg_snr = round(return_avg_snr, 1) if return_avg_snr is not None else None
+        return_avg_snr = (
+            round(return_avg_snr, 1) if return_avg_snr is not None else None
+        )
         forward_observations = int(
-            link_result.get(
-                "forward_observations", link_result.get("forward_count", 0)
-            )
+            link_result.get("forward_observations", link_result.get("forward_count", 0))
             or 0
         )
         return_observations = int(
-            link_result.get(
-                "reverse_observations", link_result.get("reverse_count", 0)
-            )
+            link_result.get("reverse_observations", link_result.get("reverse_count", 0))
             or 0
         )
         link_enrichment = enrich_link_quality(
