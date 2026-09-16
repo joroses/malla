@@ -66,15 +66,16 @@ def write_traceroute(cursor: sqlite3.Cursor, packet: dict[str, Any]) -> None:
         """
         INSERT INTO traceroute_routes (
             packet_id, timestamp, mesh_packet_id, from_node_id, to_node_id,
-            route_nodes_json, snr_towards_json, route_back_json, snr_back_json,
-            forward_complete, return_complete, parse_status, parse_error,
-            parser_version, materialized_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            channel_id, route_nodes_json, snr_towards_json, route_back_json,
+            snr_back_json, forward_complete, return_complete, parse_status,
+            parse_error, parser_version, materialized_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(packet_id) DO UPDATE SET
             timestamp = excluded.timestamp,
             mesh_packet_id = excluded.mesh_packet_id,
             from_node_id = excluded.from_node_id,
             to_node_id = excluded.to_node_id,
+            channel_id = excluded.channel_id,
             route_nodes_json = excluded.route_nodes_json,
             snr_towards_json = excluded.snr_towards_json,
             route_back_json = excluded.route_back_json,
@@ -92,6 +93,7 @@ def write_traceroute(cursor: sqlite3.Cursor, packet: dict[str, Any]) -> None:
             packet.get("mesh_packet_id"),
             packet.get("from_node_id"),
             packet.get("to_node_id"),
+            packet.get("channel_id"),
             json.dumps(decoded.route["route_nodes"]),
             json.dumps(decoded.route["snr_towards"]),
             json.dumps(decoded.route["route_back"]),

@@ -22,17 +22,20 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-def _analytics_post_fork(server, worker):  # noqa: ANN001
-    """Gunicorn post_fork hook: warm the analytics cache in each worker.
+def _warm_caches_post_fork(server, worker):  # noqa: ANN001
+    """Gunicorn post_fork hook: warm the background caches in each worker.
 
     With ``preload_app=True`` the app (and its threads) are created in the
     master before forking; threads do not survive fork(), so each worker
-    starts its own analytics refresher here. The worker also lazily starts
-    one on the first /api/analytics request as a safety net.
+    starts its own refresher threads here: the analytics dashboard cache
+    and the /api/locations whole-response cache. The workers also lazily
+    start one on the first relevant request as a safety net.
     """
     from .services.analytics_service import AnalyticsService
+    from .services.locations_response_cache import LocationsResponseCache
 
     AnalyticsService.start_background_refresh()
+    LocationsResponseCache.start_background_refresh()
 
 
 def _build_gunicorn_config(cfg):
@@ -49,7 +52,7 @@ def _build_gunicorn_config(cfg):
         "timeout": 30,
         "keepalive": 2,
         "preload_app": True,
-        "post_fork": _analytics_post_fork,
+        "post_fork": _warm_caches_post_fork,
         "access_log_format": '%({REMOTE_ADDR}e)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" %(D)s',
         "accesslog": "-",
         "errorlog": "-",

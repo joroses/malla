@@ -12,6 +12,10 @@ def ensure_traceroute_schema(cursor: sqlite3.Cursor) -> None:
     Triggers leave raw-only inserts/updates pending, including imports and older
     capture versions. The shared writer replaces the pending record in the same
     transaction. These triggers never decode payloads or examine packet history.
+    A dedicated trigger also mirrors packet_history.channel_id into
+    traceroute_routes so graph readers never need the heavy packet_history join;
+    channel is reception metadata, not a parse input, so it syncs in place
+    instead of invalidating the decoded route.
     """
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS traceroute_routes (
@@ -20,6 +24,7 @@ def ensure_traceroute_schema(cursor: sqlite3.Cursor) -> None:
             mesh_packet_id INTEGER,
             from_node_id INTEGER,
             to_node_id INTEGER,
+            channel_id TEXT,
             route_nodes_json TEXT NOT NULL DEFAULT '[]',
             snr_towards_json TEXT NOT NULL DEFAULT '[]',
             route_back_json TEXT NOT NULL DEFAULT '[]',
@@ -49,6 +54,19 @@ def ensure_traceroute_schema(cursor: sqlite3.Cursor) -> None:
             PRIMARY KEY (packet_id, direction, hop_index)
         )
     """)
+
+    # Databases materialized before channel_id existed get the column added and
+    # backfilled exactly once, when the ALTER runs; copying reception metadata
+    # needs no re-decode, so parser_version stays untouched.
+    route_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(traceroute_routes)")
+    }
+    if "channel_id" not in route_columns:
+        cursor.execute("ALTER TABLE traceroute_routes ADD COLUMN channel_id TEXT")
+        cursor.execute(
+            "UPDATE traceroute_routes SET channel_id = "
+            "(SELECT channel_id FROM packet_history WHERE id = traceroute_routes.packet_id)"
+        )
 
     for name, table, columns in (
         ("routes_time", "traceroute_routes", "timestamp"),
@@ -105,5 +123,13 @@ def ensure_traceroute_schema(cursor: sqlite3.Cursor) -> None:
         BEGIN
             DELETE FROM traceroute_hops WHERE packet_id = OLD.id;
             DELETE FROM traceroute_routes WHERE packet_id = OLD.id;
+        END
+    """)
+    cursor.execute("""
+        CREATE TRIGGER IF NOT EXISTS traceroute_packet_channel
+        AFTER UPDATE OF channel_id ON packet_history
+        BEGIN
+            UPDATE traceroute_routes SET channel_id = NEW.channel_id
+            WHERE packet_id = NEW.id;
         END
     """)

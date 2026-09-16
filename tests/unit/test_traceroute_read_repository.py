@@ -167,7 +167,45 @@ def test_get_traceroute_hops_for_graph_and_longest_links(database):
     assert len(hops) == 3
     assert [h["from_node_id"] for h in hops] == [100, 901, 902]
     assert [h["to_node_id"] for h in hops] == [901, 902, 200]
+    assert all(h["channel_id"] == "LongFast" for h in hops)
     assert len(longest_hops) == 3
+
+
+def test_graph_queries_apply_gateway_and_channel_filters(database):
+    with closing(_connection(database)) as conn:
+        _insert(conn, packet_id=1, timestamp=10.0, mesh_id=1, gateway="!00000001", route=(901,))
+        _insert(conn, packet_id=2, timestamp=20.0, mesh_id=2, gateway="!00000002", route=(902,))
+        # Raw channel update must reach the denormalized route copy.
+        conn.execute("UPDATE packet_history SET channel_id = 'SFNarrow' WHERE id = 2")
+        conn.commit()
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        gateway_hops = get_traceroute_hops_for_graph(
+            filters={
+                "start_time": 0.0,
+                "end_time": 100.0,
+                "gateway_id": "!00000002",
+            }
+        )
+        channel_hops = get_traceroute_hops_for_graph(
+            filters={"start_time": 0.0, "end_time": 100.0, "primary_channel": "SFNarrow"}
+        )
+        aggregates = get_traceroute_graph_aggregates(
+            filters={
+                "start_time": 0.0,
+                "end_time": 100.0,
+                "gateway_id": "!00000001",
+            }
+        )
+
+    assert {h["packet_id"] for h in gateway_hops} == {2}
+    assert {h["channel_id"] for h in gateway_hops} == {"SFNarrow"}
+    assert {h["packet_id"] for h in channel_hops} == {2}
+    assert aggregates["stats"]["total_rf_hops"] == 2
+    assert aggregates["stats"]["packets_analyzed"] == 1
 
 
 def test_hop_query_preserves_zero_snr_hops_in_path_order(database):

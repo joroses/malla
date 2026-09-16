@@ -49,6 +49,7 @@ CREATE TABLE traceroute_routes (
     from_node_id INTEGER,
     to_node_id INTEGER,
     mesh_packet_id INTEGER,
+    channel_id TEXT,
     route_nodes_json TEXT,
     snr_towards_json TEXT,
     route_back_json TEXT,
@@ -109,9 +110,10 @@ def build_graph_hops_database(hops):
                 """
                 INSERT INTO traceroute_routes (
                     packet_id, timestamp, from_node_id, to_node_id,
-                    mesh_packet_id, route_nodes_json, snr_towards_json,
-                    route_back_json, snr_back_json, parse_status, parser_version
-                ) VALUES (?, ?, ?, ?, ?, '[]', '[]', '[]', '[]', 'parsed', ?)
+                    mesh_packet_id, channel_id, route_nodes_json,
+                    snr_towards_json, route_back_json, snr_back_json,
+                    parse_status, parser_version
+                ) VALUES (?, ?, ?, ?, ?, ?, '[]', '[]', '[]', '[]', 'parsed', ?)
                 """,
                 (
                     packet_id,
@@ -119,6 +121,7 @@ def build_graph_hops_database(hops):
                     hop["from_node_id"],
                     hop["to_node_id"],
                     1000 + packet_id,
+                    hop.get("channel_id"),
                     PARSER_VERSION,
                 ),
             )
