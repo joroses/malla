@@ -11,6 +11,7 @@ from malla.database.repositories import LocationRepository
 from malla.database.traceroute_read_repository import (
     get_node_traceroute_statistics,
     get_route_patterns_data,
+    get_traceroute_graph_aggregates,
     get_traceroute_hops_for_graph,
     get_traceroute_hops_for_longest_links,
     get_traceroute_link,
@@ -336,5 +337,139 @@ def test_get_traceroute_link_excludes_zero_snr_from_channel_and_observations(dat
     assert result["total_attempts"] == 2
     assert result["total_count"] == 2
     assert [p["id"] for p in result["packets"]] == [2, 1]
+
+
+def _seed_graph_window(conn):
+    """Six single-hop traceroutes on the 100<->200 pair covering every
+    eligibility bucket, plus a return-direction hop with a distinct channel.
+
+    snr_towards values are protobuf int8 (scaled /4 on write):
+    p1 -7.5 dB | p2 -5.0 dB | p3 -40.0 dB (implausible) | p4 0.0 dB |
+    p5 -32.0 dB (unknown sentinel) | p6 return 200->100 at -5.0 dB SFNarrow.
+    """
+    _insert(conn, packet_id=1, timestamp=10.0, mesh_id=1, gateway="!00000001", route=(), snr_towards=[-30])
+    _insert(conn, packet_id=2, timestamp=20.0, mesh_id=2, gateway="!00000001", route=(), snr_towards=[-20])
+    _insert(conn, packet_id=3, timestamp=30.0, mesh_id=3, gateway="!00000001", route=(), snr_towards=[-160])
+    _insert(conn, packet_id=4, timestamp=40.0, mesh_id=4, gateway="!00000001", route=(), snr_towards=[0])
+    _insert(conn, packet_id=5, timestamp=50.0, mesh_id=5, gateway="!00000001", route=(), snr_towards=[-128])
+    _insert(conn, packet_id=6, timestamp=60.0, mesh_id=6, gateway="!00000001", route=(), snr_towards=[-20])
+    conn.execute("UPDATE packet_history SET channel_id = 'SFNarrow' WHERE id = 6")
+    conn.execute(
+        "UPDATE traceroute_hops SET direction = 'return',"
+        " from_node_id = 200, to_node_id = 100 WHERE packet_id = 6"
+    )
+    conn.commit()
+
+
+def test_get_traceroute_graph_aggregates_buckets_directions_and_stats(database):
+    with closing(_connection(database)) as conn:
+        _seed_graph_window(conn)
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        result = get_traceroute_graph_aggregates(
+            filters={"start_time": 0.0, "end_time": 100.0}
+        )
+
+    (link,) = result["links"]
+    assert (link["link_source"], link["link_target"]) == (100, 200)
+    # Eligible: p1, p2, p5 forward + p6 return; p5 counts as an
+    # observation without contributing SNR.
+    assert link["forward_observations"] == 3
+    assert link["forward_snr_sum"] == pytest.approx(-12.5)
+    assert link["forward_snr_count"] == 2
+    assert link["return_observations"] == 1
+    assert link["return_snr_sum"] == pytest.approx(-5.0)
+    assert link["return_snr_count"] == 1
+    assert link["packet_count"] == 4
+    # Recency argmax is p6: highest (timestamp, packet_id) among eligible.
+    assert link["last_seen"] == 60.0
+    assert link["last_packet_id"] == 6
+    assert link["last_channel"] == "SFNarrow"
+
+    assert result["stats"] == {
+        "packets_analyzed": 6,
+        "packets_with_rf_hops": 6,
+        "total_rf_hops": 6,
+        "links_filtered_by_snr": 1,  # p3 implausible
+        "links_filtered_due_to_snr_0": 1,  # p4
+    }
+
+
+def test_get_traceroute_graph_aggregates_min_snr_floor(database):
+    with closing(_connection(database)) as conn:
+        _seed_graph_window(conn)
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        result = get_traceroute_graph_aggregates(
+            filters={"start_time": 0.0, "end_time": 100.0}, min_snr=-6.0
+        )
+
+    (link,) = result["links"]
+    # Floor -6 dB drops p1 (-7.5) and the sentinel p5 (-32); p2/p6 survive.
+    assert link["forward_observations"] == 1
+    assert link["forward_snr_sum"] == pytest.approx(-5.0)
+    assert link["return_observations"] == 1
+    assert result["stats"]["links_filtered_by_snr"] == 3  # p1, p3, p5
+    assert result["stats"]["links_filtered_due_to_snr_0"] == 1  # p4 passes floor
+
+
+def test_get_traceroute_graph_aggregates_counts_null_snr_as_filtered(database):
+    with closing(_connection(database)) as conn:
+        _insert(conn, packet_id=1, timestamp=10.0, mesh_id=1, gateway="!00000001", route=(), snr_towards=[-20])
+        conn.execute("UPDATE traceroute_hops SET snr = NULL WHERE packet_id = 1")
+        conn.commit()
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        result = get_traceroute_graph_aggregates(
+            filters={"start_time": 0.0, "end_time": 100.0}
+        )
+
+    assert result["links"] == []
+    assert result["stats"]["links_filtered_by_snr"] == 1
+    assert result["stats"]["total_rf_hops"] == 1
+
+
+def test_get_traceroute_graph_aggregates_separates_pairs_on_multihop_route(database):
+    with closing(_connection(database)) as conn:
+        # 100 -> 901 -> 200: two distinct canonical pairs, both forward.
+        _insert(
+            conn,
+            packet_id=1,
+            timestamp=10.0,
+            mesh_id=1,
+            gateway="!00000001",
+            route=(901,),
+            snr_towards=[-24, -16],  # -6.0 dB and -4.0 dB
+        )
+        conn.commit()
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        result = get_traceroute_graph_aggregates(
+            filters={"start_time": 0.0, "end_time": 100.0}
+        )
+
+    by_pair = {(row["link_source"], row["link_target"]): row for row in result["links"]}
+    # Canonical pairs are id-ordered, so 901 -> 200 buckets as the return
+    # direction of pair (200, 901), exactly like the Python loop's
+    # sorted([from, to]) keying.
+    assert set(by_pair) == {(100, 901), (200, 901)}
+    assert by_pair[(100, 901)]["forward_observations"] == 1
+    assert by_pair[(100, 901)]["forward_snr_sum"] == pytest.approx(-6.0)
+    assert by_pair[(100, 901)]["return_observations"] == 0
+    assert by_pair[(200, 901)]["forward_observations"] == 0
+    assert by_pair[(200, 901)]["return_observations"] == 1
+    assert by_pair[(200, 901)]["return_snr_sum"] == pytest.approx(-4.0)
 
 

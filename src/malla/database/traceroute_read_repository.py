@@ -440,6 +440,46 @@ def route_data_from_row(packet: dict[str, Any]) -> dict[str, list[Any]] | None:
         return None
 
 
+def _graph_hop_window(
+    filters: dict[str, Any] | None,
+) -> tuple[str, list[Any], str]:
+    """Shared WHERE/JOIN construction for the graph hop scans.
+
+    Returns the where clause, its parameters, and the join type. Without a
+    gateway filter the joins use CROSS JOIN to pin hops as the outer loop:
+    the planner otherwise drives from idx_traceroute_routes_version
+    (parser_version=?), which matches every route, making cost independent
+    of the time window. A selective gateway equality on packet_history
+    overrides that pin with plain JOINs so the planner can drive from
+    idx_packet_history_gateway_time_desc and fetch only the matching
+    receptions' hops instead of scanning every hop in the window.
+    """
+    filters = dict(filters or {})
+    conditions = [
+        "r.parser_version = ?",
+        "r.parse_status = 'parsed'",
+        "h.from_node_id != 4294967295",
+        "h.to_node_id != 4294967295",
+    ]
+    params: list[Any] = [PARSER_VERSION]
+
+    if filters.get("start_time") is not None:
+        conditions.append("h.timestamp >= ?")
+        params.append(filters["start_time"])
+    if filters.get("end_time") is not None:
+        conditions.append("h.timestamp <= ?")
+        params.append(filters["end_time"])
+    if filters.get("gateway_id"):
+        conditions.append("p.gateway_id = ?")
+        params.append(filters["gateway_id"])
+    if filters.get("primary_channel"):
+        conditions.append("p.channel_id = ?")
+        params.append(filters["primary_channel"])
+
+    join_type = "JOIN" if filters.get("gateway_id") else "CROSS JOIN"
+    return " AND ".join(conditions), params, join_type
+
+
 def get_traceroute_hops_for_graph(
     filters: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
@@ -454,42 +494,11 @@ def get_traceroute_hops_for_graph(
     packet_history is always joined so each hop carries the MQTT channel_id it
     was received on; consumers resolve the modem preset (spreading factor) from
     that channel hint, falling back to the configured preset.
-
-    Without a gateway filter the joins use CROSS JOIN to pin hops as the outer
-    loop: the planner otherwise drives from idx_traceroute_routes_version
-    (parser_version=?), which matches every route, making cost independent of
-    the time window. A selective gateway equality on packet_history overrides
-    that pin with plain JOINs so the planner can drive from
-    idx_packet_history_gateway_time_desc and fetch only the matching
-    receptions' hops instead of scanning every hop in the window.
     """
-    filters = dict(filters or {})
+    where_clause, params, join_type = _graph_hop_window(filters)
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
-        conditions = [
-            "r.parser_version = ?",
-            "r.parse_status = 'parsed'",
-            "h.from_node_id != 4294967295",
-            "h.to_node_id != 4294967295",
-        ]
-        params: list[Any] = [PARSER_VERSION]
-
-        if filters.get("start_time") is not None:
-            conditions.append("h.timestamp >= ?")
-            params.append(filters["start_time"])
-        if filters.get("end_time") is not None:
-            conditions.append("h.timestamp <= ?")
-            params.append(filters["end_time"])
-        if filters.get("gateway_id"):
-            conditions.append("p.gateway_id = ?")
-            params.append(filters["gateway_id"])
-        if filters.get("primary_channel"):
-            conditions.append("p.channel_id = ?")
-            params.append(filters["primary_channel"])
-
-        where_clause = " AND ".join(conditions)
-        join_type = "JOIN" if filters.get("gateway_id") else "CROSS JOIN"
 
         query = f"""
             SELECT
@@ -509,6 +518,159 @@ def get_traceroute_hops_for_graph(
         """
         rows = cursor.execute(query, params).fetchall()
         return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def get_traceroute_graph_aggregates(
+    filters: dict[str, Any] | None = None,
+    *,
+    min_snr: float = -200.0,
+) -> dict[str, Any]:
+    """Aggregate direct-link graph data in SQL for ``include_indirect=False``.
+
+    Buckets the window's hops per canonical node pair entirely inside
+    SQLite, so a multi-day window on a busy broker costs a few thousand
+    aggregate rows instead of millions of hop dicts in the worker's heap
+    (the Python per-hop loop this replaces was the memory/timeout killer
+    on large windows).
+
+    Eligibility mirrors the historical Python filter exactly:
+
+    * implausible SNR, and hops below ``min_snr`` when it is set (any value
+      other than the -200 "unset" sentinel), count as ``links_filtered_by_snr``
+    * plausible zero-SNR hops count as ``links_filtered_due_to_snr_0``
+    * the -32.0 "unknown" sentinel is an observation that contributes no
+      SNR to any average (``*_snr_count`` stays smaller than the matching
+      observation count)
+    * recency hints (``last_seen``/``last_packet_id``/``last_channel``)
+      follow the (timestamp, packet_id) argmax among eligible hops
+
+    Node aggregates are derived from the returned link rows by the caller:
+    every eligible hop touches both endpoints of exactly one canonical
+    pair and its SNR belongs to the transmitting (``from``) node, so pair
+    sums fully determine per-node counts, averages, and recency.
+
+    Stats counters cover every hop in the window (eligible or not),
+    matching the previous whole-window Python statistics.
+    """
+    where_clause, where_params, join_type = _graph_hop_window(filters)
+
+    plausible_sql = (
+        f"COALESCE(h.snr = {TRACEROUTE_UNKNOWN_SNR}"
+        f" OR (h.snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX}), 0)"
+    )
+    # min_snr == -200.0 is the service's "no floor" sentinel.
+    floor_sql = "1" if min_snr == -200.0 else "snr >= ?"
+    floor_params: list[Any] = [] if min_snr == -200.0 else [float(min_snr)]
+
+    window_cte = f"""
+        window_hops AS (
+            SELECT
+                h.packet_id,
+                h.direction,
+                h.timestamp,
+                h.from_node_id,
+                h.to_node_id,
+                h.snr,
+                p.channel_id,
+                {plausible_sql} AS snr_plausible
+            FROM traceroute_hops h
+            {join_type} traceroute_routes r ON r.packet_id = h.packet_id
+            {join_type} packet_history p ON p.id = h.packet_id
+            WHERE {where_clause}
+        )
+    """
+
+    conn = get_db_connection()
+    try:
+        cursor = conn.cursor()
+
+        stats_row = cursor.execute(
+            f"""
+            WITH {window_cte}
+            SELECT
+                COUNT(*) AS total_rf_hops,
+                COUNT(DISTINCT packet_id) AS packets_analyzed,
+                COUNT(DISTINCT packet_id || ':' || direction)
+                    AS packets_with_rf_hops,
+                SUM(
+                    CASE WHEN NOT snr_plausible OR NOT ({floor_sql}) THEN 1 ELSE 0 END
+                ) AS links_filtered_by_snr,
+                SUM(
+                    CASE WHEN snr_plausible AND ({floor_sql}) AND snr = 0
+                         THEN 1 ELSE 0 END
+                ) AS links_filtered_due_to_snr_0
+            FROM window_hops
+            """,
+            [*where_params, *floor_params, *floor_params],
+        ).fetchone()
+
+        link_rows = cursor.execute(
+            f"""
+            WITH {window_cte},
+            eligible AS (
+                SELECT
+                    v.*,
+                    CASE WHEN v.from_node_id <= v.to_node_id
+                         THEN v.from_node_id ELSE v.to_node_id END AS link_source,
+                    CASE WHEN v.from_node_id <= v.to_node_id
+                         THEN v.to_node_id ELSE v.from_node_id END AS link_target,
+                    CASE WHEN v.from_node_id <= v.to_node_id THEN 1 ELSE 0 END
+                        AS is_forward,
+                    (v.snr != {TRACEROUTE_UNKNOWN_SNR}) AS snr_known
+                FROM window_hops v
+                WHERE v.snr_plausible = 1 AND ({floor_sql}) AND v.snr != 0
+            ),
+            pair_ranked AS (
+                SELECT
+                    e.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY e.link_source, e.link_target
+                        ORDER BY e.timestamp DESC, e.packet_id DESC
+                    ) AS recency_rank
+                FROM eligible e
+            )
+            SELECT
+                link_source,
+                link_target,
+                SUM(is_forward) AS forward_observations,
+                COALESCE(
+                    SUM(CASE WHEN is_forward = 1 AND snr_known THEN snr END), 0.0
+                ) AS forward_snr_sum,
+                SUM(
+                    CASE WHEN is_forward = 1 AND snr_known THEN 1 ELSE 0 END
+                ) AS forward_snr_count,
+                SUM(CASE WHEN is_forward = 0 THEN 1 ELSE 0 END) AS return_observations,
+                COALESCE(
+                    SUM(CASE WHEN is_forward = 0 AND snr_known THEN snr END), 0.0
+                ) AS return_snr_sum,
+                SUM(
+                    CASE WHEN is_forward = 0 AND snr_known THEN 1 ELSE 0 END
+                ) AS return_snr_count,
+                COUNT(*) AS packet_count,
+                MAX(CASE WHEN recency_rank = 1 THEN timestamp END) AS last_seen,
+                MAX(CASE WHEN recency_rank = 1 THEN packet_id END) AS last_packet_id,
+                MAX(CASE WHEN recency_rank = 1 THEN channel_id END) AS last_channel
+            FROM pair_ranked
+            GROUP BY link_source, link_target
+            ORDER BY link_source, link_target
+            """,
+            [*where_params, *floor_params],
+        ).fetchall()
+
+        return {
+            "links": [dict(row) for row in link_rows],
+            "stats": {
+                "packets_analyzed": int(stats_row["packets_analyzed"] or 0),
+                "packets_with_rf_hops": int(stats_row["packets_with_rf_hops"] or 0),
+                "total_rf_hops": int(stats_row["total_rf_hops"] or 0),
+                "links_filtered_by_snr": int(stats_row["links_filtered_by_snr"] or 0),
+                "links_filtered_due_to_snr_0": int(
+                    stats_row["links_filtered_due_to_snr_0"] or 0
+                ),
+            },
+        }
     finally:
         conn.close()
 
