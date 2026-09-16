@@ -18,6 +18,7 @@ from malla.database.traceroute_read_repository import get_traceroute_link
 from malla.routes.api_routes import register_api_routes
 from malla.services.location_service import _PACKET_LINKS_CACHE, LocationService
 from malla.services.traceroute_service import _NETWORK_GRAPH_CACHE, TracerouteService
+from tests.fixtures.graph_hops_db import build_graph_hops_database
 
 pytestmark = pytest.mark.unit
 
@@ -54,8 +55,8 @@ class TestNetworkGraphDirectionalAggregation:
         try:
             with (
                 patch(
-                    "malla.services.traceroute_service.get_traceroute_hops_for_graph",
-                    return_value=hops,
+                    "malla.database.traceroute_read_repository.get_db_connection",
+                    return_value=build_graph_hops_database(hops),
                 ),
                 patch(
                     "malla.services.traceroute_service.get_bulk_node_names",
