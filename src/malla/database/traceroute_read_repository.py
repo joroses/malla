@@ -443,14 +443,16 @@ def route_data_from_row(packet: dict[str, Any]) -> dict[str, list[Any]] | None:
 def _graph_hop_window(
     filters: dict[str, Any] | None,
 ) -> tuple[str, list[Any], str]:
-    """Shared WHERE/JOIN construction for the graph hop scans.
+    """Shared WHERE/FROM construction for the graph hop scans.
 
-    Returns the where clause, its parameters, and the join type. Without a
-    gateway filter the joins use CROSS JOIN to pin hops as the outer loop:
-    the planner otherwise drives from idx_traceroute_routes_version
-    (parser_version=?), which matches every route, making cost independent
-    of the time window. A selective gateway equality on packet_history
-    overrides that pin with plain JOINs so the planner can drive from
+    Returns the where clause, its parameters, and the FROM clause. Hops join
+    only traceroute_routes, which carries the denormalized reception
+    channel_id; packet_history (its heavy raw rows) is joined solely for a
+    gateway filter. Without that filter the routes join uses CROSS JOIN to pin
+    hops as the outer loop: the planner otherwise drives from
+    idx_traceroute_routes_version (parser_version=?), which matches every
+    route, making cost independent of the time window. A selective gateway
+    equality overrides that pin with plain JOINs so the planner can drive from
     idx_packet_history_gateway_time_desc and fetch only the matching
     receptions' hops instead of scanning every hop in the window.
     """
@@ -462,6 +464,9 @@ def _graph_hop_window(
         "h.to_node_id != 4294967295",
     ]
     params: list[Any] = [PARSER_VERSION]
+    from_clause = (
+        "traceroute_hops h CROSS JOIN traceroute_routes r ON r.packet_id = h.packet_id"
+    )
 
     if filters.get("start_time") is not None:
         conditions.append("h.timestamp >= ?")
@@ -472,12 +477,15 @@ def _graph_hop_window(
     if filters.get("gateway_id"):
         conditions.append("p.gateway_id = ?")
         params.append(filters["gateway_id"])
+        from_clause = (
+            "traceroute_hops h JOIN traceroute_routes r ON r.packet_id = h.packet_id "
+            "JOIN packet_history p ON p.id = h.packet_id"
+        )
     if filters.get("primary_channel"):
-        conditions.append("p.channel_id = ?")
+        conditions.append("r.channel_id = ?")
         params.append(filters["primary_channel"])
 
-    join_type = "JOIN" if filters.get("gateway_id") else "CROSS JOIN"
-    return " AND ".join(conditions), params, join_type
+    return " AND ".join(conditions), params, from_clause
 
 
 def get_traceroute_hops_for_graph(
@@ -491,11 +499,12 @@ def get_traceroute_hops_for_graph(
     connected-looking path. Quality filtering and continuity validation are the
     caller's responsibility.
 
-    packet_history is always joined so each hop carries the MQTT channel_id it
-    was received on; consumers resolve the modem preset (spreading factor) from
-    that channel hint, falling back to the configured preset.
+    Each hop carries the MQTT channel_id its reception arrived on, read from
+    the route's denormalized copy; consumers resolve the modem preset
+    (spreading factor) from that channel hint, falling back to the configured
+    preset.
     """
-    where_clause, params, join_type = _graph_hop_window(filters)
+    where_clause, params, from_clause = _graph_hop_window(filters)
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -509,10 +518,8 @@ def get_traceroute_hops_for_graph(
                 h.from_node_id,
                 h.to_node_id,
                 h.snr,
-                p.channel_id
-            FROM traceroute_hops h
-            {join_type} traceroute_routes r ON r.packet_id = h.packet_id
-            {join_type} packet_history p ON p.id = h.packet_id
+                r.channel_id
+            FROM {from_clause}
             WHERE {where_clause}
             ORDER BY h.timestamp DESC, h.packet_id, h.direction, h.hop_index
         """
@@ -554,7 +561,7 @@ def get_traceroute_graph_aggregates(
     Stats counters cover every hop in the window (eligible or not),
     matching the previous whole-window Python statistics.
     """
-    where_clause, where_params, join_type = _graph_hop_window(filters)
+    where_clause, where_params, from_clause = _graph_hop_window(filters)
 
     plausible_sql = (
         f"COALESCE(h.snr = {TRACEROUTE_UNKNOWN_SNR}"
@@ -573,11 +580,9 @@ def get_traceroute_graph_aggregates(
                 h.from_node_id,
                 h.to_node_id,
                 h.snr,
-                p.channel_id,
+                r.channel_id,
                 {plausible_sql} AS snr_plausible
-            FROM traceroute_hops h
-            {join_type} traceroute_routes r ON r.packet_id = h.packet_id
-            {join_type} packet_history p ON p.id = h.packet_id
+            FROM {from_clause}
             WHERE {where_clause}
         )
     """

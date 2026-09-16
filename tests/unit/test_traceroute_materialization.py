@@ -123,6 +123,7 @@ def test_capture_preserves_repeated_hops_and_gateway_receptions(database):
     assert routes[0]["mesh_packet_id"] == routes[1]["mesh_packet_id"] == 42
     for route in routes:
         assert route["parse_status"] == "parsed"
+        assert route["channel_id"] == "LongFast"
         assert json.loads(route["route_nodes_json"]) == [110, 100, 110]
         hops = conn.execute(
             "SELECT hop_index, from_node_id, to_node_id, snr FROM traceroute_hops "
@@ -468,4 +469,47 @@ def test_new_decoder_reprepares_old_records(database, monkeypatch):
     assert (
         conn.execute("SELECT parser_version FROM traceroute_routes").fetchone()[0]
         == PARSER_VERSION + 1
+    )
+
+
+def test_channel_update_syncs_route_without_invalidating(database):
+    _, conn = database
+    capture(payload(snr=[4]))
+    with conn:
+        conn.execute("UPDATE packet_history SET channel_id = 'SFNarrow'")
+    route = conn.execute(
+        "SELECT channel_id, parse_status FROM traceroute_routes"
+    ).fetchone()
+    # Channel is reception metadata, so a raw update syncs the denormalized
+    # copy in place instead of flipping the route back to pending.
+    assert route["channel_id"] == "SFNarrow"
+    assert route["parse_status"] == "parsed"
+    assert inspect_traceroutes(conn.cursor())["complete"]
+
+
+def test_schema_migration_backfills_route_channel_id(database):
+    _, conn = database
+    capture(payload(snr=[4]))
+    assert (
+        conn.execute("SELECT channel_id FROM traceroute_routes").fetchone()[0]
+        == "LongFast"
+    )
+    # Rewind to the pre-channel schema, then let the startup guard migrate it.
+    with conn:
+        conn.execute("DROP TRIGGER traceroute_packet_channel")
+        conn.execute("ALTER TABLE traceroute_routes DROP COLUMN channel_id")
+    with conn:
+        conn.execute("BEGIN")
+        ensure_traceroute_schema(conn.cursor())
+    assert (
+        conn.execute("SELECT channel_id FROM traceroute_routes").fetchone()[0]
+        == "LongFast"
+    )
+    # Re-running the guard must not disturb stored channels.
+    with conn:
+        conn.execute("BEGIN")
+        ensure_traceroute_schema(conn.cursor())
+    assert (
+        conn.execute("SELECT channel_id FROM traceroute_routes").fetchone()[0]
+        == "LongFast"
     )

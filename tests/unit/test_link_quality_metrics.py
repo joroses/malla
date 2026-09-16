@@ -853,7 +853,7 @@ class TestPacketLinksMetrics:
 
 
 class TestHopQueryChannelSelection:
-    """get_traceroute_hops_for_graph always joins packet_history for channel."""
+    """get_traceroute_hops_for_graph returns each hop's reception channel."""
 
     @pytest.fixture
     def database(self, tmp_path):
