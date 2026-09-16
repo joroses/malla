@@ -49,8 +49,9 @@ _chat_relay_candidate_cache: dict[
 ] = {}
 
 # /api/locations derives the link-window end from "now" whenever the client
-# sends only start_time (the map's default). Raw datetime.now() floats carry
-# microsecond precision, giving every request a unique filter set and turning
+# sends only start_time (the map's default) or no time parameters at all (the
+# wide 14-day default window). Raw datetime.now() floats carry microsecond
+# precision, giving every request a unique filter set and turning
 # the _NETWORK_GRAPH_CACHE/_PACKET_LINKS_CACHE TTL caches into guaranteed
 # misses. Server-derived times are snapped onto this grid instead;
 # client-supplied start_time/end_time are never adjusted.
@@ -783,17 +784,27 @@ def api_locations():
     start_time_perf = time.time()
     logger.info("API locations endpoint accessed")
     try:
-        from datetime import datetime, timedelta
+        from datetime import datetime
 
         now = datetime.now()
         max_window_seconds = 14 * 24 * 3600
 
+        # Ceil (not floor) so the derived end can never precede a client
+        # start_time picked seconds ago within the current grid bucket.
+        server_now = (
+            math.ceil(now.timestamp() / _LOCATIONS_NOW_GRID_SECONDS)
+            * _LOCATIONS_NOW_GRID_SECONDS
+        )
+
         # Wide position-lookup window (performance cap only). This window is
         # intentionally NOT narrowed by the client's time selection so nodes
-        # with stale GPS fixes remain visible while active.
+        # with stale GPS fixes remain visible while active. Both bounds are
+        # snapped onto the cache grid — this dict also becomes the link
+        # window for parameterless requests, and raw datetime.now() floats
+        # would mint a unique filter set (and cache key) on every hit.
         position_filters: dict[str, Any] = {
-            "start_time": (now - timedelta(seconds=max_window_seconds)).timestamp(),
-            "end_time": now.timestamp(),
+            "start_time": server_now - max_window_seconds,
+            "end_time": server_now,
         }
 
         # ------------------------------------------------------------------
@@ -807,13 +818,6 @@ def api_locations():
         hours_arg = request.args.get("hours", type=float)
         if hours_arg is None:
             hours_arg = request.args.get("max_age_hours", type=float)
-
-        # Ceil (not floor) so the derived end can never precede a client
-        # start_time picked seconds ago within the current grid bucket.
-        server_now = (
-            math.ceil(now.timestamp() / _LOCATIONS_NOW_GRID_SECONDS)
-            * _LOCATIONS_NOW_GRID_SECONDS
-        )
 
         link_filters: dict[str, Any] = {}
         if start_arg is not None or end_arg is not None or hours_arg:

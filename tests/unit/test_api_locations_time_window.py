@@ -122,9 +122,14 @@ class TestApiLocationsTimeWindow:
 
         assert response.status_code == 200
         graph_filters = mocked_location_services["graph"].call_args.kwargs["filters"]
-        # Start must be roughly 14 days ago (allow small execution slack)
+        # Start must be roughly 14 days ago; the ceiled grid end can sit up
+        # to one grid step ahead of wall-clock time, dragging start with it.
+        from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
+
         assert before - 14 * 24 * 3600 - 5 <= graph_filters["start_time"]
-        assert graph_filters["start_time"] <= before - 14 * 24 * 3600 + 5
+        assert graph_filters["start_time"] <= (
+            before - 14 * 24 * 3600 + _LOCATIONS_NOW_GRID_SECONDS
+        )
 
     @pytest.mark.unit
     def test_window_capped_at_14_days(self, client, mocked_location_services):
@@ -237,3 +242,35 @@ class TestApiLocationsTimeWindow:
         # Identical within a bucket; one grid step apart at most if a bucket
         # boundary happened to be crossed between the two requests.
         assert second_end - first_end in (0, _LOCATIONS_NOW_GRID_SECONDS)
+
+    @pytest.mark.unit
+    def test_default_window_snapped_to_grid(self, client, mocked_location_services):
+        """Parameterless requests also resolve a grid-stable window.
+
+        The no-params path copies the wide 14-day position window into the
+        link filters; building that window from raw datetime.now()
+        (microsecond floats) gave every default request a unique filter
+        set, so the service-layer TTL caches never hit for the most
+        common request of all (map first load, LocationCache, packet
+        detail pages).
+        """
+        from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
+
+        client.get("/api/locations")
+        client.get("/api/locations")
+
+        calls = mocked_location_services["graph"].call_args_list
+        first = calls[0].kwargs["filters"]
+        second = calls[1].kwargs["filters"]
+        for filters in (first, second):
+            assert filters["end_time"] % _LOCATIONS_NOW_GRID_SECONDS == 0
+        # Identical within a bucket; one grid step apart at most if a bucket
+        # boundary happened to be crossed between the two requests.
+        assert second["end_time"] - first["end_time"] in (
+            0,
+            _LOCATIONS_NOW_GRID_SECONDS,
+        )
+        assert second["start_time"] - first["start_time"] in (
+            0,
+            _LOCATIONS_NOW_GRID_SECONDS,
+        )
