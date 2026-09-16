@@ -426,35 +426,32 @@ class TestLocationEndpoints:
 
             # Test enhanced fields for map display
             enhanced_fields = [
-                "age_hours",
                 "timestamp_str",
-                "direct_neighbors",
-                "neighbors",
-                "sats_in_view",
+                "precision_bits",
+                "precision_meters",
+                "last_seen_network",
+                "last_seen_packet",
             ]
             for field in enhanced_fields:
                 assert field in location, f"Missing enhanced field: {field}"
 
             # Test field types
-            assert isinstance(location["age_hours"], int | float)
             assert isinstance(location["timestamp_str"], str)
-            assert isinstance(location["direct_neighbors"], int)
-            assert isinstance(location["neighbors"], list)
 
-            # Test neighbor structure if neighbors exist
-            if location["neighbors"]:
-                neighbor = location["neighbors"][0]
-                assert "neighbor_id" in neighbor
-                assert "traceroute_count" in neighbor
-                assert "packet_count" in neighbor
-                # All neighbors should have these fields
-                assert isinstance(neighbor["traceroute_count"], int)
-                assert isinstance(neighbor["packet_count"], int)
-                # SNR should be present (may be None)
-                assert "avg_snr" in neighbor
-                # RSSI may be present for direct packet neighbors
-                if neighbor["packet_count"] > 0:
-                    assert "avg_rssi" in neighbor
+            # Regression guard: fields trimmed from the payload as dead
+            # weight (no frontend consumer). Keep in sync with
+            # LocationService.get_node_locations.
+            trimmed_fields = [
+                "neighbors",
+                "direct_neighbors",
+                "age_hours",
+                "sats_in_view",
+                "packet_count",
+                "avg_snr",
+                "position_timestamp_str",
+            ]
+            for field in trimmed_fields:
+                assert field not in location, f"Unexpected trimmed field: {field}"
 
         # Test traceroute_links structure
         traceroute_links = data["traceroute_links"]

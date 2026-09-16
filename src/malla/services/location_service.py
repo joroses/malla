@@ -154,51 +154,10 @@ class LocationService:
         network_processing_start = time.time()
         network_nodes = {node["id"]: node for node in network_data.get("nodes", [])}
 
-        # Create neighbor count maps
-        neighbor_counts = {}
-        neighbor_details: dict[int, list[dict[str, Any]]] = {}
-
-        # Process network links to build neighbor relationships
-        for link in network_data.get("links", []):
-            source_id = link["source"]
-            target_id = link["target"]
-
-            # Track neighbors
-            if source_id not in neighbor_counts:
-                neighbor_counts[source_id] = 0
-                neighbor_details[source_id] = []
-            if target_id not in neighbor_counts:
-                neighbor_counts[target_id] = 0
-                neighbor_details[target_id] = []
-
-            neighbor_counts[source_id] += 1
-            neighbor_counts[target_id] += 1
-
-            # Add neighbor details with proper SNR values and traceroute count
-            avg_snr = link.get("avg_snr")
-            traceroute_count = link.get("packet_count", 0)
-
-            neighbor_details[source_id].append(
-                {
-                    "neighbor_id": target_id,
-                    "avg_snr": avg_snr,
-                    "traceroute_count": traceroute_count,
-                    "packet_count": 0,  # Will be updated if direct packets exist
-                }
-            )
-            neighbor_details[target_id].append(
-                {
-                    "neighbor_id": source_id,
-                    "avg_snr": avg_snr,
-                    "traceroute_count": traceroute_count,
-                    "packet_count": 0,  # Will be updated if direct packets exist
-                }
-            )
-
-        # Track latest direct packet reception timestamp per node
+        # Track latest direct packet reception timestamp per node; it feeds
+        # the unified activity timestamp (last_seen_packet) below.
         packet_last_seen: dict[int, float] = {}
 
-        # Process packet links to add to neighbor details
         try:
             # Use pre-computed packet links if provided, otherwise fetch them
             if packet_links is None:
@@ -213,88 +172,20 @@ class LocationService:
 
                 packet_links = LocationService.get_packet_links(packet_filters)
 
-            # Process packet links to add to neighbor details
             for link in packet_links:
-                from_node_id = link["from_node_id"]
-                to_node_id = link["to_node_id"]
-                packet_count = link.get("total_hops_seen", 0)
                 link_ts = link.get("last_seen")
                 if link_ts:
-                    if (
-                        from_node_id not in packet_last_seen
-                        or link_ts > packet_last_seen[from_node_id]
-                    ):
-                        packet_last_seen[from_node_id] = link_ts
-                    if (
-                        to_node_id not in packet_last_seen
-                        or link_ts > packet_last_seen[to_node_id]
-                    ):
-                        packet_last_seen[to_node_id] = link_ts
-
-                # Initialize neighbor tracking if not already present
-                if from_node_id not in neighbor_counts:
-                    neighbor_counts[from_node_id] = 0
-                    neighbor_details[from_node_id] = []
-                if to_node_id not in neighbor_counts:
-                    neighbor_counts[to_node_id] = 0
-                    neighbor_details[to_node_id] = []
-
-                # Check if we already have this neighbor relationship from traceroute data
-                existing_neighbor_from = next(
-                    (
-                        n
-                        for n in neighbor_details[from_node_id]
-                        if n["neighbor_id"] == to_node_id
-                    ),
-                    None,
-                )
-                existing_neighbor_to = next(
-                    (
-                        n
-                        for n in neighbor_details[to_node_id]
-                        if n["neighbor_id"] == from_node_id
-                    ),
-                    None,
-                )
-
-                if existing_neighbor_from:
-                    # Update existing neighbor with packet data
-                    existing_neighbor_from["packet_count"] = packet_count
-                    existing_neighbor_from["avg_rssi"] = link.get("avg_rssi")
-                else:
-                    # Add new neighbor from packet data
-                    neighbor_counts[from_node_id] += 1
-                    neighbor_details[from_node_id].append(
-                        {
-                            "neighbor_id": to_node_id,
-                            "avg_snr": link.get("avg_snr"),
-                            "avg_rssi": link.get("avg_rssi"),
-                            "traceroute_count": 0,
-                            "packet_count": packet_count,
-                        }
-                    )
-
-                if existing_neighbor_to:
-                    # Update existing neighbor with packet data
-                    existing_neighbor_to["packet_count"] = packet_count
-                    existing_neighbor_to["avg_rssi"] = link.get("avg_rssi")
-                else:
-                    # Add new neighbor from packet data
-                    neighbor_counts[to_node_id] += 1
-                    neighbor_details[to_node_id].append(
-                        {
-                            "neighbor_id": from_node_id,
-                            "avg_snr": link.get("avg_snr"),
-                            "avg_rssi": link.get("avg_rssi"),
-                            "traceroute_count": 0,
-                            "packet_count": packet_count,
-                        }
-                    )
+                    for link_node_id in (link["from_node_id"], link["to_node_id"]):
+                        if (
+                            link_node_id not in packet_last_seen
+                            or link_ts > packet_last_seen[link_node_id]
+                        ):
+                            packet_last_seen[link_node_id] = link_ts
 
         except Exception as e:
-            logger.warning(f"Failed to get packet links for neighbor data: {e}")
+            logger.warning(f"Failed to get packet links for activity data: {e}")
 
-        timing_breakdown["neighbor_processing"] = time.time() - network_processing_start
+        timing_breakdown["packet_activity"] = time.time() - network_processing_start
 
         # Enhance location data with network topology information
         enhancement_start = time.time()
@@ -306,9 +197,6 @@ class LocationService:
 
             # Get network data for this node
             network_node = network_nodes.get(node_id, {})
-            direct_neighbors = neighbor_counts.get(node_id, 0)
-            neighbors = neighbor_details.get(node_id, [])
-
             network_last_seen = network_node.get("last_seen")
             pkt_last_seen = packet_last_seen.get(node_id)
 
@@ -321,15 +209,9 @@ class LocationService:
                 active_candidates.append(pkt_last_seen)
             active_timestamp = max(active_candidates)
 
-            # Calculate age in hours relative to the latest active timestamp
-            age_hours = (current_time - active_timestamp) / 3600
-
-            # Format timestamp strings
+            # Format timestamp string
             timestamp_dt = datetime.fromtimestamp(active_timestamp, UTC)
             timestamp_str = timestamp_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-            pos_dt = datetime.fromtimestamp(location["timestamp"], UTC)
-            pos_str = pos_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
             enhanced_location = {
                 # Original location data
@@ -346,18 +228,11 @@ class LocationService:
                 "altitude": location["altitude"],
                 "timestamp": active_timestamp,
                 "position_timestamp": location["timestamp"],
-                "position_timestamp_str": pos_str,
                 # Enhanced fields for map display
-                "age_hours": round(age_hours, 2),
                 "timestamp_str": timestamp_str,
-                "direct_neighbors": direct_neighbors,
-                "neighbors": neighbors,
-                "sats_in_view": location.get("sats_in_view"),
                 "precision_bits": location.get("precision_bits"),
                 "precision_meters": location.get("precision_meters"),
                 # Network analysis data
-                "packet_count": network_node.get("packet_count", 0),
-                "avg_snr": network_node.get("avg_snr"),
                 "last_seen_network": network_last_seen,
                 "last_seen_packet": pkt_last_seen,
             }

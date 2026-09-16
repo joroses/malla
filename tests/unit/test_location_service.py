@@ -63,7 +63,8 @@ class TestLocationServiceNodeLocations:
         assert node["timestamp"] == tr_time
         # position_timestamp must preserve original position packet timestamp
         assert node["position_timestamp"] == pos_time
-        assert "position_timestamp_str" in node
+        # trimmed payload fields must stay absent
+        assert "position_timestamp_str" not in node
         assert node["last_seen_network"] == tr_time
 
     @pytest.mark.unit
