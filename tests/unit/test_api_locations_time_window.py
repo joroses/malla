@@ -12,12 +12,23 @@ from unittest.mock import patch
 
 import pytest
 
+from src.malla.services.locations_response_cache import LocationsResponseCache
+
 EMPTY_NETWORK_DATA = {"nodes": [], "links": []}
 
 
 @pytest.fixture
-def mocked_location_services():
-    """Patch the expensive service calls used by /api/locations."""
+def mocked_location_services(monkeypatch):
+    """Patch the expensive service calls used by /api/locations.
+
+    Also keeps the response cache from lazily spawning its refresher
+    thread inside these tests: the assertions below reason about which
+    windows the service layer was invoked with, and a background default
+    warm would add unrelated calls.
+    """
+    monkeypatch.setattr(
+        LocationsResponseCache, "_ensure_background_refresh", lambda *a: None
+    )
     with (
         patch(
             "src.malla.routes.api_routes.TracerouteService.get_network_graph_data",
@@ -251,11 +262,12 @@ class TestApiLocationsTimeWindow:
 
         The map materializes its preset start_time from the client clock at
         page-load time, so back-to-back visits send start_times a few
-        seconds apart. Un-snapped, each visit minted a unique
-        _NETWORK_GRAPH_CACHE key and re-ran the full multi-day graph build
-        (which can take minutes on large windows) instead of hitting the
-        TTL cache. Both starts inside one grid bucket must collapse onto
-        the same window.
+        seconds apart. Un-snapped, each visit minted a unique window and
+        re-ran the full multi-day graph build (which can take minutes on
+        large windows). Both starts inside one grid bucket must collapse
+        onto the same window — served from the whole-response cache, so
+        the second visit neither recomputes nor re-resolves different
+        filters.
         """
         from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
 
@@ -266,31 +278,36 @@ class TestApiLocationsTimeWindow:
         start_a = bucket - 24 * 3600 + 5  # same grid bucket, seconds apart
         start_b = bucket - 24 * 3600 + 20
 
-        client.get(f"/api/locations?start_time={start_a}&end_time={end}")
-        client.get(f"/api/locations?start_time={start_b}&end_time={end}")
+        first = client.get(f"/api/locations?start_time={start_a}&end_time={end}")
+        second = client.get(f"/api/locations?start_time={start_b}&end_time={end}")
 
-        calls = mocked_location_services["graph"].call_args_list
-        assert calls[0].kwargs["filters"] == calls[1].kwargs["filters"]
-
-        packet_calls = mocked_location_services["packet_links"].call_args_list
-        assert packet_calls[0].args[0] == packet_calls[1].args[0]
+        assert first.status_code == second.status_code == 200
+        assert second.data == first.data
+        # One compute total: the second visit hit the response cache.
+        assert mocked_location_services["graph"].call_count == 1
+        assert mocked_location_services["packet_links"].call_count == 1
+        filters = first.get_json()["filters_applied"]
+        assert filters["start_time"] % _LOCATIONS_NOW_GRID_SECONDS == 0
+        assert filters["end_time"] % _LOCATIONS_NOW_GRID_SECONDS == 0
 
     @pytest.mark.unit
     def test_repeated_requests_resolve_identical_windows(
         self, client, mocked_location_services
     ):
         """Back-to-back requests with the same start_time resolve the same
-        server-derived window (cache hit); without grid snapping every
-        request produced a fresh microsecond end_time (guaranteed miss)."""
+        server-derived window (response cache hit); without grid snapping
+        every request produced a fresh microsecond end_time (guaranteed
+        miss and recompute)."""
         from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
 
         start = int(time_module.time()) - 24 * 3600
-        client.get(f"/api/locations?start_time={start}")
-        client.get(f"/api/locations?start_time={start}")
+        first = client.get(f"/api/locations?start_time={start}")
+        second = client.get(f"/api/locations?start_time={start}")
 
-        calls = mocked_location_services["graph"].call_args_list
-        first_end = calls[0].kwargs["filters"]["end_time"]
-        second_end = calls[1].kwargs["filters"]["end_time"]
+        assert first.status_code == second.status_code == 200
+        first_end = first.get_json()["filters_applied"]["end_time"]
+        second_end = second.get_json()["filters_applied"]["end_time"]
+        assert first_end % _LOCATIONS_NOW_GRID_SECONDS == 0
         # Identical within a bucket; one grid step apart at most if a bucket
         # boundary happened to be crossed between the two requests.
         assert second_end - first_end in (0, _LOCATIONS_NOW_GRID_SECONDS)
@@ -302,27 +319,26 @@ class TestApiLocationsTimeWindow:
         The no-params path copies the wide 14-day position window into the
         link filters; building that window from raw datetime.now()
         (microsecond floats) gave every default request a unique filter
-        set, so the service-layer TTL caches never hit for the most
-        common request of all (map first load, LocationCache, packet
-        detail pages).
+        set, so the caches never hit for the most common request of all
+        (map first load, LocationCache, packet detail pages).
         """
         from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
 
-        client.get("/api/locations")
-        client.get("/api/locations")
+        first = client.get("/api/locations")
+        second = client.get("/api/locations")
 
-        calls = mocked_location_services["graph"].call_args_list
-        first = calls[0].kwargs["filters"]
-        second = calls[1].kwargs["filters"]
-        for filters in (first, second):
+        assert first.status_code == second.status_code == 200
+        first_filters = first.get_json()["filters_applied"]
+        second_filters = second.get_json()["filters_applied"]
+        for filters in (first_filters, second_filters):
             assert filters["end_time"] % _LOCATIONS_NOW_GRID_SECONDS == 0
         # Identical within a bucket; one grid step apart at most if a bucket
         # boundary happened to be crossed between the two requests.
-        assert second["end_time"] - first["end_time"] in (
+        assert second_filters["end_time"] - first_filters["end_time"] in (
             0,
             _LOCATIONS_NOW_GRID_SECONDS,
         )
-        assert second["start_time"] - first["start_time"] in (
+        assert second_filters["start_time"] - first_filters["start_time"] in (
             0,
             _LOCATIONS_NOW_GRID_SECONDS,
         )
@@ -353,14 +369,15 @@ class TestApiLocationsTimeWindow:
     def test_reloads_a_minute_apart_share_one_window(
         self, client, mocked_location_services
     ):
-        """Reloads ~60 s apart resolve identical windows (TTL cache hits).
+        """Reloads ~60 s apart resolve identical windows (cache hits).
 
         With a 30 s grid the derived bounds rolled every 30 s while the
-        service caches lived 60 s, so any two visits more than 30 s apart
-        minted different start_time/end_time, different cache keys, and a
-        full recompute. The grid now exceeds the TTL: the two simulated
-        visits below (60 s apart, pinned mid-bucket away from a grid edge)
-        must resolve identical filters and therefore share one cache entry.
+        caches lived 60 s, so any two visits more than 30 s apart minted
+        different start_time/end_time, different cache keys, and a full
+        recompute. The grid now exceeds the TTL: the two simulated
+        visits below (60 s apart, pinned mid-bucket away from a grid
+        edge) must resolve identical filters — the second visit is
+        served the cached response bytes without recompute.
         """
         import datetime as datetime_module
         import sys
@@ -385,12 +402,14 @@ class TestApiLocationsTimeWindow:
             patch.dict(sys.modules, {"datetime": frozen_datetime_module}),
             patch("time.time", side_effect=lambda: clock["t"]),
         ):
-            client.get("/api/locations?hours=24")
+            first = client.get("/api/locations?hours=24")
             clock["t"] += 60
-            client.get("/api/locations?hours=24")
+            second = client.get("/api/locations?hours=24")
 
-        graph_calls = mocked_location_services["graph"].call_args_list
-        assert graph_calls[0].kwargs["filters"] == graph_calls[1].kwargs["filters"]
-
+        assert first.status_code == second.status_code == 200
+        assert second.data == first.data
+        # One compute total: the reload 60 s later hit the response cache.
+        assert mocked_location_services["graph"].call_count == 1
         packet_calls = mocked_location_services["packet_links"].call_args_list
-        assert packet_calls[0].args[0] == packet_calls[1].args[0]
+        assert len(packet_calls) == 1
+        assert packet_calls[0].args[0]["start_time"] % grid == 0

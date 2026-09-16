@@ -19,6 +19,26 @@ from tests.fixtures.database_fixtures import DatabaseFixtures
 from tests.fixtures.traceroute_graph_data import get_sample_graph_data
 
 
+@pytest.fixture(autouse=True)
+def _isolated_locations_response_cache():
+    """Isolate the /api/locations whole-response cache between tests.
+
+    The cache is process-global and keyed only by the resolved window, so
+    without this guard a request in one test would be served the body
+    minted against a previous test's (already deleted) database. Also
+    stops any lazily started refresher thread so background refreshes
+    never outlive the patches and databases of the test that started
+    them.
+    """
+    from src.malla.services.locations_response_cache import LocationsResponseCache
+
+    LocationsResponseCache.stop_background_refresh()
+    LocationsResponseCache.clear()
+    yield
+    LocationsResponseCache.stop_background_refresh()
+    LocationsResponseCache.clear()
+
+
 @pytest.fixture(scope="session")
 def worker_id(request):
     """Get the worker ID for pytest-xdist parallel execution.

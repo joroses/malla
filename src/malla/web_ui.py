@@ -331,12 +331,15 @@ def main():
         # Create the application
         app = create_app()
 
-        # Warm the analytics cache before serving: the refresher thread
-        # computes the dashboard payload now and keeps it fresh in the
-        # background, so no visitor ever waits inside a compute window.
+        # Warm the caches before serving: refresher threads compute the
+        # analytics dashboard and /api/locations payloads now and keep
+        # them fresh in the background, so no visitor ever waits inside
+        # a compute window.
         from .services.analytics_service import AnalyticsService
+        from .services.locations_response_cache import LocationsResponseCache
 
         AnalyticsService.start_background_refresh()
+        LocationsResponseCache.start_background_refresh()
 
         # Use configuration values (environment overrides already applied)
         cfg: AppConfig = app.config.get("APP_CONFIG")  # type: ignore[assignment]

@@ -51,22 +51,129 @@ def _prune_packet_links_cache(now: float) -> None:
             _PACKET_LINKS_CACHE.pop(key, None)
 
 
+NodeLocationsCacheKey = tuple[
+    float | None,  # start_time
+    float | None,  # end_time
+    int | None,  # gateway_id
+    tuple[int, ...] | None,  # node_ids
+    float | None,  # min_age_hours
+    float | None,  # max_age_hours
+]
+
 _NODE_LOCATIONS_CACHE: dict[
-    tuple[Any, Any, Any], tuple[float, list[dict[str, Any]]]
+    NodeLocationsCacheKey, tuple[float, list[dict[str, Any]]]
 ] = {}
 _NODE_LOCATIONS_CACHE_TTL_SECONDS = 60
 _NODE_LOCATIONS_CACHE_MAX_ENTRIES = 64
 
 
+def _canonicalize_id(val: Any) -> int | None:
+    if val is None:
+        return None
+    if isinstance(val, str):
+        if val.startswith("!"):
+            try:
+                return int(val[1:], 16)
+            except ValueError:
+                return None
+        try:
+            return int(val, 16) if not val.isdigit() else int(val)
+        except ValueError:
+            return None
+    try:
+        return int(val)
+    except (ValueError, TypeError):
+        return None
+
+
+def _canonicalize_node_ids(node_ids: Any) -> tuple[int, ...] | None:
+    if not node_ids:
+        return None
+    if isinstance(node_ids, (int, str)):
+        node_ids = [node_ids]
+    try:
+        parsed = [_canonicalize_id(nid) for nid in node_ids]
+    except TypeError:
+        return None
+    valid_ids = [nid for nid in parsed if nid is not None]
+    return tuple(sorted(set(valid_ids))) if valid_ids else None
+
+
+def _canonicalize_float(val: Any) -> float | None:
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (ValueError, TypeError):
+        return None
+
+
+_CANONICAL_FILTER_KEYS = frozenset(
+    {
+        "start_time",
+        "end_time",
+        "gateway_id",
+        "node_ids",
+        "min_age_hours",
+        "max_age_hours",
+    }
+)
+
+
+def _canonicalize_filters(
+    filters: dict[str, Any] | None,
+) -> tuple[NodeLocationsCacheKey, dict[str, Any]]:
+    """Canonicalize the node-locations filters for caching *and* querying.
+
+    The cache identity and the repository query must be derived from the
+    same normalized values. Canonicalizing only the cache key let raw
+    filter spellings poison shared entries: ``node_ids="12"`` was iterated
+    by the repository character-by-character (nodes 1 and 2) while the
+    key claimed node 12, and ``gateway_id=42`` vs ``gateway_id="!0000002a"``
+    shared a key yet queried different rows. The returned dict keeps any
+    other filter keys verbatim; the six canonical keys are replaced by
+    their canonical forms, with ``gateway_id`` rendered as the ``!<8-hex>``
+    TEXT form every queryable column stores (mirroring get_packet_links).
+    """
+    filters = filters or {}
+    start_time = _canonicalize_float(filters.get("start_time"))
+    end_time = _canonicalize_float(filters.get("end_time"))
+    gateway_id = _canonicalize_id(filters.get("gateway_id"))
+    node_ids = _canonicalize_node_ids(filters.get("node_ids"))
+    min_age_hours = _canonicalize_float(filters.get("min_age_hours"))
+    max_age_hours = _canonicalize_float(filters.get("max_age_hours"))
+
+    key: NodeLocationsCacheKey = (
+        start_time,
+        end_time,
+        gateway_id,
+        node_ids,
+        min_age_hours,
+        max_age_hours,
+    )
+
+    normalized = {
+        k: v for k, v in filters.items() if k not in _CANONICAL_FILTER_KEYS
+    }
+    if start_time is not None:
+        normalized["start_time"] = start_time
+    if end_time is not None:
+        normalized["end_time"] = end_time
+    if gateway_id is not None:
+        normalized["gateway_id"] = f"!{gateway_id & 0xFFFFFFFF:08x}"
+    if node_ids is not None:
+        normalized["node_ids"] = list(node_ids)
+    if min_age_hours is not None:
+        normalized["min_age_hours"] = min_age_hours
+    if max_age_hours is not None:
+        normalized["max_age_hours"] = max_age_hours
+    return key, normalized
+
+
 def _node_locations_cache_key(
     filters: dict[str, Any] | None,
-) -> tuple[Any, Any, Any]:
-    filters = filters or {}
-    return (
-        filters.get("start_time"),
-        filters.get("end_time"),
-        filters.get("gateway_id"),
-    )
+) -> NodeLocationsCacheKey:
+    return _canonicalize_filters(filters)[0]
 
 
 def _prune_node_locations_cache(now: float) -> None:
@@ -91,6 +198,12 @@ class LocationService:
     """Service for location-related operations and calculations."""
 
     @staticmethod
+    def clear_cache() -> None:
+        """Clear cached node locations and packet links (tests, resets)."""
+        _NODE_LOCATIONS_CACHE.clear()
+        _PACKET_LINKS_CACHE.clear()
+
+    @staticmethod
     def get_node_locations(
         filters: dict[str, Any] | None = None,
         network_data: dict[str, Any] | None = None,
@@ -110,8 +223,13 @@ class LocationService:
         if filters is None:
             filters = {}
 
+        # One canonicalization drives both the cache identity and the
+        # repository query, so a cache entry always describes exactly the
+        # rows its key's spellings (int/decimal/hex/!hex, scalar vs list)
+        # will query.
+        filters_key, filters = _canonicalize_filters(filters)
         cache_key = (
-            _node_locations_cache_key(filters)
+            filters_key
             if network_data is None and packet_links is None
             else None
         )
