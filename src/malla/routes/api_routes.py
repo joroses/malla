@@ -4,11 +4,10 @@ API routes for the Meshtastic Mesh Health Web UI
 
 import json
 import logging
-import math
 import time
 from typing import Any
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, Response, jsonify, request
 
 from ..database import (
     DashboardRepository,
@@ -26,6 +25,24 @@ from ..database.traceroute_read_repository import (
 from ..models.traceroute import TraceroutePacket
 from ..services.analytics_service import AnalyticsService
 from ..services.location_service import LocationService
+from ..services.locations_response_cache import (
+    LocationsResponseCache as _LocationsResponseCache,
+)
+from ..services.locations_response_cache import (
+    LocationsWindowError as _LocationsWindowError,
+)
+from ..services.locations_response_cache import (
+    compute_locations_payload as _compute_locations_payload,
+)
+from ..services.locations_response_cache import (
+    locations_cache_key as _locations_cache_key,
+)
+from ..services.locations_response_cache import (
+    normalize_recipe as _normalize_locations_recipe,
+)
+from ..services.locations_response_cache import (
+    resolve_locations_filters as _resolve_locations_filters,
+)
 from ..services.meshtastic_service import MeshtasticService
 from ..services.node_service import NodeService
 from ..services.traceroute_service import TracerouteService
@@ -48,27 +65,12 @@ _chat_relay_candidate_cache: dict[
     tuple[int, int], tuple[float, list[dict[str, Any]]]
 ] = {}
 
-# /api/locations resolves every link window onto this grid. Server-derived
-# bounds (the end from "now", the start for hours-only requests) are snapped
-# here, and client-supplied start_time/end_time are floored/ceiled onto the
-# same grid: raw datetime.now() floats carry microsecond precision and the
-# map's per-visit start_time (Math.floor(now) - N*3600, recomputed at every
-# page load) changes by the second, so un-snapped bounds gave every request
-# a unique filter set and turned the _NETWORK_GRAPH_CACHE/_PACKET_LINKS_CACHE
-# TTL caches into guaranteed misses. Snapping widens a window by less than
-# one grid step per side.
-#
-# The step must also comfortably exceed those caches' 60 s TTL. Snapped
-# bounds roll with the clock every grid step, and an entry minted under one
-# bucket's bounds becomes unreachable the moment the next bucket starts, so
-# a 30 s grid capped the effective hit window below the TTL: reloads more
-# than 30 s apart always minted fresh keys and recomputed in full. A 300 s
-# step (5x the TTL) lets a revisit inside the TTL resolve the same bounds
-# with probability 1 - gap/300 (~80 % for a 60 s gap), keeps the per-side
-# window widening under five minutes (0.35 % of the default 24 h preset,
-# 8 % of the smallest 1 h preset), and divides every hour preset and the
-# 14-day cap exactly, so derived starts stay grid-aligned.
-_LOCATIONS_NOW_GRID_SECONDS = 300
+# /api/locations resolves every link window onto this grid. The constant
+# lives in services/locations_response_cache.py next to the resolver; it is
+# re-exported here because tests and tooling import it from this module.
+from ..services.locations_response_cache import (  # noqa: E402,F401
+    _LOCATIONS_NOW_GRID_SECONDS,
+)
 
 # TTL cache for the set of node ids involved in traceroute RF hops (including
 # intermediate route nodes). Refreshed by the /traceroute-hops/nodes endpoint;
@@ -791,143 +793,56 @@ def api_locations():
     independent of the link window: an actively routing node whose last
     position report is older than the selected window must stay visible at
     its last known good position instead of disappearing.
-    """
-    import time
 
+    The whole response is served from the pre-serialized
+    LocationsResponseCache whenever an entry for the resolved window
+    exists (a background refresher keeps recently served windows warm);
+    only a never-seen filter combination computes inline.
+    """
     start_time_perf = time.time()
     logger.info("API locations endpoint accessed")
     try:
-        from datetime import datetime
-
-        now = datetime.now()
-        max_window_seconds = 14 * 24 * 3600
-
-        # Ceil (not floor) so the derived end can never precede a client
-        # start_time picked seconds ago within the current grid bucket.
-        server_now = (
-            math.ceil(now.timestamp() / _LOCATIONS_NOW_GRID_SECONDS)
-            * _LOCATIONS_NOW_GRID_SECONDS
-        )
-
-        # Wide position-lookup window (performance cap only). This window is
-        # intentionally NOT narrowed by the client's time selection so nodes
-        # with stale GPS fixes remain visible while active. Both bounds are
-        # snapped onto the cache grid — this dict also becomes the link
-        # window for parameterless requests, and raw datetime.now() floats
-        # would mint a unique filter set (and cache key) on every hit.
-        position_filters: dict[str, Any] = {
-            "start_time": server_now - max_window_seconds,
-            "end_time": server_now,
-        }
-
-        # ------------------------------------------------------------------
-        # Resolve the link aggregation window from request parameters.
-        # Explicit start/end win; otherwise hours/max_age_hours is applied
-        # relative to now; with no time parameter at all the endpoint keeps
-        # its historical 14-day default.
-        # ------------------------------------------------------------------
         start_arg = request.args.get("start_time", type=float)
         end_arg = request.args.get("end_time", type=float)
         hours_arg = request.args.get("hours", type=float)
         if hours_arg is None:
             hours_arg = request.args.get("max_age_hours", type=float)
 
-        link_filters: dict[str, Any] = {}
-        if start_arg is not None or end_arg is not None or hours_arg:
-            if start_arg is None:
-                lookback = hours_arg * 3600 if hours_arg else max_window_seconds
-                start_arg = (end_arg if end_arg is not None else server_now) - lookback
-            if end_arg is None:
-                end_arg = server_now
-            if start_arg >= end_arg:
-                return jsonify({"error": "start_time must be before end_time"}), 400
-            # Snap every bound onto the cache grid (start down, end up;
-            # derived bounds are already grid multiples) so two map visits
-            # seconds apart resolve identical filters and hit the TTL
-            # caches. The window can only grow by < one grid step per side.
-            start_arg = (
-                math.floor(start_arg / _LOCATIONS_NOW_GRID_SECONDS)
-                * _LOCATIONS_NOW_GRID_SECONDS
-            )
-            end_arg = (
-                math.ceil(end_arg / _LOCATIONS_NOW_GRID_SECONDS)
-                * _LOCATIONS_NOW_GRID_SECONDS
-            )
-            # Cap the aggregation window for performance
-            if end_arg - start_arg > max_window_seconds:
-                start_arg = end_arg - max_window_seconds
-            link_filters["start_time"] = start_arg
-            link_filters["end_time"] = end_arg
-        else:
-            link_filters.update(position_filters)
-
         # Gateway filter (keep this server-side for performance)
+        gateway_id: int | None = None
         gateway_id_arg = request.args.get("gateway_id")
         if gateway_id_arg is not None:
             try:
                 gateway_id = int(gateway_id_arg)
             except ValueError:
                 return jsonify({"error": "Invalid gateway_id format"}), 400
-            link_filters["gateway_id"] = gateway_id
-            position_filters["gateway_id"] = gateway_id
 
         # Search filter (keep this server-side for performance)
-        if request.args.get("search"):
-            link_filters["search"] = request.args.get("search")
-            position_filters["search"] = request.args.get("search")
+        search = request.args.get("search") or None
 
-        # ------------------------------------------------------------------
-        # OPTIMIZATION: Call expensive operations ONCE and pass results down
-        # ------------------------------------------------------------------
-
-        # 1. Get network topology data (used by both get_node_locations and get_traceroute_links)
-        network_filters = {}
-        if link_filters.get("start_time"):
-            network_filters["start_time"] = link_filters["start_time"]
-        if link_filters.get("end_time"):
-            network_filters["end_time"] = link_filters["end_time"]
-        if link_filters.get("gateway_id"):
-            network_filters["gateway_id"] = link_filters["gateway_id"]
-
-        # The explicit start/end filters take precedence inside the service;
-        # hours is kept consistent with the resolved window for cache keys.
-        time_diff = link_filters["end_time"] - link_filters["start_time"]
-        hours = max(1, min(168, int(time_diff / 3600)))  # Between 1 and 168 hours
-
-        network_data = TracerouteService.get_network_graph_data(
-            hours=hours,
-            include_indirect=False,
-            filters=network_filters,
+        recipe = _normalize_locations_recipe(
+            start_arg, end_arg, hours_arg, gateway_id, search
         )
+        try:
+            link_filters, position_filters = _resolve_locations_filters(recipe)
+        except _LocationsWindowError:
+            return jsonify({"error": "start_time must be before end_time"}), 400
 
-        # 2. Get packet links (used by get_node_locations and returned in response)
-        packet_links = LocationService.get_packet_links(link_filters)
+        key = _locations_cache_key(link_filters)
+        body = _LocationsResponseCache.serve(recipe, key)
+        if body is None:
+            logger.info(
+                "Computing /api/locations response (cache miss): recipe=%s", recipe
+            )
+            payload = _compute_locations_payload(link_filters, position_filters)
+            body = _LocationsResponseCache.store(recipe, key, payload)
+            duration = time.time() - start_time_perf
+            logger.info(f"/api/locations computed in {duration:.3f}s")
 
-        # 3. Get enhanced location data, passing pre-computed data. Position
-        #    lookups use the wide window; node activity timestamps come from
-        #    the window-scoped network/packet data computed above.
-        locations = LocationService.get_node_locations(
-            position_filters, network_data=network_data, packet_links=packet_links
-        )
-
-        # 4. Get traceroute links, passing pre-computed network data
-        traceroute_links = LocationService.get_traceroute_links(
-            link_filters, network_data=network_data
-        )
-
-        duration = time.time() - start_time_perf
-        logger.info(f"/api/locations completed in {duration:.3f}s")
-
-        return safe_jsonify(
-            {
-                "locations": locations,
-                "traceroute_links": traceroute_links,
-                "packet_links": packet_links,
-                "total_count": len(locations) if isinstance(locations, list) else 0,
-                "filters_applied": link_filters,
-                "data_period_days": 14,
-            }
-        )
+        # Pre-serialized bytes: replaying them skips re-jsonifying the
+        # multi-megabyte payload on every hit (gzip still applies via the
+        # flask_compress after-request hook).
+        return Response(body, mimetype="application/json")
     except Exception as e:
         logger.error(f"Error in API locations: {e}")
         return jsonify({"error": str(e)}), 500
