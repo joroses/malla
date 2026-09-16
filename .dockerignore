@@ -73,3 +73,8 @@ Makefile
 run_tests.py
 scripts/benchmark_*.py
 scripts/generate_screenshots.py
+
+# Data directories and databases (mounted via docker volumes)
+data
+data/
+meshtastic_history.db*
