@@ -737,6 +737,13 @@ function initializeInterface() {
     // Trigger change events for all form fields to initialize them based on default values
     const formFields = document.querySelectorAll('#locationFilterForm select, #locationFilterForm input');
     formFields.forEach(field => {
+        // The time-window fields are already initialized by syncMaxAgeToDateTime()
+        // above; firing their change handlers here would duplicate the first
+        // /api/locations request and deactivate the default preset (the date
+        // handler treats any change event as a manual edit).
+        if (field.id === 'maxAge' || field.id === 'startDateTime' || field.id === 'endDateTime') {
+            return;
+        }
         if (field.value) {
             // Manually trigger the change event handler
             const event = new Event('change', { bubbles: true });
