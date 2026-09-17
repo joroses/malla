@@ -12,6 +12,7 @@ import logging
 import os
 import sys
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from flask import Flask
@@ -42,7 +43,10 @@ GATEWAY_RELIABILITY_CUTOFF_PERCENT = 30
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("app.log"), logging.StreamHandler(sys.stdout)],
+    handlers=[
+        RotatingFileHandler("app.log", maxBytes=250 * 1024 * 1024, backupCount=1),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 
 logger = logging.getLogger(__name__)

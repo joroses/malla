@@ -8,6 +8,7 @@ that starts Gunicorn with appropriate configuration for production deployment.
 
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 
 from .config import get_config
 from .web_ui import create_app
@@ -16,7 +17,10 @@ from .web_ui import create_app
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("app.log"), logging.StreamHandler(sys.stdout)],
+    handlers=[
+        RotatingFileHandler("app.log", maxBytes=250 * 1024 * 1024, backupCount=1),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 
 logger = logging.getLogger(__name__)
