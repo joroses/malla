@@ -51,12 +51,14 @@ logger = logging.getLogger(__name__)
 # guaranteed misses. Snapping widens a window by less than one grid step
 # per side.
 #
-# The step must also comfortably exceed the service-layer caches' 60 s TTL.
+# The step must at least cover the service-layer cache TTLs (network
+# graph: grid-sized 300 s; packet links / node locations: 60 s).
 # Snapped bounds roll with the clock every grid step, and an entry minted
 # under one bucket's bounds becomes unreachable the moment the next bucket
 # starts, so a 30 s grid capped the effective hit window below the TTL:
 # reloads more than 30 s apart always minted fresh keys and recomputed in
-# full. A 300 s step (5x the TTL) lets a revisit inside the TTL resolve the
+# full. A 300 s step (5x the 60 s TTLs, 1x the network-graph TTL and the
+# whole-response stale window) lets a revisit inside the TTL resolve the
 # same bounds with probability 1 - gap/300 (~80 % for a 60 s gap), keeps the
 # per-side window widening under five minutes (0.35 % of the default 24 h
 # preset, 8 % of the smallest 1 h preset), and divides every hour preset
@@ -346,6 +348,20 @@ class LocationsResponseCache:
 
     _DEFAULT_RECIPE: Recipe = (None, None, None, None, None)
 
+    # The map's default MaxAge preset sends hours=24, which normalizes to
+    # this recipe. It is pinned warm alongside the parameterless 14-day
+    # default: without pinning, the 24h entry decayed after _KEY_IDLE_SEC
+    # of no visits and idle-return loads paid a full multi-second compute.
+    _MAP_DEFAULT_RECIPE: Recipe = (None, None, 24.0, None, None)
+
+    # Always-warm recipes, in refresh priority order (most-visited first).
+    # The 24h map payload is both the hottest key and the cheaper compute,
+    # so it refreshes before the slower 14-day default every cycle.
+    _PINNED_RECIPES: tuple[Recipe, ...] = (
+        _MAP_DEFAULT_RECIPE,
+        _DEFAULT_RECIPE,
+    )
+
     _refresher_thread: threading.Thread | None = None
     _refresher_lock = threading.Lock()
     _refresher_stop = threading.Event()
@@ -525,11 +541,11 @@ class LocationsResponseCache:
 
     @classmethod
     def start_background_refresh(cls) -> None:
-        """Warm the default recipe now and keep served recipes fresh.
+        """Warm the pinned recipes now and keep served recipes fresh.
 
         The first refresher cycle runs immediately, so calling this at
-        process startup means the parameterless map payload is ready
-        before the first visitor arrives.
+        process startup means the 24h map payload and the parameterless
+        14-day payload are ready before the first visitor arrives.
         """
         cls._ensure_background_refresh()
 
@@ -556,19 +572,25 @@ class LocationsResponseCache:
     def _refresh_active_keys(cls) -> None:
         """Recompute recently served recipes; evict idle ones.
 
-        The default (parameterless) recipe is always refreshed so the
-        next visitor finds it warm even after a long idle period.
-        Recomputation is serial (the same tradeoff the analytics
-        refresher makes): each cycle refreshes every active recipe, so
-        per-key staleness is bounded by the interval plus the sum of
-        compute times — comfortably below ``_MAX_STALE_SEC`` for any
-        realistic number of active recipes, and SQLite readers do not
-        contend with each other or with request threads.
+        The pinned recipes (the 24h map default and the parameterless
+        14-day default) are always refreshed so the next visitor finds
+        them warm even after a long idle period. Recomputation is serial
+        (the same tradeoff the analytics refresher makes): each cycle
+        refreshes every active recipe, so per-key staleness is bounded by
+        the interval plus the sum of compute times — comfortably below
+        ``_MAX_STALE_SEC`` for any realistic number of active recipes,
+        and SQLite readers do not contend with each other or with
+        request threads.
         """
         now_ts = time.time()
 
-        recipes = {cls._DEFAULT_RECIPE}
+        recipes = set(cls._PINNED_RECIPES)
         for recipe, last_hit in list(cls._RECIPE_ACCESS.items()):
+            if recipe in cls._PINNED_RECIPES:
+                # Pinned recipes never decay: the map's hottest windows
+                # stay warm across idle periods.
+                recipes.add(recipe)
+                continue
             if now_ts - last_hit <= cls._KEY_IDLE_SEC:
                 recipes.add(recipe)
             else:
@@ -576,9 +598,9 @@ class LocationsResponseCache:
                 cls._RECIPE_ACCESS.pop(recipe, None)
                 cls._RECIPES.pop(recipe, None)
 
-        # Evict orphaned recipes that lack activity tracking (except default recipe)
+        # Evict orphaned recipes that lack activity tracking (except pinned recipes)
         for recipe in list(cls._RECIPES):
-            if recipe != cls._DEFAULT_RECIPE and recipe not in cls._RECIPE_ACCESS:
+            if recipe not in cls._PINNED_RECIPES and recipe not in cls._RECIPE_ACCESS:
                 cls._RECIPES.pop(recipe, None)
 
         # Evict entries nobody served or minted recently (superseded grid
@@ -612,12 +634,27 @@ class LocationsResponseCache:
             else:
                 grouped_by_key[key][2].append(recipe)
 
-        # Default recipe group first so the most common payload stays freshest
-        # even when slower windows are also active.
-        sorted_groups = sorted(
-            grouped_by_key.items(),
-            key=lambda item: cls._DEFAULT_RECIPE not in item[1][2],
-        )
+        # Pinned recipes first (24h map default ahead of the slower 14-day
+        # default) so the most-visited key never waits behind the slowest
+        # compute; remaining active windows follow smallest-window-first so
+        # fast re-warms complete before slower ones after a grid rollover.
+        def _refresh_sort_key(
+            item: tuple[Key, tuple[dict[str, Any], dict[str, Any], list[Recipe]]],
+        ) -> tuple[int, float]:
+            _key, (link_filters, _position_filters, group_recipes) = item
+            if cls._MAP_DEFAULT_RECIPE in group_recipes:
+                return (0, 0.0)
+            if cls._DEFAULT_RECIPE in group_recipes:
+                return (1, 0.0)
+            try:
+                window = float(link_filters.get("end_time", 0)) - float(
+                    link_filters.get("start_time", 0)
+                )
+            except (TypeError, ValueError):
+                window = float("inf")
+            return (2, window)
+
+        sorted_groups = sorted(grouped_by_key.items(), key=_refresh_sort_key)
 
         for key, (link_filters, position_filters, group_recipes) in sorted_groups:
             record = cls._try_begin_compute(key)

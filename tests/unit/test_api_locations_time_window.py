@@ -345,14 +345,16 @@ class TestApiLocationsTimeWindow:
 
     @pytest.mark.unit
     def test_grid_step_exceeds_service_cache_ttls(self):
-        """The snapping grid must outlive the service TTL caches.
+        """The snapping grid must cover the service TTL caches.
 
         The resolved window (and therefore the _NETWORK_GRAPH_CACHE /
         _PACKET_LINKS_CACHE keys) rolls with the clock every grid step. If
         the step were shorter than a cache's TTL, entries would become
         unreachable well before expiring and reloads tens of seconds apart
         would always recompute -- the failure mode this grid exists to
-        prevent.
+        prevent. The network-graph TTL is grid-sized (300 s) so the 60 s
+        background refresher self-hits across cycles; the shorter packet
+        cache keeps the original 2x headroom.
         """
         from src.malla.routes.api_routes import _LOCATIONS_NOW_GRID_SECONDS
         from src.malla.services.location_service import (
@@ -363,7 +365,8 @@ class TestApiLocationsTimeWindow:
         )
 
         for ttl in (_NETWORK_GRAPH_CACHE_TTL_SECONDS, _PACKET_LINKS_CACHE_TTL_SECONDS):
-            assert _LOCATIONS_NOW_GRID_SECONDS >= 2 * ttl
+            assert _LOCATIONS_NOW_GRID_SECONDS >= ttl
+        assert _LOCATIONS_NOW_GRID_SECONDS >= 2 * _PACKET_LINKS_CACHE_TTL_SECONDS
 
     @pytest.mark.unit
     def test_reloads_a_minute_apart_share_one_window(

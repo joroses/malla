@@ -372,8 +372,8 @@ class TestServeFromCache:
         # Background refresher should now recompute this recipe without manual seeding
         stub_compute["n"] = 0
         LocationsResponseCache._refresh_active_keys()
-        # Default recipe (1) + recipe (1) = 2
-        assert stub_compute["n"] == 2
+        # Pinned 24h map default (1) + pinned 14-day default (1) + recipe (1) = 3
+        assert stub_compute["n"] == 3
 
 
 class TestMintOrdering:
@@ -592,8 +592,9 @@ class TestInFlightDeduplication:
 
         LocationsResponseCache._refresh_active_keys()
 
-        # Default-recipe compute skipped: a request owns the window
-        assert stub_compute["n"] == 0
+        # Default-recipe compute skipped: a request owns the window. The
+        # pinned 24h map window still refreshes (1 compute total).
+        assert stub_compute["n"] == 1
         assert key not in LocationsResponseCache._CACHE
 
         LocationsResponseCache._end_compute(key, record, b"{}")
@@ -630,15 +631,54 @@ class TestBackgroundRefresher:
 
         deadline = time.time() + 10
         while time.time() < deadline:
-            if LocationsResponseCache._CACHE:
+            if len(LocationsResponseCache._CACHE) >= 2:
                 break
             time.sleep(0.02)
 
-        assert len(LocationsResponseCache._CACHE) == 1
-        key = next(iter(LocationsResponseCache._CACHE))
-        # The default recipe resolves the wide 14-day window
-        assert key[1] - key[0] == 14 * 24 * 3600
-        assert json.loads(LocationsResponseCache._CACHE[key][1])["data_period_days"] == 14
+        # Both pinned recipes warm: the 24h map default and the 14-day default
+        assert len(LocationsResponseCache._CACHE) == 2
+        windows = {key[1] - key[0] for key in LocationsResponseCache._CACHE}
+        assert windows == {24 * 3600, 14 * 24 * 3600}
+        for body in LocationsResponseCache._CACHE.values():
+            assert json.loads(body[1])["data_period_days"] == 14
+
+    def test_pinned_map_recipe_survives_idle(self, stub_compute):
+        """The hours=24 map recipe stays warm even when never re-served."""
+        now = time.time()
+        pinned_24h = normalize_recipe(None, None, 24, None, None)
+        assert pinned_24h == LocationsResponseCache._MAP_DEFAULT_RECIPE
+        # Stale activity (or none at all): the 24h window must still refresh.
+        LocationsResponseCache._RECIPE_ACCESS[pinned_24h] = now - 2 * (
+            LocationsResponseCache._KEY_IDLE_SEC + 1
+        )
+
+        LocationsResponseCache._refresh_active_keys()
+
+        assert pinned_24h in LocationsResponseCache._RECIPES
+        assert LocationsResponseCache._RECIPES[pinned_24h] in LocationsResponseCache._CACHE
+
+    def test_refresh_orders_24h_before_14_day(self, monkeypatch):
+        """The hot 24h map window refreshes ahead of the slow 14-day one."""
+        order: list[float] = []
+
+        def recording_compute(link_filters, position_filters):
+            order.append(link_filters["end_time"] - link_filters["start_time"])
+            return {
+                "locations": [],
+                "traceroute_links": [],
+                "packet_links": [],
+                "total_count": 0,
+                "filters_applied": dict(link_filters),
+                "data_period_days": 14,
+            }
+
+        monkeypatch.setattr(
+            locations_cache_module, "compute_locations_payload", recording_compute
+        )
+
+        LocationsResponseCache._refresh_active_keys()
+
+        assert order == [24 * 3600, 14 * 24 * 3600]
 
     def test_refresh_keeps_recent_recipes_and_evicts_idle_ones(self, stub_compute):
         now = time.time()
