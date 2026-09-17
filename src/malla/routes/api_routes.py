@@ -32,9 +32,6 @@ from ..services.locations_response_cache import (
     LocationsWindowError as _LocationsWindowError,
 )
 from ..services.locations_response_cache import (
-    compute_locations_payload as _compute_locations_payload,
-)
-from ..services.locations_response_cache import (
     locations_cache_key as _locations_cache_key,
 )
 from ..services.locations_response_cache import (
@@ -797,9 +794,9 @@ def api_locations():
     The whole response is served from the pre-serialized
     LocationsResponseCache whenever an entry for the resolved window
     exists (a background refresher keeps recently served windows warm);
-    only a never-seen filter combination computes inline.
+    a cache miss joins any in-flight compute for the same window, and
+    only an unclaimed miss computes inline.
     """
-    start_time_perf = time.time()
     logger.info("API locations endpoint accessed")
     try:
         start_arg = request.args.get("start_time", type=float)
@@ -829,15 +826,9 @@ def api_locations():
             return jsonify({"error": "start_time must be before end_time"}), 400
 
         key = _locations_cache_key(link_filters)
-        body = _LocationsResponseCache.serve(recipe, key)
-        if body is None:
-            logger.info(
-                "Computing /api/locations response (cache miss): recipe=%s", recipe
-            )
-            payload = _compute_locations_payload(link_filters, position_filters)
-            body = _LocationsResponseCache.store(recipe, key, payload)
-            duration = time.time() - start_time_perf
-            logger.info(f"/api/locations computed in {duration:.3f}s")
+        body = _LocationsResponseCache.get_or_compute(
+            recipe, key, link_filters, position_filters
+        )
 
         # Pre-serialized bytes: replaying them skips re-jsonifying the
         # multi-megabyte payload on every hit (gzip still applies via the

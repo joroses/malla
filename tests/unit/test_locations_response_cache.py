@@ -18,6 +18,7 @@ from src.malla.services.locations_response_cache import (
     _LOCATIONS_NOW_GRID_SECONDS,
     LocationsResponseCache,
     LocationsWindowError,
+    is_relative_recipe,
     locations_cache_key,
     normalize_recipe,
     resolve_locations_filters,
@@ -136,6 +137,59 @@ class TestResolveLocationsFilters:
         assert link["end_time"] - link["start_time"] == 14 * 24 * 3600
 
 
+class TestNormalizeRecipe:
+    def test_canonicalize_equivalent_explicit_bounds(self):
+        grid = _LOCATIONS_NOW_GRID_SECONDS
+        start1 = 1000 * grid + 15
+        end1 = start1 + 3600
+        start2 = 1000 * grid + 180
+        end2 = start2 + 3550
+
+        r1 = normalize_recipe(start1, end1, None, None, None)
+        r2 = normalize_recipe(start2, end2, None, None, None)
+
+        assert r1 == r2
+        assert r1[0] % grid == 0
+        assert r1[1] % grid == 0
+
+    def test_explicit_bounds_supersede_hours(self):
+        grid = _LOCATIONS_NOW_GRID_SECONDS
+        start = 1000 * grid
+        end = start + 3600
+
+        r_with_hours = normalize_recipe(start, end, 24, 42, "node")
+        r_without_hours = normalize_recipe(start, end, None, 42, "node")
+
+        assert r_with_hours == r_without_hours
+        assert r_with_hours[2] is None
+
+    def test_search_and_hours_sanitized(self):
+        r1 = normalize_recipe(None, None, 24, None, "  router-1  ")
+        assert r1[2] == 24.0
+        assert r1[4] == "router-1"
+
+        r2 = normalize_recipe(None, None, None, None, "   ")
+        assert r2[4] is None
+
+    def test_inverted_bounds_kept_for_validation(self):
+        r = normalize_recipe(1000, 500, None, None, None)
+        assert r[0] == 1000
+        assert r[1] == 500
+        with pytest.raises(LocationsWindowError):
+            resolve_locations_filters(r)
+
+    def test_is_relative_recipe(self):
+        # Default recipe (all None) is relative
+        assert is_relative_recipe(normalize_recipe(None, None, None, None, None))
+        # Hours without explicit bounds is relative
+        assert is_relative_recipe(normalize_recipe(None, None, 24, None, None))
+        # Start only or end only is relative
+        assert is_relative_recipe((1000.0, None, None, None, None))
+        assert is_relative_recipe((None, 2000.0, None, None, None))
+        # Explicit start and end is NOT relative
+        assert not is_relative_recipe((1000.0, 2000.0, None, None, None))
+
+
 class TestServeFromCache:
     def test_second_request_within_max_stale_served_from_cache(
         self, no_auto_refresh, stub_compute
@@ -221,6 +275,353 @@ class TestServeFromCache:
         assert decoded["total_count"] == 1
         # NaN sanitized to null instead of invalid JSON
         assert decoded["nan_value"] is None
+
+    def test_request_after_rollover_before_refresh_serves_bounded_stale(
+        self, monkeypatch, stub_compute, no_auto_refresh
+    ):
+        grid = _LOCATIONS_NOW_GRID_SECONDS
+        t0 = 20000 * grid
+        clock = {"now": t0}
+        monkeypatch.setattr(
+            locations_cache_module, "_grid_now", lambda: clock["now"]
+        )
+
+        recipe = normalize_recipe(None, None, 24, None, None)
+        link0, pos0 = resolve_locations_filters(recipe, server_now=t0)
+        key0 = locations_cache_key(link0)
+
+        # 1. Warm initial entry at t0
+        LocationsResponseCache.store(
+            recipe, key0, locations_cache_module.compute_locations_payload(link0, pos0)
+        )
+        assert stub_compute["n"] == 1
+        assert key0 in LocationsResponseCache._CACHE
+        initial_body = LocationsResponseCache._CACHE[key0][1]
+
+        # 2. Advance clock past the 300s grid boundary
+        clock["now"] = t0 + grid
+        link1, _ = resolve_locations_filters(recipe, server_now=clock["now"])
+        key1 = locations_cache_key(link1)
+        assert key1 != key0
+        assert key1 not in LocationsResponseCache._CACHE
+
+        # 3. Visitor arrives AFTER rollover but BEFORE refresher runs:
+        # Must return the cached body from key0 without triggering inline compute
+        body = LocationsResponseCache.serve(recipe, key1)
+        assert body is initial_body
+        assert stub_compute["n"] == 1  # No synchronous recompute!
+
+        # 4. Returned body preserves the actual filters applied when it was computed
+        payload = json.loads(body)
+        assert payload["filters_applied"]["end_time"] == t0
+
+        # 5. Background refresher subsequently executes:
+        # Mints key1 and cleans up key0
+        LocationsResponseCache._refresh_active_keys()
+        assert stub_compute["n"] == 3  # default recipe (1) + key1 (1)
+        assert key1 in LocationsResponseCache._CACHE
+        assert key0 not in LocationsResponseCache._CACHE
+        assert LocationsResponseCache._RECIPES[recipe] == key1
+
+    def test_request_after_rollover_past_max_stale_recomputes_inline(
+        self, monkeypatch, stub_compute, no_auto_refresh
+    ):
+        grid = _LOCATIONS_NOW_GRID_SECONDS
+        t0 = 20000 * grid
+        clock = {"now": t0}
+        monkeypatch.setattr(
+            locations_cache_module, "_grid_now", lambda: clock["now"]
+        )
+
+        recipe = normalize_recipe(None, None, 24, None, None)
+        link0, pos0 = resolve_locations_filters(recipe, server_now=t0)
+        key0 = locations_cache_key(link0)
+
+        LocationsResponseCache.store(
+            recipe, key0, locations_cache_module.compute_locations_payload(link0, pos0)
+        )
+
+        # Advance time past _MAX_STALE_SEC
+        stale_time = time.time() + 2 * LocationsResponseCache._MAX_STALE_SEC
+        monkeypatch.setattr(time, "time", lambda: stale_time)
+        clock["now"] = t0 + 2 * grid
+        link1, _ = resolve_locations_filters(recipe, server_now=clock["now"])
+        key1 = locations_cache_key(link1)
+
+        # Expired stale response must NOT be served; returns None for inline recompute
+        assert LocationsResponseCache.serve(recipe, key1) is None
+
+    def test_first_time_store_registers_recipe_for_refresh(
+        self, stub_compute, no_auto_refresh
+    ):
+        recipe = normalize_recipe(None, None, 12, None, None)
+        link, pos = resolve_locations_filters(recipe)
+        key = locations_cache_key(link)
+
+        # Cold request miss
+        assert LocationsResponseCache.serve(recipe, key) is None
+        assert recipe not in LocationsResponseCache._RECIPE_ACCESS
+
+        # Successful inline store must record request activity
+        LocationsResponseCache.store(
+            recipe, key, locations_cache_module.compute_locations_payload(link, pos)
+        )
+        assert recipe in LocationsResponseCache._RECIPE_ACCESS
+        assert LocationsResponseCache._RECIPE_ACCESS[recipe] > 0
+
+        # Background refresher should now recompute this recipe without manual seeding
+        stub_compute["n"] = 0
+        LocationsResponseCache._refresh_active_keys()
+        # Default recipe (1) + recipe (1) = 2
+        assert stub_compute["n"] == 2
+
+
+class TestMintOrdering:
+    """A late mint for an older window must never replace a newer one."""
+
+    def test_late_older_mint_cannot_replace_or_delete_newer_response(
+        self, no_auto_refresh, stub_compute
+    ):
+        """Refresh started pre-rollover, request minted the new window first.
+
+        The refresh resolves key0 and computes slowly; the grid rolls, a
+        request resolves key1, computes and publishes it; only then does
+        the refresh finish. Its older publication must not repoint the
+        recipe, delete the newer response, or become the next request's
+        stale-while-revalidate body.
+        """
+        grid = _LOCATIONS_NOW_GRID_SECONDS
+        t0 = 20000 * grid
+        recipe = normalize_recipe(None, None, 24, None, None)
+        link0, _ = resolve_locations_filters(recipe, server_now=t0)
+        key0 = locations_cache_key(link0)
+        link1, _ = resolve_locations_filters(recipe, server_now=t0 + grid)
+        key1 = locations_cache_key(link1)
+        assert key1[1] > key0[1]
+
+        # Post-rollover request computes and publishes the newer window
+        newer_body = LocationsResponseCache.store(
+            recipe, key1, {"locations": [{"node_id": "new"}]}
+        )
+        assert key1 in LocationsResponseCache._CACHE
+
+        # The pre-rollover refresh finishes late with the older window
+        older_body = LocationsResponseCache._mint(
+            recipe, key0, {"locations": [{"node_id": "old"}]}
+        )
+
+        # The late mint's caller still gets its computed response...
+        assert json.loads(older_body)["locations"][0]["node_id"] == "old"
+        # ...but nothing was published: the recipe keeps pointing at the
+        # newer key, whose entry survives.
+        assert LocationsResponseCache._RECIPES[recipe] == key1
+        assert LocationsResponseCache._CACHE[key1][1] is newer_body
+        assert LocationsResponseCache.serve(recipe, key1) is newer_body
+        assert key0 not in LocationsResponseCache._CACHE
+
+    def test_late_older_mint_keeps_shared_key_of_static_recipe(
+        self, no_auto_refresh, stub_compute, monkeypatch
+    ):
+        """A grouped refresh may still store a key a static recipe maps to.
+
+        The refresher groups recipes by resolved key: when the late older
+        mint also serves an explicit (static) recipe that still maps to
+        that key, the entry must be stored and kept — only the relative
+        recipe's newer mapping is protected.
+        """
+        grid = _LOCATIONS_NOW_GRID_SECONDS
+        t0 = 30000 * grid
+        clock = {"now": t0}
+        monkeypatch.setattr(
+            locations_cache_module, "_grid_now", lambda: clock["now"]
+        )
+
+        relative = normalize_recipe(None, None, 6, None, None)
+        static = normalize_recipe(t0 - 6 * 3600, t0, None, None, None)
+        link0, pos0 = resolve_locations_filters(relative, server_now=t0)
+        key0 = locations_cache_key(link0)
+        static_link, _ = resolve_locations_filters(static)
+        assert locations_cache_key(static_link) == key0
+
+        # Both recipes currently resolve to key0; the relative one is
+        # already published onto the post-rollover key1 by a request.
+        link1, _ = resolve_locations_filters(relative, server_now=t0 + grid)
+        key1 = locations_cache_key(link1)
+        LocationsResponseCache._RECIPES[relative] = key1
+        LocationsResponseCache._CACHE[key1] = (time.time(), b'{"newer": true}')
+        LocationsResponseCache._RECIPES[static] = key0
+
+        LocationsResponseCache._mint([relative, static], key0, {"v": "old"})
+
+        assert LocationsResponseCache._RECIPES[relative] == key1
+        assert LocationsResponseCache._RECIPES[static] == key0
+        # key0 stays stored and fresh: the static recipe still needs it
+        assert key0 in LocationsResponseCache._CACHE
+        assert key1 in LocationsResponseCache._CACHE
+
+    def test_mint_accepts_various_recipe_iterables_and_single_recipe(
+        self, no_auto_refresh
+    ):
+        """_mint handles single recipes and various iterable types properly."""
+        r1 = normalize_recipe(None, None, 1, None, None)
+        r2 = normalize_recipe(None, None, 2, None, None)
+        link1, _ = resolve_locations_filters(r1)
+        key1 = locations_cache_key(link1)
+
+        # Single recipe
+        LocationsResponseCache._mint(r1, key1, {"v": 1})
+        assert LocationsResponseCache._RECIPES[r1] == key1
+
+        # Tuple of recipes
+        link2, _ = resolve_locations_filters(r2)
+        key2 = locations_cache_key(link2)
+        LocationsResponseCache._mint((r1, r2), key2, {"v": 2})
+        assert LocationsResponseCache._RECIPES[r1] == key2
+        assert LocationsResponseCache._RECIPES[r2] == key2
+
+        # Set of recipes
+        LocationsResponseCache._mint({r1}, key1, {"v": 3})
+        assert LocationsResponseCache._RECIPES[r1] == key1
+
+        # Generator of recipes
+        LocationsResponseCache._mint((r for r in [r1, r2]), key2, {"v": 4})
+        assert LocationsResponseCache._RECIPES[r1] == key2
+        assert LocationsResponseCache._RECIPES[r2] == key2
+
+
+class TestInFlightDeduplication:
+    """Cache-miss requests join running computes instead of duplicating them."""
+
+    def test_request_reuses_inflight_compute(self, no_auto_refresh, stub_compute):
+        """A request arriving mid-refresh gets that compute's body."""
+        import threading
+
+        recipe = normalize_recipe(None, None, 24, None, None)
+        link, pos = resolve_locations_filters(recipe)
+        key = locations_cache_key(link)
+
+        # Simulate the refresher mid-compute for this exact window
+        record = LocationsResponseCache._try_begin_compute(key)
+        assert record is not None
+
+        result = {}
+
+        def request_thread():
+            result["body"] = LocationsResponseCache.get_or_compute(
+                recipe, key, link, pos
+            )
+
+        waiter = threading.Thread(target=request_thread)
+        waiter.start()
+        try:
+            time.sleep(0.05)  # let the request block on the in-flight record
+            payload = locations_cache_module.compute_locations_payload(link, pos)
+            body = LocationsResponseCache.store(recipe, key, payload)
+            LocationsResponseCache._end_compute(key, record, body)
+        finally:
+            waiter.join(timeout=5)
+
+        assert not waiter.is_alive()
+        assert result["body"] is body
+        # Exactly one compute: the waiting request did not recompute
+        assert stub_compute["n"] == 1
+
+    def test_request_computes_inline_after_inflight_wait_timeout(
+        self, no_auto_refresh, stub_compute, monkeypatch
+    ):
+        """A stuck in-flight owner must not block the request forever."""
+        monkeypatch.setattr(LocationsResponseCache, "_INFLIGHT_WAIT_SEC", 0.05)
+
+        recipe = normalize_recipe(None, None, 24, None, None)
+        link, pos = resolve_locations_filters(recipe)
+        key = locations_cache_key(link)
+        assert LocationsResponseCache._try_begin_compute(key) is not None
+
+        body = LocationsResponseCache.get_or_compute(recipe, key, link, pos)
+
+        assert stub_compute["n"] == 1  # fell back to computing inline
+        assert LocationsResponseCache.serve(recipe, key) is body
+
+    def test_request_computes_inline_after_owner_failure(
+        self, no_auto_refresh, monkeypatch
+    ):
+        """An owner whose compute raised must not take waiters down with it."""
+        import threading
+
+        calls = {"n": 0}
+
+        def flaky_compute(link_filters, position_filters):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("database unavailable")
+            return {"locations": [], "traceroute_links": [], "packet_links": []}
+
+        monkeypatch.setattr(
+            locations_cache_module, "compute_locations_payload", flaky_compute
+        )
+
+        recipe = normalize_recipe(None, None, 24, None, None)
+        link, pos = resolve_locations_filters(recipe)
+        key = locations_cache_key(link)
+
+        owner_failure = {}
+
+        def owner_thread():
+            try:
+                LocationsResponseCache.get_or_compute(recipe, key, link, pos)
+            except RuntimeError as err:
+                owner_failure["err"] = err
+
+        owner = threading.Thread(target=owner_thread)
+        owner.start()
+        owner.join(timeout=5)
+        assert not owner.is_alive()  # owner surfaced the failure
+        assert isinstance(owner_failure.get("err"), RuntimeError)
+
+        # The next request must still get a computed response
+        body = LocationsResponseCache.get_or_compute(recipe, key, link, pos)
+        assert calls["n"] == 2
+        assert LocationsResponseCache.serve(recipe, key) is body
+
+    def test_refresh_skips_window_computed_by_request_thread(self, stub_compute):
+        """The refresher does not duplicate a request thread's compute."""
+        link, _ = resolve_locations_filters(LocationsResponseCache._DEFAULT_RECIPE)
+        key = locations_cache_key(link)
+        record = LocationsResponseCache._try_begin_compute(key)
+        assert record is not None
+
+        LocationsResponseCache._refresh_active_keys()
+
+        # Default-recipe compute skipped: a request owns the window
+        assert stub_compute["n"] == 0
+        assert key not in LocationsResponseCache._CACHE
+
+        LocationsResponseCache._end_compute(key, record, b"{}")
+
+    def test_waiter_records_recipe_access(self, no_auto_refresh, stub_compute):
+        """A request served from an in-flight compute stays refresh-warm."""
+        import threading
+
+        recipe = normalize_recipe(None, None, 24, None, None)
+        link, pos = resolve_locations_filters(recipe)
+        key = locations_cache_key(link)
+        record = LocationsResponseCache._try_begin_compute(key)
+
+        result = {}
+
+        def request_thread():
+            result["body"] = LocationsResponseCache.get_or_compute(
+                recipe, key, link, pos
+            )
+
+        waiter = threading.Thread(target=request_thread)
+        waiter.start()
+        time.sleep(0.05)
+        LocationsResponseCache._end_compute(key, record, b'{"served": 1}')
+        waiter.join(timeout=5)
+
+        assert result["body"] == b'{"served": 1}'
+        assert LocationsResponseCache._RECIPE_ACCESS[recipe] > 0
 
 
 class TestBackgroundRefresher:
@@ -361,6 +762,101 @@ class TestBackgroundRefresher:
 
         assert len(started) == 1
         assert LocationsResponseCache._refresher_thread is thread
+
+    def test_refresh_deduplicates_equivalent_recipes_to_single_compute(
+        self, monkeypatch, stub_compute
+    ):
+        grid = _LOCATIONS_NOW_GRID_SECONDS
+        clock = {"now": 30000 * grid}
+        monkeypatch.setattr(
+            locations_cache_module, "_grid_now", lambda: clock["now"]
+        )
+
+        now_ts = time.time()
+        start = clock["now"] - 24 * 3600
+        end = clock["now"]
+
+        # 5 recipes (relative, explicit, un-snapped raw tuple) that resolve to the same 24h window
+        recipes = [
+            normalize_recipe(None, None, 24, None, None),
+            normalize_recipe(None, None, 24.0, None, None),
+            (start, end, None, None, None),
+            (start + 10, end - 10, None, None, None),
+            (start, end, 24, None, None),
+        ]
+
+        for r in recipes:
+            LocationsResponseCache._RECIPE_ACCESS[r] = now_ts
+
+        LocationsResponseCache._refresh_active_keys()
+
+        # 1 compute for default recipe + 1 compute for the shared 24h window = 2 total computes (not 6)
+        assert stub_compute["n"] == 2
+
+        key_24h = (start, end, None, None)
+        assert key_24h in LocationsResponseCache._CACHE
+        for r in recipes:
+            assert LocationsResponseCache._RECIPES[r] == key_24h
+
+    def test_refresh_grouped_recipes_cleans_superseded_key(
+        self, monkeypatch, stub_compute
+    ):
+        grid = _LOCATIONS_NOW_GRID_SECONDS
+        clock = {"now": 40000 * grid}
+        monkeypatch.setattr(
+            locations_cache_module, "_grid_now", lambda: clock["now"]
+        )
+
+        r1 = normalize_recipe(None, None, 6, None, None)
+        r2 = (None, None, 6.0, None, None)
+
+        now_ts = time.time()
+        LocationsResponseCache._RECIPE_ACCESS[r1] = now_ts
+        LocationsResponseCache._RECIPE_ACCESS[r2] = now_ts
+
+        LocationsResponseCache._refresh_active_keys()
+        first_key = LocationsResponseCache._RECIPES[r1]
+        assert first_key in LocationsResponseCache._CACHE
+
+        clock["now"] += grid
+        LocationsResponseCache._refresh_active_keys()
+
+        second_key = LocationsResponseCache._RECIPES[r1]
+        assert second_key != first_key
+        assert second_key in LocationsResponseCache._CACHE
+        assert LocationsResponseCache._RECIPES[r2] == second_key
+
+        assert first_key not in LocationsResponseCache._CACHE
+        assert first_key not in LocationsResponseCache._LAST_ACCESS
+
+    def test_background_refresh_does_not_extend_recipe_access_lifetime(
+        self, stub_compute
+    ):
+        recipe = normalize_recipe(None, None, 12, None, None)
+        link, pos = resolve_locations_filters(recipe)
+        key = locations_cache_key(link)
+
+        LocationsResponseCache.store(
+            recipe, key, locations_cache_module.compute_locations_payload(link, pos)
+        )
+        stored_at = LocationsResponseCache._RECIPE_ACCESS[recipe]
+
+        # Ensure clock time moves forward
+        time.sleep(0.01)
+        LocationsResponseCache._refresh_active_keys()
+
+        # Background refresh must NOT overwrite _RECIPE_ACCESS with current time
+        assert LocationsResponseCache._RECIPE_ACCESS[recipe] == stored_at
+
+    def test_orphaned_recipes_evicted_from_recipes_dict(self, stub_compute):
+        # A recipe present in _RECIPES but absent from _RECIPE_ACCESS
+        orphan = normalize_recipe(None, None, 48, None, None)
+        dummy_key = (1.0, 2.0, None, None)
+        LocationsResponseCache._RECIPES[orphan] = dummy_key
+
+        LocationsResponseCache._refresh_active_keys()
+
+        assert orphan not in LocationsResponseCache._RECIPES
 
 
 class TestEndpointResponseCache:

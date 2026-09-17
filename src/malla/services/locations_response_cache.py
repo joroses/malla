@@ -32,7 +32,8 @@ import logging
 import math
 import threading
 import time
-from typing import Any
+from collections.abc import Iterable
+from typing import Any, cast
 
 from ..utils.serialization_utils import sanitize_floats
 from .location_service import LocationService
@@ -106,8 +107,38 @@ def normalize_recipe(
     gateway_id: int | None,
     search: str | None,
 ) -> Recipe:
-    """Canonicalize raw request parameters into a recipe."""
-    return (start_arg, end_arg, hours_arg or None, gateway_id, search or None)
+    """Canonicalize raw request parameters into a recipe.
+
+    When explicit start and end times are provided and form a valid window,
+    they are snapped onto the cache grid immediately so equivalent request
+    shapes share a single recipe identity instead of multiplying refresh work.
+    """
+    clean_hours = float(hours_arg) if hours_arg else None
+    clean_search = search.strip() if search else None
+
+    if start_arg is not None and end_arg is not None:
+        if start_arg < end_arg:
+            snapped_start = (
+                math.floor(start_arg / _LOCATIONS_NOW_GRID_SECONDS)
+                * _LOCATIONS_NOW_GRID_SECONDS
+            )
+            snapped_end = (
+                math.ceil(end_arg / _LOCATIONS_NOW_GRID_SECONDS)
+                * _LOCATIONS_NOW_GRID_SECONDS
+            )
+            if snapped_end - snapped_start > _LOCATIONS_MAX_WINDOW_SECONDS:
+                snapped_start = snapped_end - _LOCATIONS_MAX_WINDOW_SECONDS
+            return (snapped_start, snapped_end, None, gateway_id, clean_search or None)
+        # Inverted or empty window: keep raw values so resolve_locations_filters can raise LocationsWindowError
+        return (start_arg, end_arg, clean_hours, gateway_id, clean_search or None)
+
+    return (start_arg, end_arg, clean_hours, gateway_id, clean_search or None)
+
+
+def is_relative_recipe(recipe: Recipe) -> bool:
+    """Return True if the recipe derives its window bounds from current time."""
+    start_arg, end_arg, _, _, _ = recipe
+    return start_arg is None or end_arg is None
 
 
 def resolve_locations_filters(
@@ -263,6 +294,22 @@ def serialize_locations_payload(payload: dict[str, Any]) -> bytes:
     return json.dumps(sanitized, separators=(",", ":")).encode("utf-8")
 
 
+class _InFlightCompute:
+    """Shared per-key compute record for request/refresher deduplication.
+
+    The owner thread (whichever of the background refresher or a request
+    first started the compute) sets :attr:`body` and the event when done;
+    waiters read the body directly instead of running a second
+    multi-second compute for the same window.
+    """
+
+    __slots__ = ("event", "body")
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.body: bytes | None = None
+
+
 class LocationsResponseCache:
     """In-process, pre-serialized whole-response cache for /api/locations.
 
@@ -281,6 +328,14 @@ class LocationsResponseCache:
     _RECIPES: dict[Recipe, Key] = {}
     # recipe → last time a request used it (refresher activity tracking)
     _RECIPE_ACCESS: dict[Recipe, float] = {}
+
+    # key → in-flight compute record; a cache-miss request joins the
+    # running compute (usually the refresher's) instead of duplicating it
+    _INFLIGHT: dict[Key, _InFlightCompute] = {}
+    _INFLIGHT_LOCK = threading.Lock()
+    # How long a request waits on an in-flight compute before falling
+    # back to computing inline itself (bounds the damage of a stuck owner)
+    _INFLIGHT_WAIT_SEC: float = 20.0
 
     _REFRESH_INTERVAL_SEC: float = 60.0
     _MAX_STALE_SEC: float = 300.0
@@ -319,12 +374,111 @@ class LocationsResponseCache:
             cls._RECIPE_ACCESS[recipe] = now_ts
             cls._RECIPES.setdefault(recipe, key)
             return cached[1]
+
+        # Stale-while-revalidate for relative recipes across grid rollovers:
+        # Immediately after a grid rollover, the newly rolled key is not yet warm,
+        # but the previous response minted for this recipe is still valid and fresh.
+        # Serve it to avoid blocking the visitor on an expensive inline recomputation
+        # while recording request activity so the refresher warms the new window.
+        if is_relative_recipe(recipe):
+            previous_key = cls._RECIPES.get(recipe)
+            if previous_key is not None and previous_key != key:
+                cached_prev = cls._CACHE.get(previous_key)
+                if cached_prev and (now_ts - cached_prev[0] < cls._MAX_STALE_SEC):
+                    cls._LAST_ACCESS[previous_key] = now_ts
+                    cls._RECIPE_ACCESS[recipe] = now_ts
+                    return cached_prev[1]
+
         return None
 
     @classmethod
+    def get_or_compute(
+        cls,
+        recipe: Recipe,
+        key: Key,
+        link_filters: dict[str, Any],
+        position_filters: dict[str, Any],
+    ) -> bytes:
+        """Serve *key* from cache, or compute it exactly once per process.
+
+        A cache miss first checks the per-key in-flight registry: when the
+        background refresher (or another request thread) is already
+        computing this exact window, the caller waits for and reuses that
+        result instead of running a second multi-second computation in
+        parallel. Only when no compute is running does the caller's
+        thread become the owner — and the refresher, for its part, skips
+        keys owned by requests.
+        """
+        body = cls.serve(recipe, key)
+        if body is not None:
+            return body
+
+        record = cls._try_begin_compute(key)
+        if record is None:
+            with cls._INFLIGHT_LOCK:
+                existing = cls._INFLIGHT.get(key)
+            if (
+                existing is not None
+                and existing.event.wait(timeout=cls._INFLIGHT_WAIT_SEC)
+                and existing.body is not None
+            ):
+                cls._RECIPE_ACCESS[recipe] = time.time()
+                return existing.body
+            # The owner failed or outlived the wait bound: serve whatever
+            # it minted, then retry ownership once before computing
+            # uncoordinated (the pre-dedup behavior).
+            body = cls.serve(recipe, key)
+            if body is not None:
+                return body
+            record = cls._try_begin_compute(key)
+            if record is None:
+                payload = compute_locations_payload(link_filters, position_filters)
+                return cls.store(recipe, key, payload)
+
+        compute_start = time.time()
+        logger.info("Computing /api/locations response (cache miss): recipe=%s", recipe)
+        body = None
+        try:
+            payload = compute_locations_payload(link_filters, position_filters)
+            body = cls.store(recipe, key, payload)
+            return body
+        finally:
+            cls._end_compute(key, record, body)
+            logger.info(
+                "/api/locations computed in %.3fs", time.time() - compute_start
+            )
+
+    @classmethod
+    def _try_begin_compute(cls, key: Key) -> _InFlightCompute | None:
+        """Register as the sole compute owner of *key*; None if taken."""
+        with cls._INFLIGHT_LOCK:
+            if key in cls._INFLIGHT:
+                return None
+            record = _InFlightCompute()
+            cls._INFLIGHT[key] = record
+            return record
+
+    @classmethod
+    def _end_compute(
+        cls, key: Key, record: _InFlightCompute, body: bytes | None
+    ) -> None:
+        """Publish *body* to waiters and release ownership of *key*."""
+        record.body = body
+        with cls._INFLIGHT_LOCK:
+            if cls._INFLIGHT.get(key) is record:
+                cls._INFLIGHT.pop(key, None)
+        record.event.set()
+
+    @classmethod
     def store(cls, recipe: Recipe, key: Key, payload: dict[str, Any]) -> bytes:
-        """Serialize and mint *payload* under *key*; return the body bytes."""
-        return cls._mint(recipe, key, payload)
+        """Serialize and mint *payload* under *key*; return the body bytes.
+
+        Also records request activity for *recipe* so first-time requests
+        register for background refreshing and subsequent idle eviction.
+        """
+        body = cls._mint(recipe, key, payload)
+        cls._RECIPE_ACCESS[recipe] = time.time()
+        return body
 
     @classmethod
     def clear(cls) -> None:
@@ -333,6 +487,13 @@ class LocationsResponseCache:
         cls._LAST_ACCESS.clear()
         cls._RECIPES.clear()
         cls._RECIPE_ACCESS.clear()
+        with cls._INFLIGHT_LOCK:
+            records = list(cls._INFLIGHT.values())
+            cls._INFLIGHT.clear()
+        # Wake waiters on abandoned records so they fall back to computing
+        # instead of blocking for the full wait bound.
+        for record in records:
+            record.event.set()
 
     # ------------------------------------------------------------------
     # Background refresher
@@ -415,6 +576,11 @@ class LocationsResponseCache:
                 cls._RECIPE_ACCESS.pop(recipe, None)
                 cls._RECIPES.pop(recipe, None)
 
+        # Evict orphaned recipes that lack activity tracking (except default recipe)
+        for recipe in list(cls._RECIPES):
+            if recipe != cls._DEFAULT_RECIPE and recipe not in cls._RECIPE_ACCESS:
+                cls._RECIPES.pop(recipe, None)
+
         # Evict entries nobody served or minted recently (superseded grid
         # buckets of a still-active recipe are cleaned eagerly in
         # _mint; this catches everything else).
@@ -424,42 +590,119 @@ class LocationsResponseCache:
                 cls._CACHE.pop(key, None)
                 cls._LAST_ACCESS.pop(key, None)
 
-        # Default recipe first so the most common payload stays freshest
-        # even when slower windows are also active.
-        for recipe in sorted(recipes, key=lambda r: r != cls._DEFAULT_RECIPE):
+        # Group active recipes by resolved cache key to deduplicate refresh work.
+        # Distinct recipes (e.g. relative vs explicit windows, or equivalent
+        # custom bounds) resolving to the same window compute once per cycle.
+        grouped_by_key: dict[
+            Key,
+            tuple[dict[str, Any], dict[str, Any], list[Recipe]],
+        ] = {}
+
+        for recipe in recipes:
             try:
                 link_filters, position_filters = resolve_locations_filters(recipe)
+            except Exception:
+                logger.exception(
+                    "Failed to resolve filters for recipe %s during refresh", recipe
+                )
+                continue
+            key = locations_cache_key(link_filters)
+            if key not in grouped_by_key:
+                grouped_by_key[key] = (link_filters, position_filters, [recipe])
+            else:
+                grouped_by_key[key][2].append(recipe)
+
+        # Default recipe group first so the most common payload stays freshest
+        # even when slower windows are also active.
+        sorted_groups = sorted(
+            grouped_by_key.items(),
+            key=lambda item: cls._DEFAULT_RECIPE not in item[1][2],
+        )
+
+        for key, (link_filters, position_filters, group_recipes) in sorted_groups:
+            record = cls._try_begin_compute(key)
+            if record is None:
+                # A request thread is computing this exact window right now
+                # and will mint it; a second compute here would only
+                # duplicate that work.
+                continue
+            try:
                 payload = compute_locations_payload(link_filters, position_filters)
             except Exception:
                 logger.exception(
-                    "Locations cache refresh failed for recipe %s", recipe
+                    "Locations cache refresh failed for key %s (recipes: %s)",
+                    key,
+                    group_recipes,
                 )
+                cls._end_compute(key, record, None)
                 continue
-            cls._mint(recipe, locations_cache_key(link_filters), payload)
+            body = cls._mint(group_recipes, key, payload)
+            cls._end_compute(key, record, body)
 
     @classmethod
-    def _mint(cls, recipe: Recipe, key: Key, payload: dict[str, Any]) -> bytes:
+    def _mint(
+        cls,
+        recipes: Recipe | Iterable[Recipe],
+        key: Key,
+        payload: dict[str, Any],
+    ) -> bytes:
         """Serialize *payload*, store it under *key*, and return the body.
 
-        Also cleans up the recipe's superseded key: a relative recipe that
-        rolled to a new grid bucket leaves its previous key unresolvable,
-        so it is dropped immediately instead of holding megabytes until
-        idle eviction — unless another recipe still maps to it.
+        Publication is order-checked per recipe. Relative recipes roll to
+        a new grid bucket as the clock advances, so a compute that started
+        before a rollover resolves an older window than the one already
+        published for its recipe (e.g. a request that resolved the new
+        window and finished first). Unconditionally repointing would roll
+        the recipe back and delete that newer response — the next request
+        would then be served the older window — so mints for an older
+        window never replace a newer publication. Superseded keys are
+        still dropped eagerly (unless another recipe maps to them), and a
+        mint nothing maps to is not stored at all.
         """
         body = serialize_locations_payload(payload)
-        now_ts = time.time()
 
-        previous_key = cls._RECIPES.get(recipe)
-        cls._CACHE[key] = (now_ts, body)
-        cls._LAST_ACCESS[key] = now_ts
-        cls._RECIPES[recipe] = key
+        recipe_list: list[Recipe]
+        if isinstance(recipes, list):
+            recipe_list = recipes
+        elif isinstance(recipes, tuple) and (not recipes or isinstance(recipes[0], tuple)):
+            recipe_list = cast(list[Recipe], list(recipes))
+        elif isinstance(recipes, tuple):
+            recipe_list = [cast(Recipe, recipes)]
+        else:
+            recipe_list = list(recipes)
 
-        if (
-            previous_key is not None
-            and previous_key != key
-            and previous_key not in cls._RECIPES.values()
-        ):
-            cls._CACHE.pop(previous_key, None)
-            cls._LAST_ACCESS.pop(previous_key, None)
+        # Decision pass (reads only): which recipes may repoint to *key*?
+        # For a given recipe only relative resolution changes the key, and
+        # it only ever rolls forward, so a smaller end_time is strictly a
+        # pre-rollover (older) window.
+        repoint: list[Recipe] = []
+        previous_keys: set[Key] = set()
+        for recipe in recipe_list:
+            previous_key = cls._RECIPES.get(recipe)
+            if (
+                previous_key is not None
+                and previous_key != key
+                and key[1] < previous_key[1]
+            ):
+                continue  # stale window: keep the newer publication
+            if previous_key is not None and previous_key != key:
+                previous_keys.add(previous_key)
+            repoint.append(recipe)
+
+        if repoint:
+            now_ts = time.time()
+            # Store the entry before repointing so a concurrent serve()
+            # never observes a recipe mapped to a missing cache entry.
+            cls._CACHE[key] = (now_ts, body)
+            cls._LAST_ACCESS[key] = now_ts
+            for recipe in repoint:
+                cls._RECIPES[recipe] = key
+
+        # Drop superseded keys of repointed recipes unless another recipe
+        # still resolves to them.
+        for previous_key in previous_keys:
+            if previous_key not in cls._RECIPES.values():
+                cls._CACHE.pop(previous_key, None)
+                cls._LAST_ACCESS.pop(previous_key, None)
 
         return body
