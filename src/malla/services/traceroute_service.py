@@ -46,7 +46,13 @@ from ..utils.signal_quality import (
 logger = logging.getLogger(__name__)
 
 _NETWORK_GRAPH_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
-_NETWORK_GRAPH_CACHE_TTL_SECONDS = 60
+# Match the /api/locations grid (300 s) and whole-response stale window:
+# resolved link bounds only roll every grid step, so a shorter TTL meant
+# the 60 s background refresher never self-hit (60 s interval + ~6 s
+# compute > 60 s TTL) and rebuilt the multi-second 14-day graph every
+# cycle. A grid-sized TTL lets warm buckets hit across cycles while a
+# rollover still mints a fresh key.
+_NETWORK_GRAPH_CACHE_TTL_SECONDS = 300
 _NETWORK_GRAPH_CACHE_MAX_ENTRIES = 32
 
 
