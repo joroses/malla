@@ -33,7 +33,7 @@ import math
 import threading
 import time
 from collections.abc import Iterable
-from typing import Any
+from typing import Any, cast
 
 from ..utils.serialization_utils import sanitize_floats
 from .location_service import LocationService
@@ -664,12 +664,12 @@ class LocationsResponseCache:
         recipe_list: list[Recipe]
         if isinstance(recipes, list):
             recipe_list = recipes
-        elif isinstance(recipes, set):
-            recipe_list = list(recipes)
-        elif isinstance(recipes, tuple) and len(recipes) > 0 and isinstance(recipes[0], tuple):
-            recipe_list = list(recipes)
+        elif isinstance(recipes, tuple) and (not recipes or isinstance(recipes[0], tuple)):
+            recipe_list = cast(list[Recipe], list(recipes))
+        elif isinstance(recipes, tuple):
+            recipe_list = [cast(Recipe, recipes)]
         else:
-            recipe_list = [recipes]  # type: ignore[list-item]
+            recipe_list = list(recipes)
 
         # Decision pass (reads only): which recipes may repoint to *key*?
         # For a given recipe only relative resolution changes the key, and

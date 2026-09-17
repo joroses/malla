@@ -39,6 +39,31 @@ def _isolated_locations_response_cache():
     LocationsResponseCache.clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolated_config_and_db_env():
+    """Isolate MALLA_DATABASE_FILE env var and config singleton between tests.
+
+    Tests that invoke create_app() or override config modify process-global
+    state (os.environ['MALLA_DATABASE_FILE'] and malla.config._config_singleton).
+    Without this fixture, an earlier test on a worker process can leak its
+    temporary (and subsequently deleted) database path to later tests running
+    on the same worker.
+    """
+    import malla.config
+
+    old_env = os.environ.get("MALLA_DATABASE_FILE")
+    old_singleton = malla.config._config_singleton
+
+    try:
+        yield
+    finally:
+        if old_env is None:
+            os.environ.pop("MALLA_DATABASE_FILE", None)
+        else:
+            os.environ["MALLA_DATABASE_FILE"] = old_env
+        malla.config._config_singleton = old_singleton
+
+
 @pytest.fixture(scope="session")
 def worker_id(request):
     """Get the worker ID for pytest-xdist parallel execution.

@@ -459,6 +459,35 @@ class TestMintOrdering:
         assert key0 in LocationsResponseCache._CACHE
         assert key1 in LocationsResponseCache._CACHE
 
+    def test_mint_accepts_various_recipe_iterables_and_single_recipe(
+        self, no_auto_refresh
+    ):
+        """_mint handles single recipes and various iterable types properly."""
+        r1 = normalize_recipe(None, None, 1, None, None)
+        r2 = normalize_recipe(None, None, 2, None, None)
+        link1, _ = resolve_locations_filters(r1)
+        key1 = locations_cache_key(link1)
+
+        # Single recipe
+        LocationsResponseCache._mint(r1, key1, {"v": 1})
+        assert LocationsResponseCache._RECIPES[r1] == key1
+
+        # Tuple of recipes
+        link2, _ = resolve_locations_filters(r2)
+        key2 = locations_cache_key(link2)
+        LocationsResponseCache._mint((r1, r2), key2, {"v": 2})
+        assert LocationsResponseCache._RECIPES[r1] == key2
+        assert LocationsResponseCache._RECIPES[r2] == key2
+
+        # Set of recipes
+        LocationsResponseCache._mint({r1}, key1, {"v": 3})
+        assert LocationsResponseCache._RECIPES[r1] == key1
+
+        # Generator of recipes
+        LocationsResponseCache._mint((r for r in [r1, r2]), key2, {"v": 4})
+        assert LocationsResponseCache._RECIPES[r1] == key2
+        assert LocationsResponseCache._RECIPES[r2] == key2
+
 
 class TestInFlightDeduplication:
     """Cache-miss requests join running computes instead of duplicating them."""

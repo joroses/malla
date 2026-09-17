@@ -6,26 +6,32 @@ import sqlite3
 
 import pytest
 
-from malla.config import AppConfig, _override_config
+from malla.config import AppConfig, _clear_config_cache, _override_config
 from malla.database.repositories import NodeRepository
 
 
 class TestNodeNamesRepository:
     """Unit tests for NodeRepository.get_node_names."""
 
-    def test_get_node_names_empty_db(self, tmp_path):
+    @pytest.fixture(autouse=True)
+    def _cleanup_config(self):
+        yield
+        _clear_config_cache()
+
+    def test_get_node_names_empty_db(self, tmp_path, monkeypatch):
         """Returns empty list when node_info table does not exist."""
         db_path = str(tmp_path / "empty.db")
         conn = sqlite3.connect(db_path)
         conn.close()
 
+        monkeypatch.setenv("MALLA_DATABASE_FILE", db_path)
         cfg = AppConfig(database_file=db_path)
         _override_config(cfg)
 
         nodes = NodeRepository.get_node_names()
         assert nodes == []
 
-    def test_get_node_names_success(self, tmp_path):
+    def test_get_node_names_success(self, tmp_path, monkeypatch):
         """Returns lightweight node identity objects with expected fields."""
         db_path = str(tmp_path / "test_nodes.db")
         conn = sqlite3.connect(db_path)
@@ -53,6 +59,7 @@ class TestNodeNamesRepository:
         conn.commit()
         conn.close()
 
+        monkeypatch.setenv("MALLA_DATABASE_FILE", db_path)
         cfg = AppConfig(database_file=db_path)
         _override_config(cfg)
 
@@ -69,7 +76,7 @@ class TestNodeNamesRepository:
         assert nodes[1]["node_id"] == 12345678
         assert nodes[1]["hex_id"] == f"!{12345678:08x}"
 
-    def test_get_node_names_limit(self, tmp_path):
+    def test_get_node_names_limit(self, tmp_path, monkeypatch):
         """Respects the limit argument."""
         db_path = str(tmp_path / "test_limit.db")
         conn = sqlite3.connect(db_path)
@@ -92,6 +99,7 @@ class TestNodeNamesRepository:
         conn.commit()
         conn.close()
 
+        monkeypatch.setenv("MALLA_DATABASE_FILE", db_path)
         cfg = AppConfig(database_file=db_path)
         _override_config(cfg)
 
