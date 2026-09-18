@@ -154,6 +154,10 @@
                 <input class="form-check-input" type="checkbox" id="packetLinksCheckbox">
                 <label class="form-check-label" for="packetLinksCheckbox">Packet Links</label>
             </div>
+            <div class="form-check mt-1">
+                <input class="form-check-input" type="checkbox" id="reliabilityCheckbox" checked>
+                <label class="form-check-label" for="reliabilityCheckbox" title="Badge gateways with the % of the selected node's broadcast text messages they received">Reliability</label>
+            </div>
         </div>
 
         <!-- Hop depth selector (shown only when a node is selected) -->
@@ -200,7 +204,7 @@
                 Click nodes for details<br>
                 Each RF link half is colored by the quality the node at that end receives<br>
                 Line width shows observation volume; missing directions are dashed and faded<br>
-                Selecting a node badges gateways with the % of its broadcast text messages they received ({{ GATEWAY_RELIABILITY_CUTOFF_PERCENT }}% minimum)<br>
+                <span id="gatewayReliabilityLegend">Selecting a node badges gateways with the % of its broadcast text messages they received ({{ GATEWAY_RELIABILITY_CUTOFF_PERCENT }}% minimum)<br></span>
                 Clusters group nearby nodes</small>
             </div>
         {% endcall %}
@@ -475,6 +479,7 @@ let basemapAdded = false; // basemap overlay attach is deferred until the real v
 let gatewayReliability = null; // { node_id, total_sent, gateways } payload for the selected node
 let gatewayReliabilityMap = null; // Map<gateway_node_id, gateway entry> built from gatewayReliability
 let reliabilityRequestId = 0; // guards against stale reliability responses
+let showGatewayReliability = true; // Link Types toggle for the gateway reliability feature
 // Minimum reception rate for the gateway badge; injected by the backend so
 // the sidebar legend and this script can never drift apart.
 const GATEWAY_RELIABILITY_CUTOFF_PERCENT = {{ GATEWAY_RELIABILITY_CUTOFF_PERCENT }};
@@ -657,6 +662,13 @@ function initializeInterface() {
         const desiredState = this.checked;
         if (desiredState !== showPacketLinks) {
             togglePacketLinks();
+        }
+    });
+
+    $('#reliabilityCheckbox').on('change', function() {
+        const desiredState = this.checked;
+        if (desiredState !== showGatewayReliability) {
+            toggleGatewayReliability();
         }
     });
 
@@ -1149,7 +1161,7 @@ function updateMapDisplay() {
 // Reliability entry for a node when it is a gateway that received
 // broadcasts from the currently selected node; null otherwise.
 function getGatewayReliabilityForNode(nodeId) {
-    if (!gatewayReliability || !gatewayReliabilityMap ||
+    if (!showGatewayReliability || !gatewayReliability || !gatewayReliabilityMap ||
         gatewayReliability.node_id !== selectedNodeId) {
         return null;
     }
@@ -1169,6 +1181,9 @@ function reliabilityBadgeColors(percent) {
 // network so the badges appear. Stale responses (superseded selection or
 // refetch) are discarded via reliabilityRequestId.
 async function loadGatewayReliability(nodeId) {
+    if (!showGatewayReliability) {
+        return;
+    }
     const requestId = ++reliabilityRequestId;
     const params = new URLSearchParams();
     const timeParams = getTimeFilterParams();
@@ -1749,6 +1764,38 @@ function togglePacketLinks() {
     }
 }
 
+// Show or hide the sidebar legend line describing the gateway badges.
+function updateReliabilityLegend() {
+    const legendItem = document.getElementById('gatewayReliabilityLegend');
+    if (legendItem) {
+        legendItem.style.display = showGatewayReliability ? '' : 'none';
+    }
+}
+
+function toggleGatewayReliability() {
+    showGatewayReliability = !showGatewayReliability;
+
+    if (!showGatewayReliability) {
+        // Invalidate any in-flight fetch and drop the payload so stale
+        // badges and popup notes cannot linger.
+        reliabilityRequestId += 1;
+        gatewayReliability = null;
+        gatewayReliabilityMap = null;
+    } else if (selectedNodeId !== null) {
+        // Badges render once the payload arrives (drawHopNetwork re-runs
+        // from loadGatewayReliability's completion handler).
+        loadGatewayReliability(selectedNodeId);
+    }
+
+    updateReliabilityLegend();
+
+    if (selectedNodeId !== null) {
+        // Re-render the hop-limited view without badges (skip map fit so
+        // the user keeps the current viewport).
+        drawHopNetwork(true);
+    }
+}
+
 // Draw traceroute links on the map
 function drawTracerouteLinks() {
     drawTracerouteLinksFiltered(null);
@@ -2078,7 +2125,7 @@ function computeNodesWithinHops(startNodeId, maxHops) {
 // percentage badge) even without an RF link inside the hop depth.
 function reliableGatewayNodeIds() {
     const ids = new Set();
-    if (!gatewayReliability || !gatewayReliabilityMap ||
+    if (!showGatewayReliability || !gatewayReliability || !gatewayReliabilityMap ||
         gatewayReliability.node_id !== selectedNodeId) {
         return ids;
     }
