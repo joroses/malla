@@ -358,6 +358,34 @@
     transform: scale(1.15);
 }
 
+/* A fixed-size ring stays visible even when the network fit zooms out. */
+.node-marker-container.node-marker-selected {
+    box-shadow: 0 0 0 3px white, 0 0 0 6px #111827, 0 0 0 9px #ffc107;
+}
+
+.selected-node-label {
+    position: absolute;
+    bottom: calc(100% + 16px);
+    left: 50%;
+    transform: translateX(-50%);
+    width: max-content;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    background: #111827;
+    color: white;
+    border: 2px solid #ffc107;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.4;
+    text-shadow: none;
+    pointer-events: none;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.35);
+}
+
 /* Broadcast text-message reception badge shown on gateway circles while a
    node is selected; color is set inline from the percentage tier. */
 .node-marker-reliability {
@@ -457,6 +485,9 @@ let searchResults = [];
 let allNodes = [];
 let linkData = [];
 let firstDisplay = true; // prevent recenter after initial load
+let mapIsZooming = false;
+let pendingMapFit = null; // latest fit request, scoped to its selection
+let mapFitFrame = null;
 let currentHopDepth = 1; // max hop depth to display around selected node
 let currentOverlay = null;
 let locationsAbortController = null; // cancels superseded /api/locations fetches
@@ -800,6 +831,11 @@ function initMap() {
     // Persist the view whenever it settles (pan, zoom, fit). Attached after
     // setView so the initial default view is never saved.
     map.on('moveend', saveMapView);
+    map.on('zoomstart', () => { mapIsZooming = true; });
+    map.on('zoomend', () => {
+        mapIsZooming = false;
+        if (pendingMapFit) scheduleMapFit();
+    });
 
     // Initialize markers layer group (markers overlap instead of clustering)
     markerClusterGroup = L.layerGroup();
@@ -1128,8 +1164,7 @@ function updateMapDisplay() {
             };
             map.once('moveend', attachBasemap);
             fitMapToNodes({ animate: false });
-            // Degenerate bounds (e.g. a single located node) skip fitBounds
-            // entirely, so 'moveend' never fires — fall back to direct attach.
+            // An already-fitted view may not emit 'moveend'.
             if (!attached) setTimeout(attachBasemap, 100);
         }, 500);
         firstDisplay = false;
@@ -1223,6 +1258,7 @@ async function loadGatewayReliability(nodeId, fitMap = false) {
 function addNodeMarker(node) {
     // Create custom marker with role-based styling
     const roleColor = getRoleColor(node.role);
+    const isSelected = node.node_id === selectedNodeId;
 
     // Determine display text for the marker
     let displayText = node.short_name || node.display_name;
@@ -1236,9 +1272,15 @@ function addNodeMarker(node) {
     }
 
     const container = el('div', {
-        className: 'node-marker-container',
+        className: `node-marker-container${isSelected ? ' node-marker-selected' : ''}`,
         style: { backgroundColor: roleColor }
     }, el('div', { className: 'node-marker-label' }, displayText));
+
+    if (isSelected) {
+        container.appendChild(el('div', {
+            className: 'selected-node-label',
+        }, `Selected: ${node.display_name}`));
+    }
 
     // Broadcast text-message reception badge for gateways that heard the
     // selected node (>= cutoff); below the cutoff the badge is hidden.
@@ -1259,7 +1301,11 @@ function addNodeMarker(node) {
         iconAnchor: [14, 14]
     });
 
-    const marker = L.marker([node.latitude, node.longitude], { icon: markerIcon });
+    const marker = L.marker([node.latitude, node.longitude], {
+        icon: markerIcon,
+        zIndexOffset: isSelected ? 10000 : 0,
+        title: isSelected ? `Selected: ${node.display_name}` : node.display_name,
+    });
 
     // Create popup content
     const popupContent = createNodePopupContent(node);
@@ -1271,6 +1317,8 @@ function addNodeMarker(node) {
     });
 
     markerClusterGroup.addLayer(marker);
+    marker.getElement().setAttribute('aria-label', marker.options.title);
+    if (isSelected) marker.getElement().setAttribute('aria-current', 'true');
     nodeMarkers.push(marker);
 }
 
@@ -1668,6 +1716,26 @@ function formatRole(role) {
 
 // Map control functions
 function fitMapToNodes(options = {}) {
+    pendingMapFit = { options, selectedNodeId };
+    scheduleMapFit();
+}
+
+function scheduleMapFit() {
+    if (mapFitFrame === null) {
+        mapFitFrame = requestAnimationFrame(applyPendingMapFit);
+    }
+}
+
+function applyPendingMapFit() {
+    mapFitFrame = null;
+    // Leaflet ignores a second fit during an animated zoom. Keep the latest
+    // request until zoomend, then fit the current markers, including any
+    // reliability gateways that arrived during the first fit.
+    if (mapIsZooming || !pendingMapFit) return;
+    const request = pendingMapFit;
+    pendingMapFit = null;
+    if (request.selectedNodeId !== selectedNodeId) return;
+    const options = request.options;
     if (nodeMarkers.length === 0) {
         return;
     }
@@ -1675,9 +1743,10 @@ function fitMapToNodes(options = {}) {
     // Collect lat/lngs from markers
     const latLngs = nodeMarkers.map(m => m.getLatLng());
 
-    // If we have enough markers, trim extreme outliers (top / bottom 2.5%)
+    // Trim outliers only in the overview. A selection must include every
+    // visible related node, even a distant gateway or the selected node.
     let bounds;
-    if (latLngs.length > 4) {
+    if (selectedNodeId === null && latLngs.length > 4) {
         const lats = latLngs.map(ll => ll.lat).sort((a, b) => a - b);
         const lngs = latLngs.map(ll => ll.lng).sort((a, b) => a - b);
 
@@ -1695,31 +1764,26 @@ function fitMapToNodes(options = {}) {
     }
 
     // Determine extra bottom padding on mobile when the sidebar is expanded
-    let paddingTopLeft = [20, 20];
-    let paddingBottomRight = [20, 20];
+    const paddingTopLeft = selectedNodeId === null ? [20, 20] : [96, 80];
+    const paddingBottomRight = selectedNodeId === null ? [20, 20] : [96, 36];
 
     if (window.innerWidth <= 768) {
         const sidebar = document.getElementById('sidebar');
         if (sidebar) {
             // Collapsed sidebar shows only a ~60px header, otherwise full 60vh
             const sidebarHeight = sidebar.classList.contains('collapsed') ? 60 : sidebar.clientHeight || window.innerHeight * 0.6;
-            paddingBottomRight = [20, 20 + sidebarHeight];
+            paddingBottomRight[1] += sidebarHeight;
         }
     }
 
-    // Single node (or all nodes at identical coordinates): fitBounds would
-    // compute an infinite zoom and can crash ('Invalid LatLng (NaN, NaN)'),
-    // so center on the point instead at street zoom (matches focusOnNode).
-    if (bounds.isValid() && bounds.getNorthEast().equals(bounds.getSouthWest())) {
-        map.setView(bounds.getCenter(), options.zoom ?? 15, {
-            animate: options.animate !== false,
-        });
-        return;
-    }
     if (bounds.isValid()) {
+        // A finite zoom cap also lets a single node use fitBounds padding,
+        // keeping its marker and label above the mobile sidebar.
+        const singlePosition = bounds.getNorthEast().equals(bounds.getSouthWest());
         map.fitBounds(bounds, {
             paddingTopLeft: paddingTopLeft,
             paddingBottomRight: paddingBottomRight,
+            maxZoom: singlePosition ? (options.zoom ?? 15) : map.getMaxZoom(),
             animate: options.animate !== false,
         });
     }
