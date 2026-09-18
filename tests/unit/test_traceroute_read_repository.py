@@ -83,6 +83,99 @@ def _insert(conn, *, packet_id, timestamp, mesh_id, gateway, route=(900,), snr_t
     write_traceroute(conn.cursor(), packet)
 
 
+def test_get_traceroute_link_dedupes_repeat_receptions_of_one_flood(database):
+    """Two gateways hearing one flood (same mesh id) count as one observation."""
+    with closing(_connection(database)) as conn:
+        _insert(conn, packet_id=1, timestamp=10.0, mesh_id=999, gateway="!00000001", route=())
+        _insert(conn, packet_id=2, timestamp=11.0, mesh_id=999, gateway="!00000002", route=())
+        conn.commit()
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        result = get_traceroute_link(
+            100, 200, start_time=0.0, end_time=30.0, limit=10, offset=0
+        )
+
+    assert result["total_attempts"] == 1
+    assert result["total_count"] == 1
+    assert result["forward_count"] == 1
+    assert result["reverse_count"] == 0
+    assert result["forward_observations"] == 1
+    assert len(result["packets"]) == 1
+
+
+def test_get_traceroute_link_dedupes_shared_hop_across_different_routes(database):
+    """Same flood seen with different partial routes: a shared hop counts once."""
+    with closing(_connection(database)) as conn:
+        _insert(conn, packet_id=1, timestamp=10.0, mesh_id=999, gateway="!00000001", route=(900, 901))
+        _insert(conn, packet_id=2, timestamp=11.0, mesh_id=999, gateway="!00000002", route=(900, 902))
+        conn.commit()
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        shared = get_traceroute_link(
+            100, 900, start_time=0.0, end_time=30.0, limit=10, offset=0
+        )
+        unshared = get_traceroute_link(
+            900, 901, start_time=0.0, end_time=30.0, limit=10, offset=0
+        )
+
+    assert shared["total_attempts"] == 1
+    assert shared["forward_observations"] == 1
+    assert len(shared["packets"]) == 1
+    assert unshared["total_attempts"] == 1
+    assert unshared["forward_observations"] == 1
+
+
+def test_get_traceroute_link_does_not_merge_receptions_without_mesh_id(database):
+    """Receptions without a mesh id (0/NULL) are never merged."""
+    with closing(_connection(database)) as conn:
+        _insert(conn, packet_id=1, timestamp=10.0, mesh_id=0, gateway="!00000001", route=())
+        _insert(conn, packet_id=2, timestamp=11.0, mesh_id=0, gateway="!00000002", route=())
+        _insert(conn, packet_id=3, timestamp=12.0, mesh_id=None, gateway="!00000003", route=())
+        conn.commit()
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        result = get_traceroute_link(
+            100, 200, start_time=0.0, end_time=30.0, limit=10, offset=0
+        )
+
+    assert result["total_attempts"] == 3
+    assert result["forward_count"] == 3
+    assert len(result["packets"]) == 3
+
+
+def test_get_traceroute_graph_aggregates_dedupe_one_flood(database):
+    """One flood heard twice contributes one observation and one analyzed packet."""
+    with closing(_connection(database)) as conn:
+        _insert(conn, packet_id=1, timestamp=10.0, mesh_id=999, gateway="!00000001", route=())
+        _insert(conn, packet_id=2, timestamp=11.0, mesh_id=999, gateway="!00000002", route=())
+        conn.commit()
+
+    with patch(
+        "malla.database.traceroute_read_repository.get_db_connection",
+        side_effect=lambda: _connection(database),
+    ):
+        result = get_traceroute_graph_aggregates(
+            filters={"start_time": 0.0, "end_time": 100.0}
+        )
+
+    (link,) = result["links"]
+    assert (link["link_source"], link["link_target"]) == (100, 200)
+    assert link["forward_observations"] == 1
+    assert link["packet_count"] == 1
+    assert result["stats"]["packets_analyzed"] == 1
+    assert result["stats"]["packets_with_rf_hops"] == 1
+    assert result["stats"]["total_rf_hops"] == 1
+
+
 def test_empty_database_returns_empty_packets(database):
     with patch(
         "malla.database.traceroute_read_repository.get_db_connection",

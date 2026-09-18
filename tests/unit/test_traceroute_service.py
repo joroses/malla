@@ -237,3 +237,64 @@ class TestTracerouteServiceLongestLinks:
         assert stats["node_id"] == 12345
         assert stats["node_name"] == "TestNode"
         assert stats["total_involvement"] == 18
+
+    @patch("src.malla.services.traceroute_service.LocationRepository.get_node_locations")
+    @patch("src.malla.services.traceroute_service.get_bulk_node_names")
+    @patch("src.malla.services.traceroute_service.get_traceroute_hops_for_graph")
+    def test_network_graph_dedupes_repeat_receptions_of_one_flood(
+        self, mock_get_hops, mock_get_names, mock_get_locs
+    ):
+        """Two receptions of one flood count as one observation (Python path)."""
+        from src.malla.services.traceroute_service import _NETWORK_GRAPH_CACHE
+
+        _NETWORK_GRAPH_CACHE.clear()
+        now_ts = datetime.now().timestamp()
+        mock_get_hops.return_value = [
+            {
+                "packet_id": 2,
+                "direction": "forward",
+                "hop_index": 0,
+                "timestamp": now_ts,
+                "from_node_id": 100,
+                "to_node_id": 200,
+                "snr": -5.0,
+                "channel_id": "LongFast",
+                "mesh_packet_id": 999,
+                "route_from_node_id": 100,
+                "route_to_node_id": 200,
+                "grp": "m:999:100:200",
+            },
+            {
+                "packet_id": 1,
+                "direction": "forward",
+                "hop_index": 0,
+                "timestamp": now_ts - 1,
+                "from_node_id": 100,
+                "to_node_id": 200,
+                "snr": -5.0,
+                "channel_id": "LongFast",
+                "mesh_packet_id": 999,
+                "route_from_node_id": 100,
+                "route_to_node_id": 200,
+                "grp": "m:999:100:200",
+            },
+        ]
+        mock_get_names.return_value = {100: "Node100", 200: "Node200"}
+        mock_get_locs.return_value = []
+
+        try:
+            result = TracerouteService.get_network_graph_data(
+                hours=24,
+                min_snr=-200.0,
+                include_indirect=True,
+                filters={"start_time": now_ts - 60, "end_time": now_ts + 60},
+            )
+        finally:
+            _NETWORK_GRAPH_CACHE.clear()
+
+        assert len(result["links"]) == 1
+        link = result["links"][0]
+        assert link["packet_count"] == 1
+        assert link["forward_count"] == 1
+        assert result["stats"]["packets_analyzed"] == 1
+        assert result["stats"]["total_rf_hops"] == 1

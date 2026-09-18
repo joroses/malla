@@ -42,6 +42,7 @@ from ..services.locations_response_cache import (
 )
 from ..services.meshtastic_service import MeshtasticService
 from ..services.node_service import NodeService
+from ..services.text_reliability_service import TextReliabilityService
 from ..services.traceroute_service import TracerouteService
 from ..utils.link_quality import enrich_link_quality
 from ..utils.node_utils import (
@@ -1006,6 +1007,47 @@ def api_node_relay_node_analysis(node_id):
         return jsonify({"error": str(e)}), 500
 
 
+@api_bp.route("/node/<node_id>/text-message-reliability")
+def api_node_text_message_reliability(node_id):
+    """API endpoint for per-gateway broadcast text-message reliability.
+
+    Of the broadcast TEXT_MESSAGE_APP transmissions the node originated in
+    the selected window, returns the percentage each MQTT gateway received
+    (any hop depth, deduplicated per transmission).
+
+    Time window parameters (``hours``/``max_age_hours``/``start_time``/
+    ``end_time``) resolve through the same grid-snapped window logic as
+    /api/locations so the percentages always obey the map's selected
+    time range.
+    """
+    logger.info(f"API text-message reliability endpoint accessed for node {node_id}")
+    try:
+        # Convert node_id using helper to support hex strings or int
+        node_id_int = convert_node_id(node_id)
+
+        start_arg = request.args.get("start_time", type=float)
+        end_arg = request.args.get("end_time", type=float)
+        hours_arg = request.args.get("hours", type=float)
+        if hours_arg is None:
+            hours_arg = request.args.get("max_age_hours", type=float)
+
+        recipe = _normalize_locations_recipe(start_arg, end_arg, hours_arg, None, None)
+        try:
+            link_filters, _ = _resolve_locations_filters(recipe)
+        except _LocationsWindowError:
+            return jsonify({"error": "start_time must be before end_time"}), 400
+
+        data = TextReliabilityService.get_text_message_reliability(
+            node_id_int, link_filters
+        )
+        return jsonify(data)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.error(f"Error in API text-message reliability: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 @api_bp.route("/location/statistics")
 def api_location_statistics():
     """API endpoint for location statistics."""
@@ -1810,6 +1852,14 @@ def api_nodes_data():
         primary_channel = request.args.get("primary_channel", "").strip()
         if primary_channel:
             filters["primary_channel"] = primary_channel
+
+        active_only = request.args.get("active_only", "").strip().lower()
+        if active_only in ("true", "1", "yes"):
+            filters["active_only"] = True
+
+        named_only = request.args.get("named_only", "").strip().lower()
+        if named_only in ("true", "1", "yes"):
+            filters["named_only"] = True
 
         # Calculate offset
         offset = (page - 1) * limit
