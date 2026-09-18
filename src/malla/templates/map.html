@@ -127,8 +127,9 @@
                 <div class="mb-3">
                     <label for="minBroadcasts" class="form-label">Min Broadcasts</label>
                     <input type="number" class="form-control form-control-sm" id="minBroadcasts" name="minBroadcasts" value="0" min="0" title="Minimum broadcast text messages originating from the node in the selected time window">
-                    <div class="form-text">Only nodes originating at least this many broadcast text messages are shown. Related nodes of a selection always stay visible.</div>
+                    <div class="form-text">Only nodes originating at least this many broadcast text messages are shown.</div>
                 </div>
+                <div class="form-text mb-3">Related nodes of a selection ignore Node Role, Min Contacts and Min Broadcasts for enabled link types. Time and channel filters still apply.</div>
                 <button type="submit" class="btn btn-primary btn-sm w-100">
                     <i class="bi bi-funnel"></i> Apply Filters
                 </button>
@@ -447,6 +448,7 @@ let allTracerouteLinks = [];
 let allPacketLinks = [];
 let allLinkData = [];
 let nodesPassingBaseFilters = [];
+let linksPassingBaseFilters = [];
 let selectedNodeId = null;
 let showTracerouteLinks = true;
 let showPacketLinks = false;
@@ -853,6 +855,11 @@ function refreshMapData() {
 // broadcast text-message reliability so the gateway percentages track the
 // newly selected time window.
 function reloadMapDataAndReliability() {
+    // Reliability from the previous window must not reveal gateways while
+    // the new window loads, including late responses to an older request.
+    reliabilityRequestId += 1;
+    gatewayReliability = null;
+    gatewayReliabilityMap = null;
     const request = loadNodeLocations();
     if (selectedNodeId !== null) {
         request.then(() => {
@@ -957,7 +964,6 @@ function applyClientSideFilters() {
     const formData = new FormData(form);
 
     // Get filter values
-    const maxAge = formData.get('maxAge'); // still read to sync UI but no longer used for filtering
     const roleFilter = formData.get('roleFilter');
     const channelFilter = formData.get('channelFilter');
     const startDateTime = formData.get('startDateTime');
@@ -968,20 +974,6 @@ function applyClientSideFilters() {
     // Start with all data
     let filteredNodes = [...allNodeData];
     let filteredLinks = [...allLinkData];
-
-    const currentTime = Date.now() / 1000;
-
-    // Apply role filter
-    if (roleFilter) {
-        if (roleFilter === 'UNKNOWN') {
-            // Filter for nodes with null, undefined, or unknown roles
-            filteredNodes = filteredNodes.filter(node =>
-                !node.role || node.role === 'UNKNOWN' || node.role === 'Unknown'
-            );
-        } else {
-            filteredNodes = filteredNodes.filter(node => node.role === roleFilter);
-        }
-    }
 
     // Apply channel filter
     if (channelFilter) {
@@ -1019,10 +1011,38 @@ function applyClientSideFilters() {
         });
     }
 
-    // Nodes passing every filter except the broadcast minimum. When a node
-    // is selected its related neighborhood is resolved from this set so the
-    // broadcast threshold never hides related nodes.
+    // Time and channel constrain both the full map and a selection's
+    // neighborhood. Keep this pool before applying the overview filters.
     nodesPassingBaseFilters = [...filteredNodes];
+
+    const baseNodeIds = new Set(nodesPassingBaseFilters.map(node => node.node_id));
+    filteredLinks = filteredLinks.filter(link =>
+        baseNodeIds.has(link.from_node_id) && baseNodeIds.has(link.to_node_id)
+    );
+
+    // Keep out-of-window links out of both traversal and rendering.
+    if (startTimestamp !== null || endTimestamp !== null) {
+        filteredLinks = filteredLinks.filter(link => {
+            if (!link.last_seen_str) return true;
+            const linkTs = Date.parse(link.last_seen_str) / 1000;
+            if (startTimestamp !== null && linkTs < startTimestamp) return false;
+            if (endTimestamp !== null && linkTs > endTimestamp) return false;
+            return true;
+        });
+    }
+    linksPassingBaseFilters = filteredLinks;
+
+    // Role and broadcast minimum apply to the overview, but never hide a
+    // selected node's related neighborhood.
+    if (roleFilter) {
+        if (roleFilter === 'UNKNOWN') {
+            filteredNodes = filteredNodes.filter(node =>
+                !node.role || node.role === 'UNKNOWN' || node.role === 'Unknown'
+            );
+        } else {
+            filteredNodes = filteredNodes.filter(node => node.role === roleFilter);
+        }
+    }
 
     // Filter nodes by minimum broadcast text messages originating from the
     // node in the selected window. Missing counts (older cached payloads)
@@ -1046,26 +1066,12 @@ function applyClientSideFilters() {
         });
     }
 
-    // Filter links to only include those between nodes passing the base
-    // filters (role/channel/date). The broadcast minimum hides nodes, not
-    // links: keeping links to broadcast-excluded nodes lets a later
-    // selection reveal its related neighborhood with links intact (links
-    // whose endpoint is still hidden simply don't draw).
-    const visibleNodeIds = new Set(nodesPassingBaseFilters.map(node => node.node_id));
+    // Overview links must join nodes passing all filters. Selection uses
+    // linksPassingBaseFilters to restore related links below Min Contacts.
+    const visibleNodeIds = new Set(filteredNodes.map(node => node.node_id));
     filteredLinks = filteredLinks.filter(link =>
         visibleNodeIds.has(link.from_node_id) && visibleNodeIds.has(link.to_node_id)
     );
-
-    // Apply date filters to links based on last_seen if available
-    if (startTimestamp !== null || endTimestamp !== null) {
-        filteredLinks = filteredLinks.filter(link => {
-            if (!link.last_seen_str) return true;
-            const linkTs = Date.parse(link.last_seen_str) / 1000;
-            if (startTimestamp !== null && linkTs < startTimestamp) return false;
-            if (endTimestamp !== null && linkTs > endTimestamp) return false;
-            return true;
-        });
-    }
 
     // Update global variables
     nodeData = filteredNodes;
@@ -2095,7 +2101,7 @@ function computeNodesWithinHops(startNodeId, maxHops) {
     const visited = new Set([startNodeId]);
     let frontier = [startNodeId];
     let hops = 0;
-    const traversable = allLinkData.filter(link => {
+    const traversable = linksPassingBaseFilters.filter(link => {
         if (link.link_type === 'packet') return showPacketLinks;
         return showTracerouteLinks;
     });
@@ -2135,42 +2141,37 @@ function reliableGatewayNodeIds() {
     return ids;
 }
 
-// Draw network limited by hop depth around the selected node. The Min
-// Broadcasts threshold never hides related nodes: the neighborhood is
-// resolved from the base-filtered set (role/channel/date only), so nodes
-// failing only the broadcast minimum still appear when they are within hop
-// depth via an enabled link type or carry reliability data with its toggle
-// on. The "All" depth likewise uses the base set.
+// Resolve related nodes using only time, channel, hop depth and enabled
+// link types. Role, broadcast and contact minimums apply to the overview.
 function drawHopNetwork(skipFit = false) {
     if (selectedNodeId === null) {
         return;
     }
 
-    const basePool = (nodesPassingBaseFilters && nodesPassingBaseFilters.length > 0)
-        ? nodesPassingBaseFilters
-        : [...nodeData];
-    // The selected node itself always stays visible even if a base filter
-    // (e.g. role) currently excludes it: fall back to the raw payload.
-    const selectedFromRaw = basePool.some(n => n.node_id === selectedNodeId)
-        ? null
-        : allNodeData.find(n => n.node_id === selectedNodeId) || null;
-
-    // Determine visible nodes
-    const visibleNodesSet = (currentHopDepth >= 999) ? new Set(basePool.map(n => n.node_id)) : computeNodesWithinHops(selectedNodeId, currentHopDepth);
-    visibleNodesSet.add(selectedNodeId); // ensure selected node visible
-
-    // Gateways with sufficient broadcast reception join the visible set
-    const reliableGatewayIds = reliableGatewayNodeIds();
+    const relatedNodeIds = computeNodesWithinHops(
+        selectedNodeId, currentHopDepth >= 999 ? Infinity : currentHopDepth
+    );
+    reliableGatewayNodeIds().forEach(id => relatedNodeIds.add(id));
+    const visibleNodesSet = new Set(relatedNodeIds);
+    // "All" keeps the overview nodes too, but only related nodes receive
+    // exemptions from role and minimum-count filters.
+    if (currentHopDepth >= 999) {
+        nodeData.forEach(node => visibleNodesSet.add(node.node_id));
+    }
 
     // Backup full dataset
-    const originalNodeData = [...nodeData];
+    const originalNodeData = nodeData;
+    const originalTracerouteLinkData = tracerouteLinkData;
+    const originalPacketLinkData = packetLinkData;
 
-    // Filter nodes for display from the base pool (broadcast minimum
-    // bypassed) plus the selected node fallback.
-    const poolWithSelected = selectedFromRaw ? [...basePool, selectedFromRaw] : basePool;
-    nodeData = poolWithSelected.filter(n =>
-        visibleNodesSet.has(n.node_id) || reliableGatewayIds.has(n.node_id)
+    nodeData = nodesPassingBaseFilters.filter(n => visibleNodesSet.has(n.node_id));
+    const overviewLinks = new Set([...tracerouteLinkData, ...packetLinkData]);
+    const selectedLinks = linksPassingBaseFilters.filter(link =>
+        visibleNodesSet.has(link.from_node_id) && visibleNodesSet.has(link.to_node_id) &&
+        (relatedNodeIds.has(link.from_node_id) || relatedNodeIds.has(link.to_node_id) || overviewLinks.has(link))
     );
+    tracerouteLinkData = selectedLinks.filter(link => link.link_type === 'traceroute');
+    packetLinkData = selectedLinks.filter(link => link.link_type === 'packet');
 
     // Re-render markers and links
     markerClusterGroup.clearLayers();
@@ -2212,6 +2213,8 @@ function drawHopNetwork(skipFit = false) {
 
     // Restore original data for other operations
     nodeData = originalNodeData;
+    tracerouteLinkData = originalTracerouteLinkData;
+    packetLinkData = originalPacketLinkData;
 }
 
 // ==================== Line of Sight Analysis ====================
