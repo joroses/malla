@@ -33,6 +33,11 @@ from .utils.node_utils import (
 )
 from .utils.signal_quality import QUALITY_COLORS
 
+# Minimum broadcast text-message reception rate (percent) for which the map
+# shows a gateway reliability badge while a node is selected; injected into
+# templates so the legend and the map's JS share one source.
+GATEWAY_RELIABILITY_CUTOFF_PERCENT = 30
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -274,6 +279,9 @@ def create_app(cfg: AppConfig | None = None):  # noqa: D401
             # (src/malla/utils/signal_quality.py) for every template and the
             # window.MALLA_QUALITY_COLORS script in base.html.
             "QUALITY_COLORS": QUALITY_COLORS,
+            # Minimum broadcast text-message reception rate for which the map
+            # shows a gateway reliability badge (percent).
+            "GATEWAY_RELIABILITY_CUTOFF_PERCENT": GATEWAY_RELIABILITY_CUTOFF_PERCENT,
         }
 
     # Initialize database

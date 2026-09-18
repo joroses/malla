@@ -200,6 +200,7 @@
                 Click nodes for details<br>
                 Each RF link half is colored by the quality the node at that end receives<br>
                 Line width shows observation volume; missing directions are dashed and faded<br>
+                Selecting a node badges gateways with the % of its broadcast text messages they received ({{ GATEWAY_RELIABILITY_CUTOFF_PERCENT }}% minimum)<br>
                 Clusters group nearby nodes</small>
             </div>
         {% endcall %}
@@ -345,6 +346,7 @@
 }
 
 .node-marker-container {
+    position: relative;
     width: 40px;
     height: 40px;
     border-radius: 50%;
@@ -364,6 +366,25 @@
 
 .node-marker-container:hover {
     transform: scale(1.1);
+}
+
+/* Broadcast text-message reception badge shown on gateway circles while a
+   node is selected; color is set inline from the percentage tier. */
+.node-marker-reliability {
+    position: absolute;
+    top: -10px;
+    right: -18px;
+    min-width: 32px;
+    padding: 1px 4px;
+    border-radius: 9px;
+    font-size: 10px;
+    font-weight: bold;
+    line-height: 1.3;
+    text-align: center;
+    border: 1px solid white;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.4);
+    pointer-events: none;
+    white-space: nowrap;
 }
 
 .node-marker-label {
@@ -451,6 +472,12 @@ let lastLoadedTimeKey = null; // time window the currently loaded data covers
 let locationsInflightRequest = null; // { key, promise } shared single-flight /api/locations request
 let activePresetHours = null; // MaxAge preset driving the window; sends `hours` instead of a per-visit start_time
 let basemapAdded = false; // basemap overlay attach is deferred until the real view is known
+let gatewayReliability = null; // { node_id, total_sent, gateways } payload for the selected node
+let gatewayReliabilityMap = null; // Map<gateway_node_id, gateway entry> built from gatewayReliability
+let reliabilityRequestId = 0; // guards against stale reliability responses
+// Minimum reception rate for the gateway badge; injected by the backend so
+// the sidebar legend and this script can never drift apart.
+const GATEWAY_RELIABILITY_CUTOFF_PERCENT = {{ GATEWAY_RELIABILITY_CUTOFF_PERCENT }};
 const MAP_VIEW_STORAGE_KEY = 'malla_map_view';
 
 // Persist the current view so the next visit starts where the user left off:
@@ -837,10 +864,25 @@ function timeFilterKey(timeParams) {
 // channel, min contacts) are re-applied client-side without a round trip.
 function refreshMapData() {
     if (timeFilterKey(getTimeFilterParams()) !== lastLoadedTimeKey) {
-        loadNodeLocations();
+        reloadMapDataAndReliability();
     } else {
         applyClientSideFilters();
     }
+}
+
+// Reload /api/locations and, while a node is selected, refetch its
+// broadcast text-message reliability so the gateway percentages track the
+// newly selected time window.
+function reloadMapDataAndReliability() {
+    const request = loadNodeLocations();
+    if (selectedNodeId !== null) {
+        request.then(() => {
+            if (selectedNodeId !== null) {
+                loadGatewayReliability(selectedNodeId);
+            }
+        });
+    }
+    return request;
 }
 
 // Build filter parameters from form
@@ -1093,6 +1135,78 @@ function updateMapDisplay() {
         firstDisplay = false;
         ensureBasemapAdded();
     }
+
+    // Keep the hop-limited selection view (including gateway reliability
+    // badges) when fresh data arrives while a node is selected, instead of
+    // silently reverting to the full network.
+    if (selectedNodeId !== null) {
+        drawHopNetwork(true);
+    }
+}
+
+// ==================== Gateway text-message reliability ====================
+
+// Reliability entry for a node when it is a gateway that received
+// broadcasts from the currently selected node; null otherwise.
+function getGatewayReliabilityForNode(nodeId) {
+    if (!gatewayReliability || !gatewayReliabilityMap ||
+        gatewayReliability.node_id !== selectedNodeId) {
+        return null;
+    }
+    return gatewayReliabilityMap.get(nodeId) || null;
+}
+
+// Badge colors by reception tier: green (>= 70%), amber (>= 50%),
+// orange for the rest above the cutoff.
+function reliabilityBadgeColors(percent) {
+    if (percent >= 70) return { bg: '#198754', fg: '#ffffff' };
+    if (percent >= 50) return { bg: '#ffc107', fg: '#212529' };
+    return { bg: '#fd7e14', fg: '#ffffff' };
+}
+
+// Fetch per-gateway broadcast text-message reception percentages for the
+// selected node over the current time window, then re-render the hop
+// network so the badges appear. Stale responses (superseded selection or
+// refetch) are discarded via reliabilityRequestId.
+async function loadGatewayReliability(nodeId) {
+    const requestId = ++reliabilityRequestId;
+    const params = new URLSearchParams();
+    const timeParams = getTimeFilterParams();
+    if (timeParams.hours !== undefined) {
+        params.set('hours', timeParams.hours);
+    }
+    if (timeParams.start_time !== undefined) {
+        params.set('start_time', timeParams.start_time);
+    }
+    if (timeParams.end_time !== undefined) {
+        params.set('end_time', timeParams.end_time);
+    }
+
+    try {
+        const response = await fetch(
+            `/api/node/${encodeURIComponent(String(nodeId))}/text-message-reliability?${params}`
+        );
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const data = await response.json();
+        if (requestId !== reliabilityRequestId || selectedNodeId !== nodeId) {
+            return; // superseded by a newer selection or refetch
+        }
+        if (data.error) throw new Error(data.error);
+
+        gatewayReliability = data;
+        gatewayReliabilityMap = new Map(
+            (data.gateways || []).map(g => [g.gateway_node_id, g])
+        );
+        drawHopNetwork(true);
+    } catch (error) {
+        console.error('Error loading gateway reliability:', error);
+        if (requestId === reliabilityRequestId && selectedNodeId === nodeId) {
+            // Drop any previous payload so stale badges cannot linger
+            gatewayReliability = null;
+            gatewayReliabilityMap = null;
+            drawHopNetwork(true);
+        }
+    }
 }
 
 // Add a marker for a node
@@ -1111,12 +1225,26 @@ function addNodeMarker(node) {
         displayText = displayText.substring(0, 4);
     }
 
+    const container = el('div', {
+        className: 'node-marker-container',
+        style: { backgroundColor: roleColor }
+    }, el('div', { className: 'node-marker-label' }, displayText));
+
+    // Broadcast text-message reception badge for gateways that heard the
+    // selected node (>= cutoff); below the cutoff the badge is hidden.
+    const reliability = getGatewayReliabilityForNode(node.node_id);
+    if (reliability && reliability.percent >= GATEWAY_RELIABILITY_CUTOFF_PERCENT) {
+        const colors = reliabilityBadgeColors(reliability.percent);
+        container.appendChild(el('div', {
+            className: 'node-marker-reliability',
+            style: { backgroundColor: colors.bg, color: colors.fg },
+            title: `Received ${reliability.received} of ${gatewayReliability.total_sent} broadcast messages from the selected node`
+        }, `${reliability.percent}%`));
+    }
+
     const markerIcon = L.divIcon({
         className: 'custom-node-marker',
-        html: el('div', {
-            className: 'node-marker-container',
-            style: { backgroundColor: roleColor }
-        }, el('div', { className: 'node-marker-label' }, displayText)),
+        html: container,
         iconSize: [40, 40],
         iconAnchor: [20, 20]
     });
@@ -1154,6 +1282,14 @@ function createNodePopupContent(node) {
         );
     }
 
+    const reliability = getGatewayReliabilityForNode(node.node_id);
+    const reliabilityNote = (reliability && reliability.percent >= GATEWAY_RELIABILITY_CUTOFF_PERCENT)
+        ? el('div', null,
+            el('strong', null, 'Broadcasts received:'),
+            textNode(` ${reliability.received}/${gatewayReliability.total_sent} (${reliability.percent}%)`)
+        )
+        : null;
+
     return el('div', { className: 'node-marker-info' },
         el('div', { className: 'node-marker-title' }, node.display_name),
         el('div', null, el('strong', null, 'ID:'), textNode(` !${nodeIdHex}`)),
@@ -1165,6 +1301,7 @@ function createNodePopupContent(node) {
         ) : null,
         el('div', null, el('strong', null, 'Location:'), textNode(` ${node.latitude.toFixed(6)}, ${node.longitude.toFixed(6)}`)),
         gpsNote,
+        reliabilityNote,
         node.altitude ? el('div', null, el('strong', null, 'Altitude:'), textNode(` ${node.altitude}m`)) : null,
         node.hw_model ? el('div', null, el('strong', null, 'Hardware:'), textNode(` ${node.hw_model}`)) : null,
         el('div', null,
@@ -1293,6 +1430,10 @@ function selectNode(node) {
     // Apply hop filter & render (skip map fit so we stay centered on the clicked node)
     drawHopNetwork(true);
 
+    // Fetch broadcast text-message reliability for the gateways that
+    // heard this node (badges render once the payload arrives)
+    loadGatewayReliability(node.node_id);
+
     // Show precision circle
     showPrecisionCircle(node);
 }
@@ -1344,6 +1485,11 @@ function showSelectedNodeDetails(node) {
 // Clear node selection
 function clearNodeSelection() {
     selectedNodeId = null;
+
+    // Invalidate any in-flight reliability request and drop its payload
+    reliabilityRequestId += 1;
+    gatewayReliability = null;
+    gatewayReliabilityMap = null;
 
     // Hide hop depth controls
     document.getElementById('hopDepthSection').style.display = 'none';
@@ -1868,7 +2014,7 @@ function viewNodeDetails(nodeId) {
 
 // Refresh map
 function refreshMap() {
-    loadNodeLocations();
+    reloadMapDataAndReliability();
 }
 
 // Loading/error functions
@@ -1927,6 +2073,23 @@ function computeNodesWithinHops(startNodeId, maxHops) {
     return visited;
 }
 
+// Node IDs of gateways that received at least the cutoff share of the
+// selected node's broadcast text messages; they stay visible (with their
+// percentage badge) even without an RF link inside the hop depth.
+function reliableGatewayNodeIds() {
+    const ids = new Set();
+    if (!gatewayReliability || !gatewayReliabilityMap ||
+        gatewayReliability.node_id !== selectedNodeId) {
+        return ids;
+    }
+    gatewayReliabilityMap.forEach((entry, gwNodeId) => {
+        if (entry.percent >= GATEWAY_RELIABILITY_CUTOFF_PERCENT) {
+            ids.add(gwNodeId);
+        }
+    });
+    return ids;
+}
+
 // Draw network limited by hop depth around the selected node
 function drawHopNetwork(skipFit = false) {
     if (selectedNodeId === null) {
@@ -1937,11 +2100,16 @@ function drawHopNetwork(skipFit = false) {
     const visibleNodesSet = (currentHopDepth >= 999) ? new Set(nodeData.map(n => n.node_id)) : computeNodesWithinHops(selectedNodeId, currentHopDepth);
     visibleNodesSet.add(selectedNodeId); // ensure selected node visible
 
+    // Gateways with sufficient broadcast reception join the visible set
+    const reliableGatewayIds = reliableGatewayNodeIds();
+
     // Backup full dataset
     const originalNodeData = [...nodeData];
 
     // Filter nodes for display
-    nodeData = originalNodeData.filter(n => visibleNodesSet.has(n.node_id));
+    nodeData = originalNodeData.filter(n =>
+        visibleNodesSet.has(n.node_id) || reliableGatewayIds.has(n.node_id)
+    );
 
     // Re-render markers and links
     markerClusterGroup.clearLayers();
