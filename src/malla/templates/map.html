@@ -124,6 +124,12 @@
                     <label for="minContacts" class="form-label">Min Contacts</label>
                     <input type="number" class="form-control form-control-sm" id="minContacts" name="minContacts" value="1" min="1">
                 </div>
+                <div class="mb-3">
+                    <label for="minBroadcasts" class="form-label">Min Broadcasts</label>
+                    <input type="number" class="form-control form-control-sm" id="minBroadcasts" name="minBroadcasts" value="0" min="0" title="Minimum broadcast text messages originating from the node in the selected time window">
+                    <div class="form-text">Only nodes originating at least this many broadcast text messages are shown.</div>
+                </div>
+                <div class="form-text mb-3">Related nodes of a selection ignore Node Role, Min Contacts and Min Broadcasts for enabled link types. Time and channel filters still apply.</div>
                 <button type="submit" class="btn btn-primary btn-sm w-100">
                     <i class="bi bi-funnel"></i> Apply Filters
                 </button>
@@ -352,6 +358,34 @@
     transform: scale(1.15);
 }
 
+/* A fixed-size ring stays visible even when the network fit zooms out. */
+.node-marker-container.node-marker-selected {
+    box-shadow: 0 0 0 3px white, 0 0 0 6px #111827, 0 0 0 9px #ffc107;
+}
+
+.selected-node-label {
+    position: absolute;
+    bottom: calc(100% + 16px);
+    left: 50%;
+    transform: translateX(-50%);
+    width: max-content;
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    background: #111827;
+    color: white;
+    border: 2px solid #ffc107;
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1.4;
+    text-shadow: none;
+    pointer-events: none;
+    box-shadow: 0 2px 6px rgba(0,0,0,0.35);
+}
+
 /* Broadcast text-message reception badge shown on gateway circles while a
    node is selected; color is set inline from the percentage tier. */
 .node-marker-reliability {
@@ -441,6 +475,8 @@ let allNodeData = [];
 let allTracerouteLinks = [];
 let allPacketLinks = [];
 let allLinkData = [];
+let nodesPassingBaseFilters = [];
+let linksPassingBaseFilters = [];
 let selectedNodeId = null;
 let showTracerouteLinks = true;
 let showPacketLinks = false;
@@ -449,6 +485,9 @@ let searchResults = [];
 let allNodes = [];
 let linkData = [];
 let firstDisplay = true; // prevent recenter after initial load
+let mapIsZooming = false;
+let pendingMapFit = null; // latest fit request, scoped to its selection
+let mapFitFrame = null;
 let currentHopDepth = 1; // max hop depth to display around selected node
 let currentOverlay = null;
 let locationsAbortController = null; // cancels superseded /api/locations fetches
@@ -792,6 +831,11 @@ function initMap() {
     // Persist the view whenever it settles (pan, zoom, fit). Attached after
     // setView so the initial default view is never saved.
     map.on('moveend', saveMapView);
+    map.on('zoomstart', () => { mapIsZooming = true; });
+    map.on('zoomend', () => {
+        mapIsZooming = false;
+        if (pendingMapFit) scheduleMapFit();
+    });
 
     // Initialize markers layer group (markers overlap instead of clustering)
     markerClusterGroup = L.layerGroup();
@@ -831,9 +875,10 @@ function timeFilterKey(timeParams) {
 }
 
 // Reload from the server whenever the selected time window changed, so link
-// aggregates (observation counts, averages) are recomputed for exactly that
-// window. When the window is unchanged, fast categorical filters (role,
-// channel, min contacts) are re-applied client-side without a round trip.
+// aggregates (observation counts, averages) and per-node broadcast counts
+// are recomputed for exactly that window. When the window is unchanged,
+// fast categorical filters (role, channel, min contacts, min broadcasts)
+// are re-applied client-side without a round trip.
 function refreshMapData() {
     if (timeFilterKey(getTimeFilterParams()) !== lastLoadedTimeKey) {
         reloadMapDataAndReliability();
@@ -846,6 +891,11 @@ function refreshMapData() {
 // broadcast text-message reliability so the gateway percentages track the
 // newly selected time window.
 function reloadMapDataAndReliability() {
+    // Reliability from the previous window must not reveal gateways while
+    // the new window loads, including late responses to an older request.
+    reliabilityRequestId += 1;
+    gatewayReliability = null;
+    gatewayReliabilityMap = null;
     const request = loadNodeLocations();
     if (selectedNodeId !== null) {
         request.then(() => {
@@ -950,30 +1000,16 @@ function applyClientSideFilters() {
     const formData = new FormData(form);
 
     // Get filter values
-    const maxAge = formData.get('maxAge'); // still read to sync UI but no longer used for filtering
     const roleFilter = formData.get('roleFilter');
     const channelFilter = formData.get('channelFilter');
     const startDateTime = formData.get('startDateTime');
     const endDateTime = formData.get('endDateTime');
     const minContacts = formData.get('minContacts');
+    const minBroadcasts = formData.get('minBroadcasts');
 
     // Start with all data
     let filteredNodes = [...allNodeData];
     let filteredLinks = [...allLinkData];
-
-    const currentTime = Date.now() / 1000;
-
-    // Apply role filter
-    if (roleFilter) {
-        if (roleFilter === 'UNKNOWN') {
-            // Filter for nodes with null, undefined, or unknown roles
-            filteredNodes = filteredNodes.filter(node =>
-                !node.role || node.role === 'UNKNOWN' || node.role === 'Unknown'
-            );
-        } else {
-            filteredNodes = filteredNodes.filter(node => node.role === roleFilter);
-        }
-    }
 
     // Apply channel filter
     if (channelFilter) {
@@ -1011,6 +1047,49 @@ function applyClientSideFilters() {
         });
     }
 
+    // Time and channel constrain both the full map and a selection's
+    // neighborhood. Keep this pool before applying the overview filters.
+    nodesPassingBaseFilters = [...filteredNodes];
+
+    const baseNodeIds = new Set(nodesPassingBaseFilters.map(node => node.node_id));
+    filteredLinks = filteredLinks.filter(link =>
+        baseNodeIds.has(link.from_node_id) && baseNodeIds.has(link.to_node_id)
+    );
+
+    // Keep out-of-window links out of both traversal and rendering.
+    if (startTimestamp !== null || endTimestamp !== null) {
+        filteredLinks = filteredLinks.filter(link => {
+            if (!link.last_seen_str) return true;
+            const linkTs = Date.parse(link.last_seen_str) / 1000;
+            if (startTimestamp !== null && linkTs < startTimestamp) return false;
+            if (endTimestamp !== null && linkTs > endTimestamp) return false;
+            return true;
+        });
+    }
+    linksPassingBaseFilters = filteredLinks;
+
+    // Role and broadcast minimum apply to the overview, but never hide a
+    // selected node's related neighborhood.
+    if (roleFilter) {
+        if (roleFilter === 'UNKNOWN') {
+            filteredNodes = filteredNodes.filter(node =>
+                !node.role || node.role === 'UNKNOWN' || node.role === 'Unknown'
+            );
+        } else {
+            filteredNodes = filteredNodes.filter(node => node.role === roleFilter);
+        }
+    }
+
+    // Filter nodes by minimum broadcast text messages originating from the
+    // node in the selected window. Missing counts (older cached payloads)
+    // mean zero. Default 0 shows every node.
+    const minBroadcastsNum = parseInt(minBroadcasts || '0', 10);
+    if (!isNaN(minBroadcastsNum) && minBroadcastsNum > 0) {
+        filteredNodes = filteredNodes.filter(node =>
+            (node.broadcast_text_count ?? 0) >= minBroadcastsNum
+        );
+    }
+
     // Filter links by minimum number of direct contacts (total_hops_seen)
     const minContactsNum = parseInt(minContacts || '1', 10);
     if (!isNaN(minContactsNum) && minContactsNum > 1) {
@@ -1023,22 +1102,12 @@ function applyClientSideFilters() {
         });
     }
 
-    // Filter links to only include those between visible nodes
+    // Overview links must join nodes passing all filters. Selection uses
+    // linksPassingBaseFilters to restore related links below Min Contacts.
     const visibleNodeIds = new Set(filteredNodes.map(node => node.node_id));
     filteredLinks = filteredLinks.filter(link =>
         visibleNodeIds.has(link.from_node_id) && visibleNodeIds.has(link.to_node_id)
     );
-
-    // Apply date filters to links based on last_seen if available
-    if (startTimestamp !== null || endTimestamp !== null) {
-        filteredLinks = filteredLinks.filter(link => {
-            if (!link.last_seen_str) return true;
-            const linkTs = Date.parse(link.last_seen_str) / 1000;
-            if (startTimestamp !== null && linkTs < startTimestamp) return false;
-            if (endTimestamp !== null && linkTs > endTimestamp) return false;
-            return true;
-        });
-    }
 
     // Update global variables
     nodeData = filteredNodes;
@@ -1095,8 +1164,7 @@ function updateMapDisplay() {
             };
             map.once('moveend', attachBasemap);
             fitMapToNodes({ animate: false });
-            // Degenerate bounds (e.g. a single located node) skip fitBounds
-            // entirely, so 'moveend' never fires — fall back to direct attach.
+            // An already-fitted view may not emit 'moveend'.
             if (!attached) setTimeout(attachBasemap, 100);
         }, 500);
         firstDisplay = false;
@@ -1190,6 +1258,7 @@ async function loadGatewayReliability(nodeId, fitMap = false) {
 function addNodeMarker(node) {
     // Create custom marker with role-based styling
     const roleColor = getRoleColor(node.role);
+    const isSelected = node.node_id === selectedNodeId;
 
     // Determine display text for the marker
     let displayText = node.short_name || node.display_name;
@@ -1203,9 +1272,15 @@ function addNodeMarker(node) {
     }
 
     const container = el('div', {
-        className: 'node-marker-container',
+        className: `node-marker-container${isSelected ? ' node-marker-selected' : ''}`,
         style: { backgroundColor: roleColor }
     }, el('div', { className: 'node-marker-label' }, displayText));
+
+    if (isSelected) {
+        container.appendChild(el('div', {
+            className: 'selected-node-label',
+        }, `Selected: ${node.display_name}`));
+    }
 
     // Broadcast text-message reception badge for gateways that heard the
     // selected node (>= cutoff); below the cutoff the badge is hidden.
@@ -1226,7 +1301,11 @@ function addNodeMarker(node) {
         iconAnchor: [14, 14]
     });
 
-    const marker = L.marker([node.latitude, node.longitude], { icon: markerIcon });
+    const marker = L.marker([node.latitude, node.longitude], {
+        icon: markerIcon,
+        zIndexOffset: isSelected ? 10000 : 0,
+        title: isSelected ? `Selected: ${node.display_name}` : node.display_name,
+    });
 
     // Create popup content
     const popupContent = createNodePopupContent(node);
@@ -1238,6 +1317,8 @@ function addNodeMarker(node) {
     });
 
     markerClusterGroup.addLayer(marker);
+    marker.getElement().setAttribute('aria-label', marker.options.title);
+    if (isSelected) marker.getElement().setAttribute('aria-current', 'true');
     nodeMarkers.push(marker);
 }
 
@@ -1635,6 +1716,26 @@ function formatRole(role) {
 
 // Map control functions
 function fitMapToNodes(options = {}) {
+    pendingMapFit = { options, selectedNodeId };
+    scheduleMapFit();
+}
+
+function scheduleMapFit() {
+    if (mapFitFrame === null) {
+        mapFitFrame = requestAnimationFrame(applyPendingMapFit);
+    }
+}
+
+function applyPendingMapFit() {
+    mapFitFrame = null;
+    // Leaflet ignores a second fit during an animated zoom. Keep the latest
+    // request until zoomend, then fit the current markers, including any
+    // reliability gateways that arrived during the first fit.
+    if (mapIsZooming || !pendingMapFit) return;
+    const request = pendingMapFit;
+    pendingMapFit = null;
+    if (request.selectedNodeId !== selectedNodeId) return;
+    const options = request.options;
     if (nodeMarkers.length === 0) {
         return;
     }
@@ -1642,9 +1743,10 @@ function fitMapToNodes(options = {}) {
     // Collect lat/lngs from markers
     const latLngs = nodeMarkers.map(m => m.getLatLng());
 
-    // If we have enough markers, trim extreme outliers (top / bottom 2.5%)
+    // Trim outliers only in the overview. A selection must include every
+    // visible related node, even a distant gateway or the selected node.
     let bounds;
-    if (latLngs.length > 4) {
+    if (selectedNodeId === null && latLngs.length > 4) {
         const lats = latLngs.map(ll => ll.lat).sort((a, b) => a - b);
         const lngs = latLngs.map(ll => ll.lng).sort((a, b) => a - b);
 
@@ -1662,31 +1764,26 @@ function fitMapToNodes(options = {}) {
     }
 
     // Determine extra bottom padding on mobile when the sidebar is expanded
-    let paddingTopLeft = [20, 20];
-    let paddingBottomRight = [20, 20];
+    const paddingTopLeft = selectedNodeId === null ? [20, 20] : [96, 80];
+    const paddingBottomRight = selectedNodeId === null ? [20, 20] : [96, 36];
 
     if (window.innerWidth <= 768) {
         const sidebar = document.getElementById('sidebar');
         if (sidebar) {
             // Collapsed sidebar shows only a ~60px header, otherwise full 60vh
             const sidebarHeight = sidebar.classList.contains('collapsed') ? 60 : sidebar.clientHeight || window.innerHeight * 0.6;
-            paddingBottomRight = [20, 20 + sidebarHeight];
+            paddingBottomRight[1] += sidebarHeight;
         }
     }
 
-    // Single node (or all nodes at identical coordinates): fitBounds would
-    // compute an infinite zoom and can crash ('Invalid LatLng (NaN, NaN)'),
-    // so center on the point instead at street zoom (matches focusOnNode).
-    if (bounds.isValid() && bounds.getNorthEast().equals(bounds.getSouthWest())) {
-        map.setView(bounds.getCenter(), options.zoom ?? 15, {
-            animate: options.animate !== false,
-        });
-        return;
-    }
     if (bounds.isValid()) {
+        // A finite zoom cap also lets a single node use fitBounds padding,
+        // keeping its marker and label above the mobile sidebar.
+        const singlePosition = bounds.getNorthEast().equals(bounds.getSouthWest());
         map.fitBounds(bounds, {
             paddingTopLeft: paddingTopLeft,
             paddingBottomRight: paddingBottomRight,
+            maxZoom: singlePosition ? (options.zoom ?? 15) : map.getMaxZoom(),
             animate: options.animate !== false,
         });
     }
@@ -2060,15 +2157,22 @@ window.addEventListener('resize', function() {
     }
 });
 
-// Compute nodes within given hop depth using allLinkData
+// Compute nodes within given hop depth, traversing only the link types
+// currently enabled via the Link Types toggles. Related-node resolution for
+// a selection must honor those toggles: a disabled type contributes neither
+// neighbors nor visibility.
 function computeNodesWithinHops(startNodeId, maxHops) {
     const visited = new Set([startNodeId]);
     let frontier = [startNodeId];
     let hops = 0;
+    const traversable = linksPassingBaseFilters.filter(link => {
+        if (link.link_type === 'packet') return showPacketLinks;
+        return showTracerouteLinks;
+    });
     while (frontier.length > 0 && hops < maxHops) {
         const nextFrontier = [];
         frontier.forEach(nodeId => {
-            allLinkData.forEach(link => {
+            traversable.forEach(link => {
                 if (link.from_node_id === nodeId && !visited.has(link.to_node_id)) {
                     visited.add(link.to_node_id);
                     nextFrontier.push(link.to_node_id);
@@ -2101,26 +2205,37 @@ function reliableGatewayNodeIds() {
     return ids;
 }
 
-// Draw network limited by hop depth around the selected node
+// Resolve related nodes using only time, channel, hop depth and enabled
+// link types. Role, broadcast and contact minimums apply to the overview.
 function drawHopNetwork(skipFit = false) {
     if (selectedNodeId === null) {
         return;
     }
 
-    // Determine visible nodes
-    const visibleNodesSet = (currentHopDepth >= 999) ? new Set(nodeData.map(n => n.node_id)) : computeNodesWithinHops(selectedNodeId, currentHopDepth);
-    visibleNodesSet.add(selectedNodeId); // ensure selected node visible
-
-    // Gateways with sufficient broadcast reception join the visible set
-    const reliableGatewayIds = reliableGatewayNodeIds();
+    const relatedNodeIds = computeNodesWithinHops(
+        selectedNodeId, currentHopDepth >= 999 ? Infinity : currentHopDepth
+    );
+    reliableGatewayNodeIds().forEach(id => relatedNodeIds.add(id));
+    const visibleNodesSet = new Set(relatedNodeIds);
+    // "All" keeps the overview nodes too, but only related nodes receive
+    // exemptions from role and minimum-count filters.
+    if (currentHopDepth >= 999) {
+        nodeData.forEach(node => visibleNodesSet.add(node.node_id));
+    }
 
     // Backup full dataset
-    const originalNodeData = [...nodeData];
+    const originalNodeData = nodeData;
+    const originalTracerouteLinkData = tracerouteLinkData;
+    const originalPacketLinkData = packetLinkData;
 
-    // Filter nodes for display
-    nodeData = originalNodeData.filter(n =>
-        visibleNodesSet.has(n.node_id) || reliableGatewayIds.has(n.node_id)
+    nodeData = nodesPassingBaseFilters.filter(n => visibleNodesSet.has(n.node_id));
+    const overviewLinks = new Set([...tracerouteLinkData, ...packetLinkData]);
+    const selectedLinks = linksPassingBaseFilters.filter(link =>
+        visibleNodesSet.has(link.from_node_id) && visibleNodesSet.has(link.to_node_id) &&
+        (relatedNodeIds.has(link.from_node_id) || relatedNodeIds.has(link.to_node_id) || overviewLinks.has(link))
     );
+    tracerouteLinkData = selectedLinks.filter(link => link.link_type === 'traceroute');
+    packetLinkData = selectedLinks.filter(link => link.link_type === 'packet');
 
     // Re-render markers and links
     markerClusterGroup.clearLayers();
@@ -2162,6 +2277,8 @@ function drawHopNetwork(skipFit = false) {
 
     // Restore original data for other operations
     nodeData = originalNodeData;
+    tracerouteLinkData = originalTracerouteLinkData;
+    packetLinkData = originalPacketLinkData;
 }
 
 // ==================== Line of Sight Analysis ====================

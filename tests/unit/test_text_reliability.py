@@ -22,7 +22,10 @@ from malla.database.materializations import (
     materialization_tx_scope,
     materialize_packet,
 )
-from malla.database.text_reliability_repository import get_text_message_reliability
+from malla.database.text_reliability_repository import (
+    get_broadcast_text_counts,
+    get_text_message_reliability,
+)
 from malla.services.text_reliability_service import TextReliabilityService
 
 pytestmark = pytest.mark.unit
@@ -352,3 +355,63 @@ class TestTextMessageReliabilityEndpoint:
 
         assert response.status_code == 200
         assert response.get_json() == payload
+
+
+def _broadcast_counts(path, **window):
+    with closing(_connection(path)) as conn:
+        return get_broadcast_text_counts(conn.cursor(), **window)
+
+
+class TestBroadcastTextCounts:
+    """Per-node distinct broadcast text counts for the map filter."""
+
+    def test_counts_distinct_transmissions_per_sender(self, database):
+        with closing(_connection(database)) as conn:
+            for tx in range(3):
+                _insert_packet(conn, mesh_packet_id=1000 + tx, gateway_id=GW_C_HEX)
+                if tx < 2:
+                    _insert_packet(conn, mesh_packet_id=1000 + tx, gateway_id=GW_B_HEX)
+            _insert_packet(
+                conn,
+                mesh_packet_id=2000,
+                gateway_id=GW_B_HEX,
+                from_node_id=OTHER_NODE_ID,
+            )
+
+        counts = _broadcast_counts(database)
+
+        assert counts[TX_NODE_ID] == 3
+        assert counts[OTHER_NODE_ID] == 1
+
+    def test_duplicates_and_non_broadcasts_excluded(self, database):
+        with closing(_connection(database)) as conn:
+            _insert_packet(conn, mesh_packet_id=3000, gateway_id=GW_B_HEX)
+            _insert_packet(conn, mesh_packet_id=3000, gateway_id=GW_B_HEX)
+            _insert_packet(conn, mesh_packet_id=3000, gateway_id=GW_C_HEX)
+            _insert_packet(
+                conn, mesh_packet_id=3001, gateway_id=GW_B_HEX, to_node_id=OTHER_NODE_ID
+            )
+            _insert_packet(conn, mesh_packet_id=3002, gateway_id=GW_B_HEX, portnum=3)
+
+        assert _broadcast_counts(database) == {TX_NODE_ID: 1}
+
+    def test_window_and_gateway_filters(self, database):
+        now = time.time()
+        with closing(_connection(database)) as conn:
+            _insert_packet(
+                conn, mesh_packet_id=4000, gateway_id=GW_B_HEX, timestamp=now - 10 * 3600
+            )
+            _insert_packet(
+                conn, mesh_packet_id=4001, gateway_id=GW_B_HEX, timestamp=now - 3600
+            )
+            _insert_packet(
+                conn, mesh_packet_id=4002, gateway_id=GW_C_HEX, timestamp=now - 3600
+            )
+
+        assert _broadcast_counts(database) == {TX_NODE_ID: 3}
+        recent = _broadcast_counts(
+            database, start_time=now - 2 * 3600, end_time=now
+        )
+        assert recent == {TX_NODE_ID: 2}
+        by_gateway = _broadcast_counts(database, gateway_id=GW_C_HEX)
+        assert by_gateway == {TX_NODE_ID: 1}
