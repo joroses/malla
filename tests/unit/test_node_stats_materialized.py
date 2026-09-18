@@ -21,6 +21,7 @@ from malla.database.materializations import (
     materialize_packet,
 )
 from malla.database.repositories import NodeRepository
+from malla.database.text_reliability_repository import get_text_message_reliability
 
 pytestmark = pytest.mark.unit
 
@@ -205,3 +206,84 @@ class TestGetNodes24hStats:
             )
 
         assert [n["node_id"] for n in result["nodes"]] == [TX_NODE_ID]
+
+
+class TestGetNodesBroadcastCounts:
+    @pytest.fixture
+    def broadcasts(self, database):
+        with closing(_connection(database)) as conn:
+            _seed_nodes(conn)
+            for node_id, count in ((TX_NODE_ID, 2), (GW_NODE_ID, 10)):
+                for tx in range(count):
+                    # Repeated receptions, including a second gateway, count once.
+                    for gateway in ("!33333333", "!33333333", "!44444444"):
+                        _insert_packet(
+                            conn,
+                            from_node_id=node_id,
+                            to_node_id=4294967295,
+                            mesh_packet_id=1000 + tx,
+                            gateway_id=gateway,
+                        )
+            # Non-text, private, old, and self-only messages must not count.
+            for extra in (
+                {"portnum": 3},
+                {"to_node_id": GW_NODE_ID},
+                {"timestamp": time.time() - 90000},
+                {"gateway_id": f"!{TX_NODE_ID:08x}"},
+            ):
+                fields = {"to_node_id": 4294967295, "mesh_packet_id": 2000, **extra}
+                _insert_packet(conn, **fields)
+        return database
+
+    @pytest.mark.parametrize("order_by", ["last_packet_time", "node_id"])
+    def test_counts_match_reliability_for_every_sort_path(self, broadcasts, order_by):
+        with patch(
+            "malla.database.repositories.get_db_connection",
+            side_effect=lambda: _connection(broadcasts),
+        ):
+            result = NodeRepository.get_nodes(
+                order_by=order_by, include_broadcast_counts=True
+            )
+
+        counts = {n["node_id"]: n["broadcast_text_count_24h"] for n in result["nodes"]}
+        assert counts == {TX_NODE_ID: 2, GW_NODE_ID: 10, IDLE_NODE_ID: 0}
+        with closing(_connection(broadcasts)) as conn:
+            for node_id, count in counts.items():
+                reliability = get_text_message_reliability(
+                    conn.cursor(), node_id, start_time=time.time() - 86400
+                )
+                assert count == reliability["total_sent"]
+
+    @pytest.mark.parametrize("order_dir", ["asc", "desc"])
+    def test_numeric_sort_precedes_pagination_and_respects_filters(
+        self, broadcasts, order_dir
+    ):
+        expected = [IDLE_NODE_ID, TX_NODE_ID, GW_NODE_ID]
+        if order_dir == "desc":
+            expected.reverse()
+        with patch(
+            "malla.database.repositories.get_db_connection",
+            side_effect=lambda: _connection(broadcasts),
+        ):
+            pages = [
+                NodeRepository.get_nodes(
+                    order_by="broadcast_text_count_24h",
+                    order_dir=order_dir,
+                    limit=1,
+                    offset=offset,
+                )
+                for offset in range(3)
+            ]
+            assert [page["nodes"][0]["node_id"] for page in pages] == expected
+            assert all(page["total_count"] == 3 for page in pages)
+
+            filtered = NodeRepository.get_nodes(
+                order_by="broadcast_text_count_24h",
+                order_dir=order_dir,
+                filters={"hw_model": "TBEAM", "active_only": True},
+                search="Tx",
+            )
+            assert filtered["total_count"] == 1
+            assert filtered["nodes"][0]["node_id"] == TX_NODE_ID
+            assert filtered["nodes"][0]["broadcast_text_count_24h"] == 2
+            assert filtered["nodes"][0]["packet_count_24h"] > 0
