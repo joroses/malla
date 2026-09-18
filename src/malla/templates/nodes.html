@@ -69,9 +69,15 @@
         {"class": "btn-primary", "id": "applyFilters", "icon": "bi bi-search", "text": "Apply Filters", "type": "button"},
         {"class": "btn-outline-secondary", "id": "clearFilters", "icon": "bi bi-x-circle", "text": "Clear Filters", "type": "button"},
         {"class": "btn-outline-info", "id": "refreshTable", "icon": "bi bi-arrow-clockwise", "text": "Refresh", "type": "button"},
-        {"class": "btn-outline-success", "id": "shareFilters", "icon": "bi bi-share", "text": "Share", "type": "button"}
     ] %}
     {{ table_controls_section(table_controls) }}
+
+    {% set stats_items = [
+        {"label": "Total Nodes", "id": "statsTotal", "default": "0"},
+        {"label": "Filtered", "id": "statsFiltered", "default": "0"},
+        {"label": "Last Update", "id": "statsLastUpdate", "default": "--"}
+    ] %}
+    {{ table_stats_section("tableStats", stats_items) }}
 
     <!-- Legend Section -->
     <div class="sidebar-section">
@@ -208,43 +214,23 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
-    // ------------------------------------------------------------------
-    // Fetch ALL node data once and keep it client-side for filtering
-    // ------------------------------------------------------------------
-    let allNodeData = [];
-
-    async function fetchAllNodes() {
-        try {
-            // Fetch up to 10k nodes in a single request – more than enough for typical deployments
-            const response = await fetch('/api/nodes/data?limit=10000&page=1');
-            const json = await response.json();
-            // The endpoint returns an object with a "data" property
-            allNodeData = json.data || [];
-        } catch (err) {
-            console.error('Error fetching all node data:', err);
-            allNodeData = [];
-        }
-    }
-
     // Initialize page with filters and load data
     async function initializePageWithFilters() {
+        // Small delay to ensure DOM is updated and options are loaded
+        await new Promise(resolve => setTimeout(resolve, 100));
+
         // Apply URL parameters
         const hasParams = await urlManager.applyURLParameters();
 
-        // Initialize the filter controller (after data + UI ready)
+        // Initialize the filter controller
         controller.initialLoad(hasParams);
     }
-
-    // Load supporting data (hardware models, roles) AND all nodes, then start
-    Promise.all([loadHardwareModels(), loadNodeRoles(), loadPrimaryChannels(), fetchAllNodes()]).then(async () => {
-        initializePageWithFilters();
-    });
 
     // Initialize the modern table
     const table = new ModernTable('nodesTable', {
         endpoint: '/api/nodes/data',
         enableSearch: false,
-        enablePagination: false,
+        enablePagination: true,
         pageSize: 100,
         deferInitialLoad: true,
         defaultSort: { column: 'last_packet_str', direction: 'desc' },
@@ -253,6 +239,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 key: 'hex_id',
                 title: 'Node ID',
                 sortable: true,
+                sortKey: 'node_id',
                 render: (value, row) => {
                     return el('a', {
                         href: safePath(`/node/${encodeURIComponent(String(row.node_id))}`),
@@ -265,6 +252,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 key: 'node_name',
                 title: 'Name',
                 sortable: true,
+                sortKey: 'long_name',
                 render: (value, row) => {
                     return el('a', {
                         href: safePath(`/node/${encodeURIComponent(String(row.node_id))}`),
@@ -379,87 +367,19 @@ document.addEventListener('DOMContentLoaded', function() {
         ]
     });
 
-    // We no longer paginate or infinite-scroll; the whole dataset will be rendered at once.
+    // Set default sort
+    table.state.sortBy = 'last_packet_time';
+    table.state.sortOrder = 'desc';
+    table.updateTableHeader();
 
-    // ------------------------------------------------------------------
-    // Override ModernTable logic – perform all processing client-side
-    // ------------------------------------------------------------------
-    table.loadData = async function() {
-        // If dataset not yet available (should not happen after initial Promise), fetch it now
-        if (allNodeData.length === 0) {
-            await fetchAllNodes();
-        }
-
-        this.state.loading = true;
-        // Only show loading spinner when first page loads
-        if (this.state.page === 1) this.showLoading();
-
-        try {
-            // Start with full dataset
-            let filtered = [...allNodeData];
-            const filters = this.state.filters || {};
-
-            // --- Search filter -------------------------------------------------
-            const searchQuery = (filters.search || '').toString().trim().toLowerCase();
-            if (searchQuery) {
-                filtered = filtered.filter((n) => {
-                    const haystack = [
-                        n.node_name,
-                        n.long_name,
-                        n.short_name,
-                        n.hex_id,
-                        n.hw_model,
-                        n.role
-                    ].map(v => (v || '').toString().toLowerCase()).join(' ');
-                    return haystack.includes(searchQuery);
-                });
-            }
-
-            // --- Role filter ---------------------------------------------------
-            if (filters.role) filtered = filtered.filter((n) => n.role === filters.role);
-            // --- Hardware model filter ----------------------------------------
-            if (filters.hw_model) filtered = filtered.filter((n) => n.hw_model === filters.hw_model);
-            // --- Primary channel filter --------------------------------------
-            if (filters.primary_channel) filtered = filtered.filter((n) => n.primary_channel === filters.primary_channel);
-            // --- Active only ---------------------------------------------------
-            if (filters.active_only === true || filters.active_only === '1') {
-                filtered = filtered.filter((n) => (n.packet_count_24h || 0) > 0);
-            }
-            // --- Named only ----------------------------------------------------
-            if (filters.named_only === true || filters.named_only === '1') {
-                filtered = filtered.filter((n) => (n.long_name || n.short_name));
-            }
-
-            // --- Sorting -------------------------------------------------------
-            if (!this.state.sortBy) {
-                this.state.sortBy = 'last_packet_time';
-                this.state.sortOrder = 'desc';
-            }
-            const dir = this.state.sortOrder === 'asc' ? 1 : -1;
-            const key = this.state.sortBy;
-            filtered.sort((a, b) => {
-                const av = a[key] ?? '';
-                const bv = b[key] ?? '';
-                return av < bv ? -1 * dir : (av > bv ? 1 * dir : 0);
-            });
-
-            // --- Render entire dataset (no pagination) -------------------------
-            this.state.totalCount = filtered.length;
-            this.state.data = filtered;
-            this.renderTableBody();
-
-            this.emit('dataLoaded', { data: this.state.data, totalCount: this.state.totalCount });
-        } catch (error) {
-            console.error('Error processing node data locally:', error);
-            this.showError(error.message || 'Failed to process data');
-        } finally {
-            this.state.loading = false;
-        }
-    };
-
-    // Update stats function (removed - stats section was removed from UI)
+    // Update stats function
     function updateStats() {
-        // No-op - stats section removed
+        const statsTotal = document.getElementById('statsTotal');
+        const statsFiltered = document.getElementById('statsFiltered');
+        const statsLastUpdate = document.getElementById('statsLastUpdate');
+        if (statsTotal) statsTotal.textContent = table.state.totalCount || '0';
+        if (statsFiltered) statsFiltered.textContent = table.state.data.length || '0';
+        if (statsLastUpdate) statsLastUpdate.textContent = new Date().toLocaleTimeString();
     }
 
     // Initialize the filter controller
@@ -470,9 +390,11 @@ document.addEventListener('DOMContentLoaded', function() {
         updateStats
     });
 
-    // Expose controller methods to global scope for testing/debugging
+    // Expose controller, table, and urlManager to global scope for testing/debugging
     window.applyCurrentFilters = () => controller.applyCurrentFilters();
     window.controller = controller;
+    window.table = table;
+    window.urlManager = urlManager;
 
     // Button handlers
     const applyFiltersBtn = document.getElementById('applyFilters');
@@ -483,15 +405,22 @@ document.addEventListener('DOMContentLoaded', function() {
     clearFiltersBtn.addEventListener('click', () => controller.clearFilters());
     refreshBtn.addEventListener('click', () => {
         table.refresh();
+        updateStats();
     });
 
-    // Initialize tooltips after table loads
+    // Initialize tooltips and stats after table loads
     table.on('dataLoaded', function() {
+        updateStats();
         // Initialize Bootstrap tooltips
         const tooltipTriggerList = [].slice.call(document.querySelectorAll('[data-bs-toggle="tooltip"]'));
         tooltipTriggerList.map(function (tooltipTriggerEl) {
             return new bootstrap.Tooltip(tooltipTriggerEl);
         });
+    });
+
+    // Load supporting data (hardware models, roles, channels) then initialize table with filters
+    Promise.all([loadHardwareModels(), loadNodeRoles(), loadPrimaryChannels()]).then(async () => {
+        await initializePageWithFilters();
     });
 });
 </script>

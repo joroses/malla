@@ -1498,29 +1498,36 @@ class NodeRepository:
             # Add named_only filter
             if filters.get("named_only"):
                 where_conditions.append(
-                    "ni.long_name IS NOT NULL AND ni.long_name != ''"
+                    "((ni.long_name IS NOT NULL AND ni.long_name != '') OR (ni.short_name IS NOT NULL AND ni.short_name != ''))"
                 )
 
             where_clause = ""
             if where_conditions:
                 where_clause = "WHERE " + " AND ".join(where_conditions)
 
-            # Fast count query using only node_info
-            count_query = f"""
-                SELECT COUNT(*) as total
-                FROM node_info ni
-                {where_clause}
-            """
-            cursor.execute(count_query, params)
-            total_count = cursor.fetchone()["total"]
+            if not filters.get("active_only"):
+                # Fast count query using only node_info
+                count_query = f"""
+                    SELECT COUNT(*) as total
+                    FROM node_info ni
+                    {where_clause}
+                """
+                cursor.execute(count_query, params)
+                total_count = cursor.fetchone()["total"]
 
             # Determine sort column mapping
             valid_order_columns = [
                 "node_id",
+                "hex_id",
                 "long_name",
+                "node_name",
                 "hw_model",
+                "role",
+                "primary_channel",
                 "last_updated",
                 "packet_count_24h",
+                "last_packet_time",
+                "last_packet_str",
             ]
             if order_by not in valid_order_columns:
                 order_by = "last_packet_time"  # Default to last seen time
@@ -1529,34 +1536,11 @@ class NodeRepository:
 
             # Check if we need 24h stats for sorting or filtering
             needs_24h_stats = (
-                order_by == "packet_count_24h"
-                or filters.get("active_only")
-                or order_by == "last_packet_time"
+                order_by in ("packet_count_24h", "last_packet_time", "last_packet_str")
+                or bool(filters.get("active_only"))
             )
 
             if needs_24h_stats:
-                # Use the more complex query with 24h stats
-                order_mappings = {
-                    "node_id": "ni.node_id",
-                    "long_name": "ni.long_name",
-                    "hw_model": "ni.hw_model",
-                    "last_updated": "ni.last_updated",
-                    "packet_count_24h": "stats.packet_count_24h",
-                    "last_packet_time": "COALESCE(stats.last_packet_time, ni.last_updated)",
-                }
-                order_column = order_mappings.get(
-                    order_by, "COALESCE(stats.last_packet_time, ni.last_updated)"
-                )
-
-                # Add active_only filter if needed
-                if filters.get("active_only"):
-                    where_conditions.append("stats.packet_count_24h > 0")
-                    where_clause = (
-                        "WHERE " + " AND ".join(where_conditions)
-                        if where_conditions
-                        else ""
-                    )
-
                 # The 24h aggregates read the lean packet_observations
                 # projection when it is populated (written at capture time
                 # or by the backfill tool) instead of scanning the wide
@@ -1625,6 +1609,40 @@ class NodeRepository:
                         GROUP BY gateway_id
                     """
 
+                order_mappings = {
+                    "node_id": "ni.node_id",
+                    "hex_id": "ni.node_id",
+                    "long_name": "ni.long_name",
+                    "node_name": "COALESCE(ni.long_name, ni.short_name)",
+                    "hw_model": "ni.hw_model",
+                    "role": "ni.role",
+                    "primary_channel": "ni.primary_channel",
+                    "last_updated": "ni.last_updated",
+                    "packet_count_24h": "stats.packet_count_24h",
+                    "last_packet_time": "COALESCE(stats.last_packet_time, ni.last_updated)",
+                    "last_packet_str": "COALESCE(stats.last_packet_time, ni.last_updated)",
+                }
+                order_column = order_mappings.get(
+                    order_by, "COALESCE(stats.last_packet_time, ni.last_updated)"
+                )
+
+                # Add active_only filter if needed
+                if filters.get("active_only"):
+                    where_conditions.append("stats.packet_count_24h > 0")
+                    where_clause = (
+                        "WHERE " + " AND ".join(where_conditions)
+                        if where_conditions
+                        else ""
+                    )
+                    count_query = f"""
+                        SELECT COUNT(*) as total
+                        FROM node_info ni
+                        JOIN ({stats_subquery}) stats ON ni.node_id = stats.node_id
+                        {where_clause}
+                    """
+                    cursor.execute(count_query, params)
+                    total_count = cursor.fetchone()["total"]
+
                 query = f"""
                     SELECT
                         ni.node_id,
@@ -1649,11 +1667,28 @@ class NodeRepository:
                     LIMIT ? OFFSET ?
                 """
             else:
+                where_clause = ""
+                if where_conditions:
+                    where_clause = "WHERE " + " AND ".join(where_conditions)
+
+                # Fast count query using only node_info
+                count_query = f"""
+                    SELECT COUNT(*) as total
+                    FROM node_info ni
+                    {where_clause}
+                """
+                cursor.execute(count_query, params)
+                total_count = cursor.fetchone()["total"]
+
                 # Use fast query with only node_info
                 order_mappings = {
                     "node_id": "ni.node_id",
+                    "hex_id": "ni.node_id",
                     "long_name": "ni.long_name",
+                    "node_name": "COALESCE(ni.long_name, ni.short_name)",
                     "hw_model": "ni.hw_model",
+                    "role": "ni.role",
+                    "primary_channel": "ni.primary_channel",
                     "last_updated": "ni.last_updated",
                 }
                 order_column = order_mappings.get(order_by, "ni.last_updated")

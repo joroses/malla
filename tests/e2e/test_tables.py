@@ -381,6 +381,25 @@ class TestTables:
         rows = page.locator(".modern-table tbody tr")
         expect(rows.first).to_be_visible()
 
+    def test_nodes_pagination(self, page: Page, test_server_url: str):
+        """Test pagination functionality in nodes table."""
+        page.goto(f"{test_server_url}/nodes")
+
+        # Wait for table to load
+        page.wait_for_selector(".modern-table tbody tr", timeout=10000)
+
+        # Check pagination controls exist (they are created by the ModernTable JavaScript)
+        expect(page.locator(".modern-pagination")).to_be_visible()
+
+        # Check that table has data
+        rows = page.locator(".modern-table tbody tr")
+        expect(rows.first).to_be_visible()
+
+        # Check pagination info elements exist
+        expect(page.locator("#nodesTable-start")).to_be_visible()
+        expect(page.locator("#nodesTable-end")).to_be_visible()
+        expect(page.locator("#nodesTable-total")).to_be_visible()
+
     def test_nodes_hardware_filter_complete(self, page: Page, test_server_url: str):
         """Test that all hardware models are available in the dropdown."""
         page.goto(f"{test_server_url}/nodes")

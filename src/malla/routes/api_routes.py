@@ -1811,6 +1811,14 @@ def api_nodes_data():
         if primary_channel:
             filters["primary_channel"] = primary_channel
 
+        active_only = request.args.get("active_only", "").strip().lower()
+        if active_only in ("true", "1", "yes"):
+            filters["active_only"] = True
+
+        named_only = request.args.get("named_only", "").strip().lower()
+        if named_only in ("true", "1", "yes"):
+            filters["named_only"] = True
+
         # Calculate offset
         offset = (page - 1) * limit
 
