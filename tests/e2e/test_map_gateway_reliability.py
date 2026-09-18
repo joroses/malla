@@ -114,6 +114,50 @@ def node_popup_text(page: Page, node_id: int) -> str:
 
 class TestGatewayReliabilityToggle:
     @pytest.mark.e2e
+    def test_nodes_list_reliability_action(self, page: Page, test_server_url):
+        """The nodes action selects its sender and shows gateway reliability."""
+        gateway_reliability_map_page(page, test_server_url)
+        page.route(
+            "**/api/nodes/data*",
+            lambda route: route.fulfill(
+                json={
+                    "data": [
+                        {
+                            "node_id": NODE_ALPHA["node_id"],
+                            "hex_id": "!00000064",
+                            "node_name": "Node Alpha",
+                            "broadcast_text_count_24h": 10,
+                        }
+                    ],
+                    "total_count": 1,
+                    "page": 1,
+                    "limit": 100,
+                    "total_pages": 1,
+                }
+            ),
+        )
+        page.goto(f"{test_server_url}/nodes")
+        expect(
+            page.get_by_title(
+                "Distinct broadcast text messages sent in the last 24 hours", exact=True
+            )
+        ).to_have_text("10")
+        header = page.locator('th[data-sort="broadcast_text_count_24h"]')
+        with page.expect_request(
+            lambda req: "sort_by=broadcast_text_count_24h" in req.url
+        ):
+            header.click()
+
+        page.get_by_title("View broadcast message reliability", exact=True).click()
+        expect(page).to_have_url(
+            f"{test_server_url}/map?highlight={NODE_ALPHA['node_id']}"
+        )
+        expect(page.locator(".node-marker-reliability")).to_have_text(
+            "80%", timeout=DEFAULT_TIMEOUT
+        )
+        assert page.evaluate("selectedNodeId") == NODE_ALPHA["node_id"]
+
+    @pytest.mark.e2e
     def test_reliability_on_by_default(self, page: Page, test_server_url):
         """Checkbox starts checked; selecting a node badges the gateway and
         the popup note shows the reception figures."""

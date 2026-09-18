@@ -178,6 +178,30 @@ def get_broadcast_text_counts(
         TEXT_MESSAGE_APP transmission count (nodes with zero broadcasts
         are absent; callers treat missing as 0).
     """
+    query, params = broadcast_text_counts_query(
+        cursor, start_time, end_time, gateway_id
+    )
+    cursor.execute(query, params)
+
+    counts: dict[int, int] = {}
+    for row in cursor.fetchall():
+        try:
+            sender = int(row["from_node_id"])
+            count = int(row["broadcast_count"] or 0)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            counts[sender] = count
+    return counts
+
+
+def broadcast_text_counts_query(
+    cursor: sqlite3.Cursor,
+    start_time: float | None = None,
+    end_time: float | None = None,
+    gateway_id: str | None = None,
+) -> tuple[str, list[Any]]:
+    """Build the shared count query for map filters and sortable node lists."""
     where_clauses = [
         "from_node_id IS NOT NULL",
         "portnum = ?",
@@ -210,12 +234,6 @@ def get_broadcast_text_counts(
             FROM packet_observations
             WHERE {filter_sql}
         """
-        query = f"""
-            SELECT from_node_id, COUNT(DISTINCT tx_id) AS broadcast_count
-            FROM ({source_sql})
-            GROUP BY from_node_id
-        """
-        cursor.execute(query, params)
     else:
         cursor.execute("PRAGMA table_info(packet_history)")
         ph_columns = {r[1] for r in cursor.fetchall()}
@@ -230,20 +248,9 @@ def get_broadcast_text_counts(
             WHERE gateway_id IS NOT NULL
               AND {filter_sql}
         """
-        query = f"""
-            SELECT from_node_id, COUNT(DISTINCT tx_id) AS broadcast_count
-            FROM ({source_sql})
-            GROUP BY from_node_id
-        """
-        cursor.execute(query, params)
-
-    counts: dict[int, int] = {}
-    for row in cursor.fetchall():
-        try:
-            sender = int(row["from_node_id"])
-            count = int(row["broadcast_count"] or 0)
-        except (TypeError, ValueError):
-            continue
-        if count > 0:
-            counts[sender] = count
-    return counts
+    query = f"""
+        SELECT from_node_id, COUNT(DISTINCT tx_id) AS broadcast_count
+        FROM ({source_sql})
+        GROUP BY from_node_id
+    """
+    return query, params

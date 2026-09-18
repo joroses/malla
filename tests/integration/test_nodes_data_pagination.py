@@ -43,6 +43,7 @@ class TestNodesDataPagination:
                 "last_packet_str",
                 "last_packet_time",
                 "packet_count_24h",
+                "broadcast_text_count_24h",
                 "status",
             ):
                 assert key in node
@@ -112,6 +113,23 @@ class TestNodesDataPagination:
         assert resp_desc.status_code == 200
         desc_ids = [n["node_id"] for n in resp_desc.get_json()["data"]]
         assert desc_ids == sorted(desc_ids, reverse=True)
+
+    @pytest.mark.parametrize("direction", ["asc", "desc"])
+    def test_nodes_data_broadcast_sorting(self, client, direction):
+        response = client.get(
+            "/api/nodes/data",
+            query_string={
+                "sort_by": "broadcast_text_count_24h",
+                "sort_order": direction,
+            },
+        )
+        assert response.status_code == 200
+        counts = [
+            node["broadcast_text_count_24h"] for node in response.get_json()["data"]
+        ]
+        assert counts
+        assert all(isinstance(count, int) and count >= 0 for count in counts)
+        assert counts == sorted(counts, reverse=direction == "desc")
 
     def test_nodes_data_search_filter(self, client):
         """Test searching nodes."""

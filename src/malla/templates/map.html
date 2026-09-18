@@ -842,7 +842,13 @@ function initMap() {
     map.addLayer(markerClusterGroup);
 
     // Load node data
-    loadNodeLocations();
+    loadNodeLocations().then(() => {
+        const highlightedNodeId = new URLSearchParams(window.location.search).get('highlight');
+        const node = allNodeData.find(n => String(n.node_id) === highlightedNodeId);
+        if (node) {
+            selectNode(node);
+        }
+    });
 }
 
 // Extract the selected time window from the form. While a MaxAge preset is

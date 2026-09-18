@@ -323,6 +323,14 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
             },
             {
+                key: 'broadcast_text_count_24h',
+                title: 'Broadcasts (24h)',
+                sortable: true,
+                render: (value) => el('span', {
+                    title: 'Distinct broadcast text messages sent in the last 24 hours'
+                }, String(value ?? 0))
+            },
+            {
                 key: 'primary_channel',
                 title: 'Channel',
                 sortable: true,
@@ -340,6 +348,9 @@ document.addEventListener('DOMContentLoaded', function() {
                     });
                     const tracerouteUrl = urlManager.createFilteredURL('/traceroute', {
                         from_node: value
+                    });
+                    const reliabilityUrl = urlManager.createFilteredURL('/map', {
+                        highlight: value
                     });
 
                     return el('div', { className: 'btn-group', role: 'group' },
@@ -360,6 +371,12 @@ document.addEventListener('DOMContentLoaded', function() {
                             className: 'btn btn-sm btn-outline-info',
                             title: 'View traceroutes from this node',
                             iconClass: 'bi bi-diagram-3'
+                        }),
+                        buttonLink({
+                            href: reliabilityUrl,
+                            className: 'btn btn-sm btn-outline-success',
+                            title: 'View broadcast message reliability',
+                            iconClass: 'bi bi-broadcast'
                         })
                     );
                 }

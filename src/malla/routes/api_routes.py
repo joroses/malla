@@ -1872,6 +1872,7 @@ def api_nodes_data():
             order_by=sort_by,
             order_dir=sort_order,
             filters=filters,
+            include_broadcast_counts=True,
         )
 
         # Format data for modern table
@@ -1902,6 +1903,7 @@ def api_nodes_data():
                     "last_packet_str": node.get("last_packet_str", "Never"),
                     "last_packet_time": node.get("last_packet_time"),
                     "packet_count_24h": node.get("packet_count_24h", 0),
+                    "broadcast_text_count_24h": node.get("broadcast_text_count_24h", 0),
                     "status": status,
                 }
             )

@@ -1457,8 +1457,9 @@ class NodeRepository:
         order_dir: str = "desc",
         search: str | None = None,
         filters: dict | None = None,
+        include_broadcast_counts: bool = False,
     ) -> dict[str, Any]:
-        """Get node information with activity statistics (optimized version)."""
+        """Get nodes with activity stats and optional distinct 24h text broadcasts."""
         if filters is None:
             filters = {}
 
@@ -1526,6 +1527,7 @@ class NodeRepository:
                 "primary_channel",
                 "last_updated",
                 "packet_count_24h",
+                "broadcast_text_count_24h",
                 "last_packet_time",
                 "last_packet_str",
             ]
@@ -1534,11 +1536,28 @@ class NodeRepository:
 
             order_dir = "DESC" if order_dir.lower() == "desc" else "ASC"
 
+            broadcast_select = ""
+            broadcast_join = ""
+            broadcast_params = []
+            if include_broadcast_counts or order_by == "broadcast_text_count_24h":
+                from .text_reliability_repository import broadcast_text_counts_query
+
+                broadcast_query, broadcast_params = broadcast_text_counts_query(
+                    cursor, start_time=time.time() - 86400
+                )
+                broadcast_select = "COALESCE(broadcasts.broadcast_count, 0) AS broadcast_text_count_24h,"
+                broadcast_join = (
+                    f"LEFT JOIN ({broadcast_query}) broadcasts "
+                    "ON broadcasts.from_node_id = ni.node_id"
+                )
+
             # Check if we need 24h stats for sorting or filtering
-            needs_24h_stats = (
-                order_by in ("packet_count_24h", "last_packet_time", "last_packet_str")
-                or bool(filters.get("active_only"))
-            )
+            needs_24h_stats = order_by in (
+                "packet_count_24h",
+                "last_packet_time",
+                "last_packet_str",
+                "broadcast_text_count_24h",
+            ) or bool(filters.get("active_only"))
 
             if needs_24h_stats:
                 # The 24h aggregates read the lean packet_observations
@@ -1619,6 +1638,7 @@ class NodeRepository:
                     "primary_channel": "ni.primary_channel",
                     "last_updated": "ni.last_updated",
                     "packet_count_24h": "stats.packet_count_24h",
+                    "broadcast_text_count_24h": "COALESCE(broadcasts.broadcast_count, 0)",
                     "last_packet_time": "COALESCE(stats.last_packet_time, ni.last_updated)",
                     "last_packet_str": "COALESCE(stats.last_packet_time, ni.last_updated)",
                 }
@@ -1653,6 +1673,7 @@ class NodeRepository:
                         ni.primary_channel,
                         ni.last_updated,
                         printf('!%08x', ni.node_id) as hex_id,
+                        {broadcast_select}
                         COALESCE(stats.packet_count_24h, 0) as packet_count_24h,
                         COALESCE(gstats.gateway_packet_count_24h, 0) as gateway_packet_count_24h,
                         COALESCE(stats.last_packet_time, ni.last_updated) as last_packet_time,
@@ -1662,8 +1683,9 @@ class NodeRepository:
                     FROM node_info ni
                     LEFT JOIN ({stats_subquery}) stats ON ni.node_id = stats.node_id
                     LEFT JOIN ({gstats_subquery}) gstats ON gstats.gateway_id = printf('!%08x', ni.node_id)
+                    {broadcast_join}
                     {where_clause}
-                    ORDER BY {order_column} {order_dir}
+                    ORDER BY {order_column} {order_dir}, ni.node_id ASC
                     LIMIT ? OFFSET ?
                 """
             else:
@@ -1703,6 +1725,7 @@ class NodeRepository:
                         ni.primary_channel,
                         ni.last_updated,
                         printf('!%08x', ni.node_id) as hex_id,
+                        {broadcast_select}
                         0 as packet_count_24h,
                         0 as gateway_packet_count_24h,
                         ni.last_updated as last_packet_time,
@@ -1710,13 +1733,14 @@ class NodeRepository:
                         NULL as avg_rssi,
                         NULL as avg_snr
                     FROM node_info ni
+                    {broadcast_join}
                     {where_clause}
-                    ORDER BY {order_column} {order_dir}
+                    ORDER BY {order_column} {order_dir}, ni.node_id ASC
                     LIMIT ? OFFSET ?
                 """
 
             # Execute query with parameters
-            query_params = params + [limit, offset]
+            query_params = broadcast_params + params + [limit, offset]
             cursor.execute(query, query_params)
             nodes = [dict(row) for row in cursor.fetchall()]
 
