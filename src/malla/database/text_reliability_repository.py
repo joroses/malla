@@ -150,3 +150,100 @@ def get_text_message_reliability(
         "total_sent": total_sent,
         "gateways": gateways,
     }
+
+
+def get_broadcast_text_counts(
+    cursor: sqlite3.Cursor,
+    start_time: float | None = None,
+    end_time: float | None = None,
+    gateway_id: str | None = None,
+) -> dict[int, int]:
+    """Distinct broadcast text transmissions originated per node in a window.
+
+    Counts one transmission (resolved ``tx_id``) once no matter how many
+    gateways heard it or how many duplicate receptions exist — the same
+    definition as ``total_sent`` in :func:`get_text_message_reliability`,
+    but aggregated for every sender at once so the map can filter nodes
+    by "minimum broadcast text messages originating from the node".
+
+    Args:
+        cursor: Database cursor on a connection with Row factory.
+        start_time: Optional window lower bound (epoch seconds, inclusive).
+        end_time: Optional window upper bound (epoch seconds, inclusive).
+        gateway_id: Optional ``!<8-hex>`` gateway filter; when given only
+            receptions heard by that gateway contribute to the counts.
+
+    Returns:
+        Mapping of numeric sender node id to distinct broadcast
+        TEXT_MESSAGE_APP transmission count (nodes with zero broadcasts
+        are absent; callers treat missing as 0).
+    """
+    where_clauses = [
+        "from_node_id IS NOT NULL",
+        "portnum = ?",
+        "to_node_id = ?",
+        "gateway_id != ''",
+        # Same self-loopback exclusion as the reliability reader: a
+        # gateway hearing its own transmission is not an independent
+        # reception.
+        "lower(gateway_id) != printf('!%08x', from_node_id)",
+    ]
+    params: list[Any] = [TEXT_MESSAGE_PORTNUM, BROADCAST_NODE_ID]
+
+    if start_time is not None:
+        where_clauses.append("timestamp >= ?")
+        params.append(start_time)
+    if end_time is not None:
+        where_clauses.append("timestamp <= ?")
+        params.append(end_time)
+    if gateway_id is not None:
+        where_clauses.append("gateway_id = ?")
+        params.append(gateway_id)
+    filter_sql = " AND ".join(where_clauses)
+
+    if derived_table_populated(cursor, "packet_observations"):
+        logger.debug(
+            "broadcast text counts: reading materialized packet_observations"
+        )
+        source_sql = f"""
+            SELECT from_node_id, tx_id
+            FROM packet_observations
+            WHERE {filter_sql}
+        """
+        query = f"""
+            SELECT from_node_id, COUNT(DISTINCT tx_id) AS broadcast_count
+            FROM ({source_sql})
+            GROUP BY from_node_id
+        """
+        cursor.execute(query, params)
+    else:
+        cursor.execute("PRAGMA table_info(packet_history)")
+        ph_columns = {r[1] for r in cursor.fetchall()}
+        tx_id_expr = (
+            "COALESCE(NULLIF(mesh_packet_id, 0), -id)"
+            if "mesh_packet_id" in ph_columns
+            else "-id"
+        )
+        source_sql = f"""
+            SELECT from_node_id, {tx_id_expr} AS tx_id
+            FROM packet_history
+            WHERE gateway_id IS NOT NULL
+              AND {filter_sql}
+        """
+        query = f"""
+            SELECT from_node_id, COUNT(DISTINCT tx_id) AS broadcast_count
+            FROM ({source_sql})
+            GROUP BY from_node_id
+        """
+        cursor.execute(query, params)
+
+    counts: dict[int, int] = {}
+    for row in cursor.fetchall():
+        try:
+            sender = int(row["from_node_id"])
+            count = int(row["broadcast_count"] or 0)
+        except (TypeError, ValueError):
+            continue
+        if count > 0:
+            counts[sender] = count
+    return counts

@@ -260,6 +260,51 @@ def compute_locations_payload(
         position_filters, network_data=network_data, packet_links=packet_links
     )
 
+    # 3b. Distinct broadcast TEXT_MESSAGE_APP transmissions originated per
+    #    node over the exact link window. The map's "Min Broadcasts" filter
+    #    applies this client-side, so every location carries its count
+    #    (missing means zero) and no extra request is needed when the
+    #    threshold changes.
+    try:
+        from ..database.connection import get_db_connection
+        from ..database.text_reliability_repository import (
+            get_broadcast_text_counts,
+        )
+
+        gateway_hex: str | None = None
+        gateway_filter = link_filters.get("gateway_id")
+        if gateway_filter is not None:
+            try:
+                gateway_hex = f"!{int(gateway_filter):08x}"
+            except (TypeError, ValueError):
+                gateway_hex = str(gateway_filter)
+
+        _broadcast_conn = get_db_connection()
+        try:
+            broadcast_counts = get_broadcast_text_counts(
+                _broadcast_conn.cursor(),
+                link_filters.get("start_time"),
+                link_filters.get("end_time"),
+                gateway_hex,
+            )
+        finally:
+            _broadcast_conn.close()
+    except Exception:
+        logger.warning(
+            "Broadcast text counts unavailable; defaulting to zero",
+            exc_info=True,
+        )
+        broadcast_counts = {}
+
+    if isinstance(locations, list):
+        for location in locations:
+            try:
+                location["broadcast_text_count"] = broadcast_counts.get(
+                    int(location.get("node_id", -1)), 0
+                )
+            except (TypeError, ValueError):
+                location["broadcast_text_count"] = 0
+
     # 4. Traceroute links, passing pre-computed network data
     traceroute_links = LocationService.get_traceroute_links(
         link_filters, network_data=network_data

@@ -124,6 +124,11 @@
                     <label for="minContacts" class="form-label">Min Contacts</label>
                     <input type="number" class="form-control form-control-sm" id="minContacts" name="minContacts" value="1" min="1">
                 </div>
+                <div class="mb-3">
+                    <label for="minBroadcasts" class="form-label">Min Broadcasts</label>
+                    <input type="number" class="form-control form-control-sm" id="minBroadcasts" name="minBroadcasts" value="0" min="0" title="Minimum broadcast text messages originating from the node in the selected time window">
+                    <div class="form-text">Only nodes originating at least this many broadcast text messages are shown. Related nodes of a selection always stay visible.</div>
+                </div>
                 <button type="submit" class="btn btn-primary btn-sm w-100">
                     <i class="bi bi-funnel"></i> Apply Filters
                 </button>
@@ -441,6 +446,7 @@ let allNodeData = [];
 let allTracerouteLinks = [];
 let allPacketLinks = [];
 let allLinkData = [];
+let nodesPassingBaseFilters = [];
 let selectedNodeId = null;
 let showTracerouteLinks = true;
 let showPacketLinks = false;
@@ -831,9 +837,10 @@ function timeFilterKey(timeParams) {
 }
 
 // Reload from the server whenever the selected time window changed, so link
-// aggregates (observation counts, averages) are recomputed for exactly that
-// window. When the window is unchanged, fast categorical filters (role,
-// channel, min contacts) are re-applied client-side without a round trip.
+// aggregates (observation counts, averages) and per-node broadcast counts
+// are recomputed for exactly that window. When the window is unchanged,
+// fast categorical filters (role, channel, min contacts, min broadcasts)
+// are re-applied client-side without a round trip.
 function refreshMapData() {
     if (timeFilterKey(getTimeFilterParams()) !== lastLoadedTimeKey) {
         reloadMapDataAndReliability();
@@ -956,6 +963,7 @@ function applyClientSideFilters() {
     const startDateTime = formData.get('startDateTime');
     const endDateTime = formData.get('endDateTime');
     const minContacts = formData.get('minContacts');
+    const minBroadcasts = formData.get('minBroadcasts');
 
     // Start with all data
     let filteredNodes = [...allNodeData];
@@ -1011,6 +1019,21 @@ function applyClientSideFilters() {
         });
     }
 
+    // Nodes passing every filter except the broadcast minimum. When a node
+    // is selected its related neighborhood is resolved from this set so the
+    // broadcast threshold never hides related nodes.
+    nodesPassingBaseFilters = [...filteredNodes];
+
+    // Filter nodes by minimum broadcast text messages originating from the
+    // node in the selected window. Missing counts (older cached payloads)
+    // mean zero. Default 0 shows every node.
+    const minBroadcastsNum = parseInt(minBroadcasts || '0', 10);
+    if (!isNaN(minBroadcastsNum) && minBroadcastsNum > 0) {
+        filteredNodes = filteredNodes.filter(node =>
+            (node.broadcast_text_count ?? 0) >= minBroadcastsNum
+        );
+    }
+
     // Filter links by minimum number of direct contacts (total_hops_seen)
     const minContactsNum = parseInt(minContacts || '1', 10);
     if (!isNaN(minContactsNum) && minContactsNum > 1) {
@@ -1023,8 +1046,12 @@ function applyClientSideFilters() {
         });
     }
 
-    // Filter links to only include those between visible nodes
-    const visibleNodeIds = new Set(filteredNodes.map(node => node.node_id));
+    // Filter links to only include those between nodes passing the base
+    // filters (role/channel/date). The broadcast minimum hides nodes, not
+    // links: keeping links to broadcast-excluded nodes lets a later
+    // selection reveal its related neighborhood with links intact (links
+    // whose endpoint is still hidden simply don't draw).
+    const visibleNodeIds = new Set(nodesPassingBaseFilters.map(node => node.node_id));
     filteredLinks = filteredLinks.filter(link =>
         visibleNodeIds.has(link.from_node_id) && visibleNodeIds.has(link.to_node_id)
     );
@@ -2060,15 +2087,22 @@ window.addEventListener('resize', function() {
     }
 });
 
-// Compute nodes within given hop depth using allLinkData
+// Compute nodes within given hop depth, traversing only the link types
+// currently enabled via the Link Types toggles. Related-node resolution for
+// a selection must honor those toggles: a disabled type contributes neither
+// neighbors nor visibility.
 function computeNodesWithinHops(startNodeId, maxHops) {
     const visited = new Set([startNodeId]);
     let frontier = [startNodeId];
     let hops = 0;
+    const traversable = allLinkData.filter(link => {
+        if (link.link_type === 'packet') return showPacketLinks;
+        return showTracerouteLinks;
+    });
     while (frontier.length > 0 && hops < maxHops) {
         const nextFrontier = [];
         frontier.forEach(nodeId => {
-            allLinkData.forEach(link => {
+            traversable.forEach(link => {
                 if (link.from_node_id === nodeId && !visited.has(link.to_node_id)) {
                     visited.add(link.to_node_id);
                     nextFrontier.push(link.to_node_id);
@@ -2101,14 +2135,28 @@ function reliableGatewayNodeIds() {
     return ids;
 }
 
-// Draw network limited by hop depth around the selected node
+// Draw network limited by hop depth around the selected node. The Min
+// Broadcasts threshold never hides related nodes: the neighborhood is
+// resolved from the base-filtered set (role/channel/date only), so nodes
+// failing only the broadcast minimum still appear when they are within hop
+// depth via an enabled link type or carry reliability data with its toggle
+// on. The "All" depth likewise uses the base set.
 function drawHopNetwork(skipFit = false) {
     if (selectedNodeId === null) {
         return;
     }
 
+    const basePool = (nodesPassingBaseFilters && nodesPassingBaseFilters.length > 0)
+        ? nodesPassingBaseFilters
+        : [...nodeData];
+    // The selected node itself always stays visible even if a base filter
+    // (e.g. role) currently excludes it: fall back to the raw payload.
+    const selectedFromRaw = basePool.some(n => n.node_id === selectedNodeId)
+        ? null
+        : allNodeData.find(n => n.node_id === selectedNodeId) || null;
+
     // Determine visible nodes
-    const visibleNodesSet = (currentHopDepth >= 999) ? new Set(nodeData.map(n => n.node_id)) : computeNodesWithinHops(selectedNodeId, currentHopDepth);
+    const visibleNodesSet = (currentHopDepth >= 999) ? new Set(basePool.map(n => n.node_id)) : computeNodesWithinHops(selectedNodeId, currentHopDepth);
     visibleNodesSet.add(selectedNodeId); // ensure selected node visible
 
     // Gateways with sufficient broadcast reception join the visible set
@@ -2117,8 +2165,10 @@ function drawHopNetwork(skipFit = false) {
     // Backup full dataset
     const originalNodeData = [...nodeData];
 
-    // Filter nodes for display
-    nodeData = originalNodeData.filter(n =>
+    // Filter nodes for display from the base pool (broadcast minimum
+    // bypassed) plus the selected node fallback.
+    const poolWithSelected = selectedFromRaw ? [...basePool, selectedFromRaw] : basePool;
+    nodeData = poolWithSelected.filter(n =>
         visibleNodesSet.has(n.node_id) || reliableGatewayIds.has(n.node_id)
     );
 
