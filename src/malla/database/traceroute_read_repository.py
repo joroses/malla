@@ -257,6 +257,29 @@ def get_traceroute_packets(
         conn.close()
 
 
+def _traceroute_group_key_sql(
+    hop_alias: str = "h", route_alias: str = "r"
+) -> str:
+    """SQL expression identifying one logical traceroute attempt.
+
+    A mesh flood keeps its ``mesh_packet_id`` while every gateway that hears
+    any rebroadcast stores its own reception row (``packet_history.id``), each
+    with a different partial route. Counting hop rows therefore counts one
+    flood many times. The group key collapses those receptions back to a
+    single logical attempt: ``(mesh_packet_id, from, to)`` when a mesh id is
+    present (endpoints included so an id collision never merges distinct
+    traceroutes), otherwise the lone reception's own packet id.
+    """
+    return (
+        f"CASE WHEN {route_alias}.mesh_packet_id IS NOT NULL "
+        f"AND {route_alias}.mesh_packet_id != 0 "
+        f"THEN 'm:' || {route_alias}.mesh_packet_id || ':' "
+        f"|| COALESCE({route_alias}.from_node_id, -1) || ':' "
+        f"|| COALESCE({route_alias}.to_node_id, -1) "
+        f"ELSE 'p:' || {hop_alias}.packet_id END"
+    )
+
+
 def get_traceroute_link(
     node1_id: int,
     node2_id: int,
@@ -271,6 +294,11 @@ def get_traceroute_link(
     The hop table identifies matches without decoding or scanning traceroute
     payloads. Statistics cover every matching hop in the requested window, while
     the detail query returns each matching packet once.
+
+    Receptions sharing one ``mesh_packet_id`` are one logical flood heard by
+    many gateways: each directed hop counts once per flood (representative
+    reception: longest payload, then most recent), and the detail query
+    returns one representative reception per flood.
     """
     conn = get_db_connection()
     try:
@@ -288,43 +316,70 @@ def get_traceroute_link(
             node2_id,
             node1_id,
         ]
+        group_key = _traceroute_group_key_sql("h", "r")
+        orientation_sql = (
+            f"CASE WHEN m.from_node_id = {node1_id} "
+            f"AND m.to_node_id = {node2_id} THEN 0 ELSE 1 END"
+        )
         # Directional averages and quality aggregates follow graph eligibility:
         # zero-SNR hops and implausible SNR contribute no SNR and do not count
         # as evidenced topology observations. The -32.0 "unknown SNR" sentinel
         # counts as an observation (volume) but contributes no numeric SNR.
         # Raw observation counts and the combined average keep their historical
-        # definitions. The recency rank picks the most recent channel from
-        # eligible hops deterministically (timestamp, then packet id).
+        # definitions. Deduplication collapses repeat receptions of one flood
+        # (same mesh_packet_id): the representative reception is the longest
+        # payload, then the most recent, mirroring the grouped packet view.
+        # The recency rank picks the most recent channel from eligible
+        # representatives deterministically (timestamp, then packet id).
         stats = cursor.execute(
             f"""
             WITH matching AS (
                 SELECT
                     h.packet_id,
+                    h.direction,
                     h.from_node_id,
                     h.to_node_id,
                     h.snr,
                     p.channel_id,
+                    p.payload_length,
                     r.timestamp AS route_timestamp,
                     p.id AS packet_row_id,
+                    {group_key} AS grp,
                     CASE WHEN (h.snr = {TRACEROUTE_UNKNOWN_SNR}
                                OR (h.snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX} AND h.snr != 0))
                               AND h.from_node_id != 4294967295 AND h.to_node_id != 4294967295
-                         THEN 1 ELSE 0 END AS is_eligible,
-                    ROW_NUMBER() OVER (
-                        PARTITION BY CASE WHEN (h.snr = {TRACEROUTE_UNKNOWN_SNR}
-                                               OR (h.snr BETWEEN {SNR_PLAUSIBLE_MIN} AND {SNR_PLAUSIBLE_MAX} AND h.snr != 0))
-                                              AND h.from_node_id != 4294967295 AND h.to_node_id != 4294967295
-                                         THEN 1 ELSE 0 END
-                        ORDER BY r.timestamp DESC, p.id DESC
-                    ) AS eligible_recency_rank
+                         THEN 1 ELSE 0 END AS is_eligible
                 FROM traceroute_hops h
                 JOIN traceroute_routes r ON r.packet_id = h.packet_id
                 JOIN packet_history p ON p.id = h.packet_id
                 WHERE r.parser_version = ? AND r.parse_status = 'parsed'
                   AND {match_sql}
+            ),
+            ranked AS (
+                SELECT
+                    m.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY m.grp, {orientation_sql}, m.direction
+                        ORDER BY m.payload_length DESC,
+                                 m.route_timestamp DESC,
+                                 m.packet_row_id DESC
+                    ) AS grp_rank
+                FROM matching m
+            ),
+            deduped AS (
+                SELECT * FROM ranked WHERE grp_rank = 1
+            ),
+            with_recency AS (
+                SELECT
+                    d.*,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY d.is_eligible
+                        ORDER BY d.route_timestamp DESC, d.packet_row_id DESC
+                    ) AS eligible_recency_rank
+                FROM deduped d
             )
             SELECT
-                COUNT(DISTINCT packet_id) AS total_attempts,
+                COUNT(DISTINCT grp) AS total_attempts,
                 SUM(CASE WHEN from_node_id = ? AND to_node_id = ?
                          THEN 1 ELSE 0 END) AS forward_count,
                 SUM(CASE WHEN from_node_id = ? AND to_node_id = ?
@@ -345,7 +400,7 @@ def get_traceroute_link(
                          AND snr != 0
                          THEN snr END) AS reverse_avg_snr,
                 MAX(CASE WHEN is_eligible = 1 AND eligible_recency_rank = 1 THEN channel_id END) AS channel_id
-            FROM matching
+            FROM with_recency
             """,
             [
                 PARSER_VERSION,
@@ -374,13 +429,22 @@ def get_traceroute_link(
                     h.from_node_id AS target_from_node_id,
                     h.to_node_id AS target_to_node_id,
                     h.snr AS target_hop_snr,
+                    h.direction,
+                    h.hop_index,
+                    p.payload_length,
+                    r.timestamp AS route_timestamp,
+                    {group_key} AS grp,
                     ROW_NUMBER() OVER (
-                        PARTITION BY h.packet_id
-                        ORDER BY CASE h.direction WHEN 'forward' THEN 0 ELSE 1 END,
-                                  h.hop_index
-                    ) AS target_rank
+                        PARTITION BY {group_key}
+                        ORDER BY p.payload_length DESC,
+                                 r.timestamp DESC,
+                                 h.packet_id DESC,
+                                 CASE h.direction WHEN 'forward' THEN 0 ELSE 1 END,
+                                 h.hop_index
+                    ) AS grp_rank
                 FROM traceroute_hops h
                 JOIN traceroute_routes r ON r.packet_id = h.packet_id
+                JOIN packet_history p ON p.id = h.packet_id
                 WHERE r.parser_version = ? AND r.parse_status = 'parsed'
                   AND {match_sql}
             )
@@ -395,7 +459,7 @@ def get_traceroute_link(
             FROM matching m
             JOIN traceroute_routes r ON r.packet_id = m.packet_id
             JOIN packet_history p ON p.id = m.packet_id
-            WHERE m.target_rank = 1
+            WHERE m.grp_rank = 1
             ORDER BY r.timestamp DESC, p.id DESC
             LIMIT ? OFFSET ?
             """,
@@ -503,8 +567,14 @@ def get_traceroute_hops_for_graph(
     the route's denormalized copy; consumers resolve the modem preset
     (spreading factor) from that channel hint, falling back to the configured
     preset.
+
+    Each hop also carries its logical-flood group key (``mesh_packet_id`` plus
+    route endpoints, falling back to the reception's packet id): receptions
+    sharing one mesh id are one flood heard many times, and callers must
+    deduplicate on that key before counting observations.
     """
     where_clause, params, from_clause = _graph_hop_window(filters)
+    group_key_sql = _traceroute_group_key_sql("h", "r")
     conn = get_db_connection()
     try:
         cursor = conn.cursor()
@@ -518,7 +588,11 @@ def get_traceroute_hops_for_graph(
                 h.from_node_id,
                 h.to_node_id,
                 h.snr,
-                r.channel_id
+                r.channel_id,
+                r.mesh_packet_id,
+                r.from_node_id AS route_from_node_id,
+                r.to_node_id AS route_to_node_id,
+                {group_key_sql} AS grp
             FROM {from_clause}
             WHERE {where_clause}
             ORDER BY h.timestamp DESC, h.packet_id, h.direction, h.hop_index
@@ -558,8 +632,13 @@ def get_traceroute_graph_aggregates(
     pair and its SNR belongs to the transmitting (``from``) node, so pair
     sums fully determine per-node counts, averages, and recency.
 
-    Stats counters cover every hop in the window (eligible or not),
-    matching the previous whole-window Python statistics.
+    Receptions sharing one ``mesh_packet_id`` are one logical flood heard by
+    many gateways: each directed hop counts once per flood (most recent
+    reception wins), so shared prefixes are not multiplied by the number of
+    gateways that heard them. Receptions without a mesh id are never merged.
+
+    Stats counters cover every deduplicated hop in the window (eligible or
+    not), matching the previous whole-window Python statistics.
     """
     where_clause, where_params, from_clause = _graph_hop_window(filters)
 
@@ -570,6 +649,7 @@ def get_traceroute_graph_aggregates(
     # min_snr == -200.0 is the service's "no floor" sentinel.
     floor_sql = "1" if min_snr == -200.0 else "snr >= ?"
     floor_params: list[Any] = [] if min_snr == -200.0 else [float(min_snr)]
+    group_key_sql = _traceroute_group_key_sql("h", "r")
 
     window_cte = f"""
         window_hops AS (
@@ -581,9 +661,20 @@ def get_traceroute_graph_aggregates(
                 h.to_node_id,
                 h.snr,
                 r.channel_id,
+                {group_key_sql} AS grp,
                 {plausible_sql} AS snr_plausible
             FROM {from_clause}
             WHERE {where_clause}
+        ),
+        deduped_hops AS (
+            SELECT
+                w.*,
+                ROW_NUMBER() OVER (
+                    PARTITION BY w.grp, w.from_node_id, w.to_node_id,
+                                 w.direction
+                    ORDER BY w.timestamp DESC, w.packet_id DESC
+                ) AS dup_rank
+            FROM window_hops w
         )
     """
 
@@ -596,8 +687,8 @@ def get_traceroute_graph_aggregates(
             WITH {window_cte}
             SELECT
                 COUNT(*) AS total_rf_hops,
-                COUNT(DISTINCT packet_id) AS packets_analyzed,
-                COUNT(DISTINCT packet_id || ':' || direction)
+                COUNT(DISTINCT grp) AS packets_analyzed,
+                COUNT(DISTINCT grp || ':' || direction)
                     AS packets_with_rf_hops,
                 SUM(
                     CASE WHEN NOT snr_plausible OR NOT ({floor_sql}) THEN 1 ELSE 0 END
@@ -606,7 +697,8 @@ def get_traceroute_graph_aggregates(
                     CASE WHEN snr_plausible AND ({floor_sql}) AND snr = 0
                          THEN 1 ELSE 0 END
                 ) AS links_filtered_due_to_snr_0
-            FROM window_hops
+            FROM deduped_hops
+            WHERE dup_rank = 1
             """,
             [*where_params, *floor_params, *floor_params],
         ).fetchone()
@@ -624,8 +716,9 @@ def get_traceroute_graph_aggregates(
                     CASE WHEN v.from_node_id <= v.to_node_id THEN 1 ELSE 0 END
                         AS is_forward,
                     (v.snr != {TRACEROUTE_UNKNOWN_SNR}) AS snr_known
-                FROM window_hops v
-                WHERE v.snr_plausible = 1 AND ({floor_sql}) AND v.snr != 0
+                FROM deduped_hops v
+                WHERE v.dup_rank = 1
+                  AND v.snr_plausible = 1 AND ({floor_sql}) AND v.snr != 0
             ),
             pair_ranked AS (
                 SELECT
