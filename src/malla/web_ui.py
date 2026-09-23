@@ -38,13 +38,6 @@ from .utils.signal_quality import QUALITY_COLORS
 # templates so the legend and the map's JS share one source.
 GATEWAY_RELIABILITY_CUTOFF_PERCENT = 30
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("app.log"), logging.StreamHandler(sys.stdout)],
-)
-
 logger = logging.getLogger(__name__)
 
 # Static-asset cache-busting token; changes each process start (i.e. each deploy).
@@ -363,7 +356,6 @@ def main():
         print(f"Database: {app.config['DATABASE_FILE']}")
         print(f"Web UI: http://{host}:{port}")
         print(f"Debug mode: {debug}")
-        print(f"Log level: {logging.getLogger().level}")
         print("=" * 60)
         print()
 

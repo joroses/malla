@@ -12,13 +12,6 @@ import sys
 from .config import get_config
 from .web_ui import create_app
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler("app.log"), logging.StreamHandler(sys.stdout)],
-)
-
 logger = logging.getLogger(__name__)
 
 
